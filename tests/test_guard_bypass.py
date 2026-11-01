@@ -360,6 +360,14 @@ class FollowUpToTheReviews(Cases):
                      'git checkout -bfeature main && git push --force-with-lease origin HEAD',
                      'git switch --force-create=feature main && git push --force-with-lease origin HEAD',
                      'git switch -c feature --track origin/main && git push --force-with-lease origin HEAD'], cwd=repo)
+        self.denied(['git checkout -qB main origin/main && git push --force-with-lease', 'git switch -qC main && git push -f',
+                     'git checkout -qb main && git push -f', 'git switch -qc main && git push --force-with-lease', 'git checkout -qbmain && git push -f',
+                     'git switch -qCmain origin/main && git push --force-with-lease', 'git checkout -b main -q && git push -f',
+                     'git switch -sc main && git push -f', 'git checkout -qB master origin/master && git push --force-with-lease'],
+                    message='force_main', cwd=repo)
+        self.passes(['git checkout -qb feat && git push -u origin feat', 'git switch -qc feat && git push -u origin HEAD',
+                     'git checkout -qbfeat origin/main && git push --force-with-lease origin HEAD',
+                     'git switch -qC feat origin/main && git push --force-with-lease origin HEAD'], cwd=repo)
         self.denied(['git switch --create=main && git push --force-with-lease origin HEAD', 'git switch -cmain && git push -f',
                      'git checkout -Bmain HEAD~1 && git push --force-with-lease', 'git switch --force-create=master && git push -f'],
                     message='force_main', cwd=repo)
@@ -438,6 +446,33 @@ class FollowUpToTheReviews(Cases):
                      'git checkout - && git update-ref HEAD HEAD~1', 'gh pr checkout 5 && git update-ref HEAD HEAD~1'],
                     message='move_main', cwd=repo)
         self.passes(['git update-ref HEAD HEAD~0', 'git checkout -b feat && git update-ref HEAD HEAD~0'], cwd=repo)
+
+    def test_config_env_names_a_variable_to_read(self):
+        repo = self.repo('feature/y')
+        self.denied(['SIMPLE=upstream git -c push.default=current --config-env=push.default=SIMPLE push --force-with-lease',
+                     'SIMPLE=upstream git --config-env push.default=SIMPLE push --force-with-lease',
+                     'export SIMPLE=upstream; git --config-env=push.default=SIMPLE push --force-with-lease',
+                     'env SIMPLE=upstream git --config-env=push.default=SIMPLE push --force-with-lease',
+                     "SIMPLE=upstream sh -c 'git --config-env=push.default=SIMPLE push --force-with-lease'",
+                     'git --config-env=push.default=AKIT_SURELY_UNSET push --force-with-lease',  # cannot be read: risky
+                     'SIMPLE=true git --config-env=remote.origin.mirror=SIMPLE push origin HEAD'], message='force_main', cwd=repo)
+        self.passes(['SIMPLE=current git --config-env=push.default=SIMPLE push --force-with-lease origin feat',
+                     'SIMPLE=false git --config-env=remote.origin.mirror=SIMPLE push origin HEAD',
+                     'git --config-env=push.default=AKIT_SURELY_UNSET push -u origin HEAD'], cwd=repo)
+
+    def test_a_quoted_dollar_in_a_refspec_is_not_a_variable(self):
+        repo = self.repo('feature/y')
+        self.passes(["git push --force-with-lease origin 'fix/$state'", 'git push --force-with-lease origin fix/\\$state',
+                     "git push --force-with-lease origin 'HEAD:fix/${state}'"], cwd=repo)
+        self.denied(['git push --force-with-lease origin "fix/$state"', 'git push --force-with-lease origin fix/$state',
+                     "git push --force-with-lease origin 'fix/$state' $B", "git push --force-with-lease origin 'a'\"$B\""],
+                    message='force_main', cwd=repo)
+
+    def test_more_config_slots_than_are_read_cannot_be_vouched_for(self):
+        repo = self.repo('feature/y')
+        self.denied(['GIT_CONFIG_COUNT=65 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=vi git push -u origin HEAD',
+                     'GIT_CONFIG_COUNT=1000 git push -u origin HEAD'], message='force_main', cwd=repo)
+        self.passes(['GIT_CONFIG_COUNT=64 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=vi git push -u origin HEAD'], cwd=repo)
 
     def test_a_variable_in_a_forced_refspec_may_hold_main(self):
         repo = self.repo('feature/y')

@@ -82,7 +82,7 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
 STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False,
-         'raw': [], 'moved': False, 'envcfg': [], 'inherit': [],
+         'raw': [], 'moved': False, 'envcfg': [], 'inherit': [], 'penv': {}, 'pinherit': {},
          'marks': {'active': set(), 'unquoted': set(), 'braced': set()}}  # cwd None = unknown; raw = the command's tokens before $VAR expansion
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
@@ -884,10 +884,12 @@ def git_head(args):
     while i < len(args):
         if args[i] == '-C' and i + 1 < len(args):
             where = os.path.join(where, os.path.expanduser(args[i + 1]))
-        if args[i] in ('-c', '--config-env') and i + 1 < len(args):
+        if args[i] == '-c' and i + 1 < len(args):
             config.append(args[i + 1])
+        elif args[i] == '--config-env' and i + 1 < len(args):
+            config.append(config_env(args[i + 1]))
         elif args[i].startswith('--config-env='):
-            config.append(args[i].split('=', 1)[1])
+            config.append(config_env(args[i].split('=', 1)[1]))
         if args[i] in GIT_VALUE:
             i += 2
         elif args[i].startswith('-'):
@@ -897,22 +899,39 @@ def git_head(args):
     return (where, args[i], args[i + 1:], config) if i < len(args) else None
 
 
-def env_config(toks):
-    """The settings GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n / GIT_CONFIG_PARAMETERS give a git command,
-    from assignments in front of it (expanded) and from variables set earlier, as key=value strings. When the count cannot
-    be read every key that is set is taken."""
-    env = dict(STATE['vars'])
+def config_env(entry):
+    """key=value for a --config-env=key=ENVNAME setting: the value is what the variable ENVNAME holds, from the assignments in
+    front of the command, the variables set earlier and the hook's own environment; $ENVNAME when it cannot be told."""
+    key, _, name = entry.partition('=')
+    value = STATE['penv'].get(name, STATE['vars'].get(name, os.environ.get(name)))
+    return '%s=%s' % (key, '$' + name if value is None else value)
+
+
+def prefix_env(toks):
+    """The VAR=value assignments in front of a command (up to a git), expanded."""
+    env = {}
     for t in toks:
         if os.path.basename(t) == 'git':
             break
         if ASSIGN.match(t):
             k, v = t.split('=', 1)
             env[k] = expand(v)
+    return env
+
+
+def env_config(toks):
+    """The settings GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n / GIT_CONFIG_PARAMETERS give a git command,
+    from assignments in front of it (expanded) and from variables set earlier, as key=value strings. When the count cannot
+    be read every key that is set is taken."""
+    env = dict(STATE['vars'], **prefix_env(toks))
     try:
-        slots = range(min(int(env.get('GIT_CONFIG_COUNT') or 0), 64))
+        count = int(env.get('GIT_CONFIG_COUNT') or 0)
+        slots = range(min(count, 64))
     except ValueError:
         slots = sorted({int(m.group(1)) for k in env for m in [re.match(r'GIT_CONFIG_KEY_(\d{1,2})$', k)] if m})
-    out = ['%s=%s' % (env['GIT_CONFIG_KEY_%d' % n], env.get('GIT_CONFIG_VALUE_%d' % n, '')) for n in slots
+        count = 0
+    out = ['remote.too-many-settings.push='] if count > 64 else []  # more than are read: nothing can be vouched for
+    out += ['%s=%s' % (env['GIT_CONFIG_KEY_%d' % n], env.get('GIT_CONFIG_VALUE_%d' % n, '')) for n in slots
            if env.get('GIT_CONFIG_KEY_%d' % n)]
     # 'key=value' before git 2.31, 'key'='value' after it
     return out + [m.group(1) + ('' if m.group(2) is None else '=' + m.group(2))
@@ -929,6 +948,26 @@ def branch_class(name, track=False):
     return None
 
 
+def create_name(rest):
+    """The new branch name of git checkout / switch: -b NAME, -cNAME, -qBNAME, -qB NAME (the create letter can sit in a
+    bundle of short flags; what follows it is the name, or the next argument when nothing does), --create NAME,
+    --force-create=NAME. The last one wins."""
+    name, k = None, 0
+    while k < len(rest) and rest[k] != '--':
+        a = rest[k]
+        if a in ('--create', '--force-create'):
+            name, k = (rest[k + 1] if k + 1 < len(rest) else None), k + 1
+        elif a.startswith(('--create=', '--force-create=')):
+            name = a.split('=', 1)[1]
+        elif a.startswith('-') and not a.startswith('--'):
+            at = next((i for i, ch in enumerate(a) if i and ch in 'bBcC'), None)
+            if at is not None:
+                name = a[at + 1:] or (rest[k + 1] if k + 1 < len(rest) else None)
+                k += 0 if a[at + 1:] else 1
+        k += 1
+    return name
+
+
 def note_move(sub, rest, config, where):
     """Remember in STATE['moved'] ('main' or 'unknown') that this git command may leave main, or a branch that cannot be
     told, checked out for the commands after it. The branch read at hook time is stale from then on, and nothing clears
@@ -939,11 +978,7 @@ def note_move(sub, rest, config, where):
         kind = 'unknown'  # an alias or an external git-<name> can do anything
     elif sub in ('checkout', 'switch'):
         made = {'-b', '-B', '-c', '-C', '--create', '--force-create'}
-        make = next((rest[k + 1] for k, a in enumerate(rest[:-1]) if a in made), None)
-        if make is None:  # -cNAME, -bNAME, --create=NAME, --force-create=NAME
-            make = next((a.split('=', 1)[1] if a.startswith('--') else a[2:] for a in rest if (
-                a[:2] in ('-b', '-B', '-c', '-C') and not a.startswith('--') and len(a) > 2) or a.startswith(
-                ('--create=', '--force-create='))), None)
+        make = create_name(rest)
         flags = flag_parts(rest, value_opts=made | {'--orphan', '--source', '-s', '--conflict', '--pathspec-from-file'},
                            value_letters='bBcCs')
         track = 't' in flags[0] or '--track' in flags[1]
@@ -1044,7 +1079,7 @@ def git_decision(args):
             colon_delete = colon_delete or (bool(sep) and not src)
             main_hit = main_hit or (dst if sep else src) in MAIN_REFS or bool(MAIN_DST.search(dst if sep else src))
             wild = wild or '*' in ref
-            unresolved = unresolved or bool(re.search(r'\$[A-Za-z_{0-9@*]', ref))  # a variable: it may well hold main
+            unresolved = unresolved or (bool(re.search(r'\$[A-Za-z_{0-9@*]', ref)) and ref in STATE['marks']['active'])  # a variable (not '$x'): it may well hold main
         # a refspec or mirror in the command line config (remote.<name>.push / .mirror, push.default) is a push nobody can read
         configured = any(risky_config(c, force or plus) for c in config)
         if configured or ((force or plus or deleting or colon_delete) and main_hit):
@@ -1613,11 +1648,12 @@ def applying(prog_args):
 def nested(run, *args):
     """Run a nested script, shell or command with the git settings the command in front of it carries (GIT_CONFIG_* in its
     prefix) still in force."""
-    saved, STATE['inherit'] = STATE['inherit'], STATE['envcfg']
+    saved = STATE['inherit'], STATE['pinherit']
+    STATE['inherit'], STATE['pinherit'] = STATE['envcfg'], STATE['penv']
     try:
         return run(*args)
     finally:
-        STATE['inherit'] = saved
+        STATE['inherit'], STATE['pinherit'] = saved
 
 
 def analyze(toks, depth, raw=None):
@@ -1627,6 +1663,7 @@ def analyze(toks, depth, raw=None):
             k, v = t.split('=', 1)
             STATE['vars'][k] = expand(v)
         return None
+    STATE['penv'] = dict(STATE['pinherit'], **prefix_env(toks))
     STATE['envcfg'] = STATE['inherit'] + (env_config(toks) if any('GIT_CONFIG' in t for t in toks) or any(
         k.startswith('GIT_CONFIG') for k in STATE['vars']) else [])
     stripped = strip_prefix(toks)
