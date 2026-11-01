@@ -884,13 +884,16 @@ def git_decision(args):
             return 'deny', MSG['lane']
     if sub in ('add', 'stage'):
         s, l, p = flag_parts(rest, value_opts={'--chmod', '--pathspec-from-file'})
-        if s & {'A', 'u'} or l & {'--all', '--update', '--no-ignore-removal'}:
+        sweeping = bool(s & {'A', 'u'} or l & {'--all', '--update', '--no-ignore-removal'})
+        # raw tokens: a variable that holds several words splits into several pathspecs. An unknown folder gives no repo
+        # root to compare with, so only a plain relative pathspec can be judged then.
+        if any(re.search(r'[$`]', t) for t in STATE['raw']) or (STATE['cwd'] is None and (sweeping or any(
+                x.startswith(('/', '~', ':')) or '..' in x.split('/') for x in p))):
+            return 'deny', MSG['stage']
+        if sweeping:
             # -A and -u stage only the named paths; a bare one, a pathspec file, a pathspec the shell may expand to nothing
-            # ($VAR, $(...), a glob) or a tree-wide pathspec is the sweep
-            # (raw tokens: a variable that holds several words splits into several pathspecs). An unknown folder gives no
-            # repo root to compare with.
-            if (not p or '--pathspec-from-file' in l or STATE['cwd'] is None or any(re.search(r'[$`]', t) for t in STATE['raw'])
-                    or any(re.search(r'[*?\[{]', x) for x in p) or stage_sweeps(p, where)):
+            # (a glob) or a tree-wide pathspec is the sweep
+            if not p or '--pathspec-from-file' in l or any(re.search(r'[*?\[{]', x) for x in p) or stage_sweeps(p, where):
                 return 'deny', MSG['stage']
         elif stage_sweeps(p, where):
             return 'deny', MSG['stage']
@@ -1507,7 +1510,7 @@ def analyze(toks, depth):
             return 'deny', MSG['find_delete']
         if inner in READERS and any(feeds_env(c) for c in STATE['pipe'] if c):
             return 'deny', MSG['env']  # something that names an env file feeds the reader through the pipe
-        return analyze(args[k:], depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])
+        return analyze(STATE['raw'][1 + k:], depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])  # raw: see git add
     if prog == 'git':
         return git_decision(args)
     if prog == 'gh':

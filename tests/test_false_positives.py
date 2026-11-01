@@ -211,8 +211,15 @@ class RoutineCommandsPass(unittest.TestCase):
                     'git add -A `ls`', 'FILES="README.md ."; git add -A $FILES', 'D=src; git add -A $D',
                     'git -C "$R" add -A src'], 'deny', cwd=repo, key='stage')
         # an unresolved cd leaves no known repo root: the path may be the checkout itself
-        self.check(['cd "$REPO" && git add -A %s' % repo, 'cd "$REPO" && git add -A src/', 'cd "$REPO" && git add -u .'],
+        self.check(['cd "$REPO" && git add -A %s' % repo, 'cd "$REPO" && git add -A src/', 'cd "$REPO" && git add -u .',
+                    'cd "$REPO" && git add %s' % repo, 'cd "$REPO" && git add ../x', 'cd "$REPO" && git stage ~/x'],
                    'deny', cwd=repo, key='stage')
+        # plain adds keep working, also when the folder is unknown and the path is relative
+        self.check(['git add README.md src/a.py', 'git stage src/', 'cd "$REPO" && git add src/a.py'], None, cwd=repo)
+        # a variable that holds several words splits into several pathspecs, with or without -A, also behind xargs
+        self.check(['F="README.md ."; git add $F', 'F="README.md ."; git stage $F', 'F=src/a.py; git add "$F"',
+                    'F="a ."; xargs git add -A $F </dev/null', 'F="a ."; echo x | xargs git add $F',
+                    'F="a ."; echo x | xargs -I{} git add -A $F {}'], 'deny', cwd=repo, key='stage')
         self.check(['git add -A', 'git add -u', 'git add --all', 'git add --update', 'git add -A .', 'git add -u .',
                     'git add -A ./', 'git add -A :/', "git add -A '*'", 'git add -A src .', 'git add -A :!docs',
                     'git add -A --pathspec-from-file=list.txt', 'git add -A %s' % repo, 'git add .', 'git commit -a',
