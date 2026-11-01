@@ -1,0 +1,4 @@
+# Claude Code: track shared config (.claude/rules/, .claude/settings.json, .claude/skills/), ignore local state
+.claude/settings.local.json
+.claude/worktrees/
+CLAUDE.local.md

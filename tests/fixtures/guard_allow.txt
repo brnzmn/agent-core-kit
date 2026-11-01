@@ -1,0 +1,165 @@
+# Commands the guard must let through, one per line (blank lines and lines starting with # are ignored).
+# They run from a working folder that does not exist, with the test config from helpers.py: protected_dirs lake-data and
+# ~/vault-data, protected Supabase project abcdefghijklmnopqrst. Heredoc cases live in the test file.
+
+# git: staging and committing by name, and text that only mentions danger
+git add src/app.py README.md
+git add -p src/app.py
+git add -- 'docs/my file.md'
+git commit -m 'reset --hard docs'
+git commit -m "guard: block git add -A and rm -rf"
+git commit --amend --no-edit
+git commit -F msg.txt
+git status --short
+git diff --stat HEAD~1
+git log --oneline -20
+git push origin feature/login
+git push --force-with-lease origin feature/login
+git push -u origin HEAD
+git pull --rebase
+git fetch --all --prune
+git checkout -b feature/x
+git checkout main
+git checkout -- src/app.py
+git restore src/app.py
+git restore --staged src/app.py
+git restore --staged .
+git branch -d merged-branch
+git branch --list
+git stash push -u -m 'backup 2026-01-01'
+git stash list
+git stash pop
+git reset --keep HEAD~1
+git reset --soft HEAD~1
+git reset HEAD src/app.py
+git clean -n
+git clean -fdn
+git worktree add ../wt feature
+git worktree list
+git worktree prune --dry-run
+git rebase main
+git tag v1.0.0
+git cherry-pick abc1234
+git add -- ':(exclude)package-lock.json' src/app.py
+git add src/ README.md
+git switch main
+git switch -c feature/x
+git switch --detach HEAD~1
+git update-ref refs/heads/scratch HEAD
+git clean -n -d
+git push --force-with-lease origin feature/x:feature/x
+echo "never run git reset --hard"
+printf '%s\n' 'git clean -fdx' >> notes.md
+python3 -c "print('git push --force')"
+node -e "console.log('lake-data')"
+rg -n "git add -A" docs
+grep -rn "rm -rf" .
+
+# github CLI reads
+gh pr view 7
+gh pr create --fill
+gh pr checks 7
+gh pr list --state open
+gh issue list
+gh -R acme/shop pr view 7
+gh --repo acme/shop pr checks 7
+gh api user
+gh api repos/acme/shop/pulls/7
+gh api repos/acme/shop/issues/7/comments
+
+# deletes that go straight through: build folders, temp, single files
+rm -rf node_modules
+rm -rf dist .next
+rm -rf /tmp/x
+rm -rf "$(mktemp -d)"
+rm -rf __pycache__ .pytest_cache
+rm -f build.log
+rm notes.txt
+rm -rf dist-installer
+rm -rf "$TMPDIR/build-cache"
+rm -rf "${TMPDIR:-/tmp}/scratch"
+rm -rf "$(mktemp -d)/sub"
+D="$(mktemp -d)"; rm -rf "$D/x"
+(cd /tmp/work && ls); rm -f a.txt
+cd /private/tmp/x && rm -rf probe
+mkdir -p /tmp/x && cd /tmp/x && rm -rf logins
+rm -rf node_modules/.cache
+for d in a b; do echo $d; done
+if true; then ls; fi
+S=/private/tmp/x/probe; cd $S && rm -rf logins
+find . -name "*.log"
+find . -type f -name "*.tmp" -print
+
+# env files: the examples are fine
+cat .env.example
+cat .env.sample
+head -5 .env.template
+grep -c API_KEY .env.example
+grep -n API_KEY .env.example
+source .env.example
+. ./.env.sample
+cat * | wc -l
+cat .gitignore .eslintrc
+cp .env.example .env
+rg -n "dotenv" src
+grep -rn ".env" README.md
+sed -i "s/a/b/" .env.local.example
+awk -F= '{print $1}' .env.template
+git ls-files | xargs cat | wc -l
+echo hello | sh
+echo "$(date)" > stamp.txt
+echo `date`
+git commit -m "fix $(date +%F)"
+ssh box "cat /srv/app/.env.example"
+
+# protected folders: reads, copies out, backups, look-alike names
+cat lake-data/manifest.json
+head -5 lake-data/x.csv | wc -l
+grep -rn foo lake-data/
+ls ~/vault-data
+sed -n 1,40p lake-data/notes.md
+sqlite3 lake-data/x.db 'select 1'
+sqlite3 -readonly lake-data/x.db 'select count(*) from t'
+sqlite3 lake-data/x.db '.schema'
+sqlite3 lake-data/x.db '.backup /tmp/x.bak'
+sqlite3 lake-data/backups/h.bak 'insert into t values (1)'
+sqlite3 ~/vault-data/x.db 'select 1'
+sqlite3 "file:lake-data/h.db?mode=ro" 'select 1'
+cp lake-data/x.csv /tmp/x.csv
+rsync -a lake-data/ /tmp/copy/
+ln -s lake-data/exports ~/lake-exports
+echo x > my-lake-data/a.txt
+touch lake-data-old/flag
+sed -i 's#lake-data#$LAKE#' scripts/config.sh
+
+# SQL that is not destructive, or runs on a disposable database
+psql -c 'select * from t'
+psql -c 'ALTER TABLE t DROP CONSTRAINT t_pk'
+grep -rn 'DROP TABLE' supabase/migrations
+echo "TRUNCATE x" > notes.txt
+sqlite3 /tmp/scratch.db 'drop table t'
+sqlite3 :memory: 'drop table t'
+
+# moves: small, inside one repo, into _archive
+mv a.txt b.txt
+mv a b ~/Downloads/
+mv a b c d e _archive/
+mv out/*.json _archive/old-run/
+mv repo/.claude/worktrees/feat/src/a.ts ~/Archive/x/
+mv ~/projects/app-wt/feature-x/src/a.ts ~/Archive/
+mv notes.txt old-notes.txt
+
+# supabase: other projects, non-schema commands
+supabase db push --project-ref zzzzzzzzzzzzzzzzzzzz
+supabase functions deploy hello --project-ref abcdefghijklmnopqrst
+supabase db diff
+supabase migration new add_users
+
+# the rest of a normal day
+ls -la
+cat README.md
+pnpm test
+python3 -m unittest discover -s tests
+cd / && ls
+awk -F/ '{print $1}' paths.txt
+tr / _ < a > b

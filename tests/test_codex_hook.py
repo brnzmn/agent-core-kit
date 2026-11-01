@@ -1,0 +1,232 @@
+"""codex_hook.py: the thin adapter that feeds Codex's hook payloads to the same guard, budget, stop and capture scripts
+Claude Code runs. Every run uses a throwaway AGENT_CORE_LOCAL."""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from helpers import CORE, HOOKS, TEST_CONFIG, env_for, make_local  # noqa: E402
+
+
+def codex_raw(mode, payload, local=None, **env):
+    return subprocess.run([sys.executable, os.path.join(HOOKS, 'codex_hook.py'), mode], input=json.dumps(payload),
+                          capture_output=True, text=True, env=env_for(local, **env), timeout=30)
+
+
+def codex(mode, payload, local=None, **env):
+    out = codex_raw(mode, payload, local, **env)
+    assert out.returncode == 0 and not out.stderr, out.stderr
+    return json.loads(out.stdout) if out.stdout.strip() else None
+
+
+def git_repo(path):
+    subprocess.run(['git', 'init', '-q', path], check=True)
+    return path
+
+
+def pre_bash(command, cwd=None, local=None):
+    out = codex('pre-bash', {'hook_event_name': 'PreToolUse', 'tool_name': 'Bash', 'tool_input': {'command': command},
+                             'cwd': cwd or CORE, 'session_id': 's', 'turn_id': 't'}, local)
+    return out and out['hookSpecificOutput']
+
+
+def pre_patch(body, cwd, local=None):
+    out = codex('pre-patch', {'hook_event_name': 'PreToolUse', 'tool_name': 'apply_patch',
+                              'tool_input': {'command': '*** Begin Patch\n' + body + '\n*** End Patch'}, 'cwd': cwd}, local)
+    return out and out['hookSpecificOutput']
+
+
+class PreBash(unittest.TestCase):
+    def test_git_add_all_is_denied_with_its_alternative(self):
+        out = pre_bash('git add -A && git commit -m wip')
+        self.assertEqual(out['permissionDecision'], 'deny')
+        self.assertIn('Stage files by name', out['permissionDecisionReason'])
+
+    def test_the_tool_is_codex(self):
+        repo = git_repo(tempfile.mkdtemp(prefix='akit-lane-'))
+        with open(os.path.join(repo, '.agent-lane'), 'w') as fh:
+            fh.write('tool: claude\n')
+        out = pre_bash('git commit -m wip', cwd=repo)
+        self.assertEqual(out['permissionDecision'], 'deny')
+        self.assertIn('.agent-lane', out['permissionDecisionReason'])
+        with open(os.path.join(repo, '.agent-lane'), 'w') as fh:
+            fh.write('tool: codex\n')
+        denied = pre_bash('git commit -m wip', cwd=repo)
+        self.assertNotIn('.agent-lane', (denied or {}).get('permissionDecisionReason', ''))
+
+    def test_lone_recursive_delete_becomes_a_trash_move(self):
+        out = pre_bash('rm -rf src/old-feature', cwd='/work/project')  # not under /tmp, which counts as disposable
+        self.assertEqual(out['permissionDecision'], 'allow')
+        self.assertIn('bin/trash.py', out['updatedInput']['command'])
+
+    def test_ordinary_command_passes(self):
+        self.assertIsNone(pre_bash('git status --short && pnpm test'))
+
+    def test_other_tools_pass(self):
+        self.assertIsNone(codex('pre-bash', {'tool_name': 'Read', 'tool_input': {'command': 'git add -A'}, 'cwd': CORE}))
+
+
+class PrePatch(unittest.TestCase):
+    def setUp(self):
+        self.repo = git_repo(tempfile.mkdtemp(prefix='akit-repo-'))
+        with open(os.path.join(self.repo, 'AGENTS.md'), 'w') as fh:
+            fh.write('# Repo\n\n## Rules\n- Stage files by name.\n')
+
+    def test_patch_that_pushes_agents_md_over_budget_is_denied(self):
+        body = '*** Update File: AGENTS.md\n@@\n- Stage files by name.\n' + ''.join('+- rule %d\n' % i for i in range(160))
+        out = pre_patch(body, self.repo)
+        self.assertEqual(out['permissionDecision'], 'deny')
+        self.assertIn('budget', out['permissionDecisionReason'])
+
+    def test_new_agents_md_over_budget_is_denied(self):
+        body = '*** Add File: sub/AGENTS.md\n' + ''.join('+line %d\n' % i for i in range(200))
+        self.assertEqual(pre_patch(body, self.repo)['permissionDecision'], 'deny')
+
+    def test_log_entries_are_denied(self):
+        body = ('*** Update File: AGENTS.md\n@@\n ## Rules\n- Stage files by name.\n+## Build status\n'
+                '+- 2026-10-28 shipped the importer\n+- 2026-10-28 fixed the login\n')
+        self.assertEqual(pre_patch(body, self.repo)['permissionDecision'], 'deny')
+
+    def test_ordinary_patch_passes(self):
+        body = ('*** Add File: src/app.py\n+print("hi")\n*** Update File: AGENTS.md\n@@\n- Stage files by name.\n'
+                '+- Keep PRs small.')
+        self.assertIsNone(pre_patch(body, self.repo))
+
+    def test_deleting_a_file_passes(self):
+        self.assertIsNone(pre_patch('*** Delete File: AGENTS.md', self.repo))
+
+    def test_generated_global_file_is_denied_with_the_way_out(self):
+        body = '*** Update File: %s\n@@\n+- new rule\n' % os.path.expanduser('~/.codex/AGENTS.md')
+        out = pre_patch(body, self.repo)
+        self.assertEqual(out['permissionDecision'], 'deny')
+        self.assertIn('generated by the kit', out['permissionDecisionReason'])
+        self.assertIn('local/AGENTS.md', out['permissionDecisionReason'])
+
+    def test_other_tools_pass(self):
+        self.assertIsNone(codex('pre-patch', {'tool_name': 'Bash', 'tool_input': {'command': 'x'}, 'cwd': self.repo}))
+
+
+class Stop(unittest.TestCase):
+    OFFER = 'Tests are green. Want me to open the PR?'
+
+    def stop(self, text, plan=None, local=None, active=False):
+        path = ''
+        if plan is not None:
+            fh = tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False)
+            fh.write(json.dumps({'type': 'response_item', 'payload': {'type': 'function_call', 'name': 'update_plan',
+                                 'arguments': json.dumps({'plan': plan})}}) + '\n')
+            fh.close()
+            path = fh.name
+        out = codex_raw('stop', {'hook_event_name': 'Stop', 'last_assistant_message': text, 'transcript_path': path,
+                                 'stop_hook_active': active}, local)
+        self.assertEqual((out.returncode, out.stderr), (0, ''))
+        return json.loads(out.stdout) if out.stdout.strip() else None
+
+    def test_offer_is_pushed_back_and_names_the_user(self):
+        out = self.stop(self.OFFER)
+        self.assertEqual(out['decision'], 'block')
+        self.assertIn('Alex', out['reason'])
+
+    def test_open_plan_items_block(self):
+        plan = [{'step': 'write tests', 'status': 'completed'}, {'step': 'open PR', 'status': 'pending'}]
+        self.assertEqual(self.stop('Done with the tests.', plan)['decision'], 'block')
+
+    def test_finished_plan_and_blocker_line_pass(self):
+        self.assertIsNone(self.stop('Merged and live.', [{'step': 'open PR', 'status': 'completed'}]))
+        self.assertIsNone(self.stop('1. Open x\n2. Click y\n3. Paste z\nBlocked: no token'))
+
+    def test_second_stop_in_a_turn_passes(self):
+        self.assertIsNone(self.stop(self.OFFER, active=True))
+
+    def test_stop_hook_false_prints_nothing(self):
+        local = make_local(dict(TEST_CONFIG, stop_hook=False))
+        plan = [{'step': 'open PR', 'status': 'pending'}]
+        out = codex_raw('stop', {'hook_event_name': 'Stop', 'last_assistant_message': self.OFFER, 'stop_hook_active': False},
+                        local)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, '', ''))
+        self.assertIsNone(self.stop('Done with the tests.', plan, local=local))
+        self.assertIsNotNone(self.stop(self.OFFER, local=make_local(dict(TEST_CONFIG, stop_hook=True))), 'control')
+
+
+class SessionStart(unittest.TestCase):
+    def test_plain_text_notice_for_a_kit_that_is_not_set_up(self):
+        local = make_local(rulebook=False)
+        with tempfile.TemporaryDirectory() as cwd:
+            out = codex_raw('session-start', {'hook_event_name': 'SessionStart', 'cwd': cwd}, local,
+                            HOME=tempfile.mkdtemp(prefix='akit-home-'))
+        self.assertEqual((out.returncode, out.stderr), (0, ''))
+        self.assertIn('mention once to Alex', out.stdout)
+        self.assertIn('not set up', out.stdout)
+
+
+class Prompt(unittest.TestCase):
+    CORRECTION = "No, that's wrong, I told you to stage by name"
+
+    def capture(self, prompt, source=None):
+        local = make_local()
+        payload = {'hook_event_name': 'UserPromptSubmit', 'prompt': prompt, 'session_id': 'abc', 'cwd': '/tmp'}
+        if source is not None:
+            path = os.path.join(tempfile.mkdtemp(), 'rollout.jsonl')
+            with open(path, 'w') as fh:
+                source, originator = source if isinstance(source, tuple) else (source, 'Codex Desktop')
+                fh.write(json.dumps({'type': 'session_meta', 'payload': {'id': 'abc', 'source': source,
+                                                                         'originator': originator}}) + '\n')
+            payload['transcript_path'] = path
+        out = codex_raw('prompt', payload, local)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, '', ''))
+        inbox = os.path.join(local, 'learning', 'inbox')
+        if not os.path.isdir(inbox):
+            return []
+        out = []
+        for name in os.listdir(inbox):
+            with open(os.path.join(inbox, name), encoding='utf-8') as fh:
+                out += [json.loads(line) for line in fh if line.strip()]
+        return out
+
+    def test_correction_is_captured_and_tagged_codex(self):
+        self.assertEqual([r['tool'] for r in self.capture(self.CORRECTION, 'vscode')], ['codex'])
+        self.assertEqual([r['tool'] for r in self.capture(self.CORRECTION)], ['codex'])
+
+    def test_scripted_and_agent_turns_are_not_captured(self):
+        self.assertEqual(self.capture(self.CORRECTION, 'exec'), [])
+        self.assertEqual(self.capture(self.CORRECTION, {'subagent': {}}), [])
+        self.assertEqual(self.capture(self.CORRECTION, ('vscode', 'Claude Code')), [])
+        self.assertEqual(self.capture('<heartbeat>' + self.CORRECTION + '</heartbeat>', 'vscode'), [])
+
+    def test_ide_context_is_stripped(self):
+        recs = self.capture('# Context from my IDE setup:\n\n## My request for Codex:\n' + self.CORRECTION, 'vscode')
+        self.assertTrue(recs[0]['text'].startswith("No, that's wrong"))
+
+    def test_neutral_prompt_is_not_captured(self):
+        self.assertEqual(self.capture('Please add a unit test for the parser.'), [])
+
+
+class Robustness(unittest.TestCase):
+    def test_every_mode_is_quiet_without_a_local_folder(self):
+        with tempfile.TemporaryDirectory() as parent:
+            local = os.path.join(parent, 'no-local-yet')
+            repo = git_repo(os.path.join(parent, 'repo'))
+            payloads = {
+                'pre-bash': {'tool_name': 'Bash', 'tool_input': {'command': 'git status'}, 'cwd': repo},
+                'pre-patch': {'tool_name': 'apply_patch', 'cwd': repo, 'tool_input': {
+                    'command': '*** Begin Patch\n*** Add File: a.py\n+x = 1\n*** End Patch'}},
+                'stop': {'last_assistant_message': 'Built it.', 'stop_hook_active': False},
+                'prompt': {'prompt': 'Please add a test.', 'session_id': 's', 'cwd': repo},
+            }
+            for mode, payload in payloads.items():
+                out = codex_raw(mode, payload, local)
+                self.assertEqual((out.returncode, out.stdout, out.stderr), (0, '', ''), mode)
+
+    def test_unknown_mode_and_garbage_input_are_quiet(self):
+        out = codex_raw('nonsense', {})
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, '', ''))
+        out = subprocess.run([sys.executable, os.path.join(HOOKS, 'codex_hook.py'), 'stop'], input='not json',
+                             capture_output=True, text=True, env=env_for(), timeout=20)
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, '', ''))
+
+
+if __name__ == '__main__':
+    unittest.main()

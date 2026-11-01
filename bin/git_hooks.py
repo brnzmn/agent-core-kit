@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Install agent-core-kit's git pre-commit hook (bin/precommit.py) into every repo under your projects folder.
+
+  python3 bin/git_hooks.py install   [--root DIR | REPO ...]
+  python3 bin/git_hooks.py check     [--root DIR | REPO ...]   exit 1 if any repo lacks it
+  python3 bin/git_hooks.py uninstall [--root DIR | REPO ...]
+
+The projects folder is projects_root in local/config.json (or $AGENT_CORE_PROJECTS). With neither set and no
+repos given, there is nothing to do: the script says so and exits 0. Repos are found up to 3 levels deep and
+worktrees share their main repo's hooks. An existing pre-commit is kept and runs after the check; a copy saved
+earlier is never overwritten (a second one is saved as pre-commit.agent-core-orig.<timestamp>). A repo with
+core.hooksPath (a tracked hooks folder such as .githooks) keeps its files untouched: the hook goes in
+<git dir>/agent-core-hooks, which forwards every hook the original folder has, and core.hooksPath points there
+with the old value saved in agentcore.origHooksPath. Nothing is deleted; uninstall puts back what was there.
+
+A repo whose hooks the pre-commit framework, husky or lefthook generates is left alone, with one line saying the
+check is not installed there; `check` reports it as skipped, not missing. install() called with no arguments (the
+session-start hook does that) acts only when the repo has no hook or the hook is the kit's own; the command line
+passes adopt=True, which also chains a pre-commit hook of the user's own.
+"""
+import argparse
+import os
+import shlex
+import stat
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'claude', 'hooks'))
+import common  # noqa: E402
+
+MARK = '# agent-core pre-commit'
+ORIG = 'pre-commit.agent-core-orig'
+OWN_DIR = 'agent-core-hooks'
+SKIP = {'node_modules', '.venv', 'venv', 'vendor', 'dist', 'build', '.next', '_archive', '_to_delete'}
+
+# The hook finds the kit at commit time: $AGENT_CORE_DIR, else the path install.sh recorded in .core-dir, else the
+# kit path at the time the hook was written. A moved kit therefore only needs install.sh --sync to be found again.
+CHECK = '''core="${AGENT_CORE_DIR:-}"
+[ -n "$core" ] || core="$(cat "$HOME/.claude/hooks/agent-core/.core-dir" 2>/dev/null || true)"
+[ -n "$core" ] || core=@CORE@
+check="$core/bin/precommit.py"
+if [ -f "$check" ] && command -v python3 >/dev/null 2>&1; then
+  python3 "$check" || exit 1
+fi
+'''
+PLAIN = '''#!/bin/sh
+%s (installed by agent-core-kit's bin/git_hooks.py; the previous hook, if any, is %s)
+%sorig="$(dirname "$0")/%s"
+if [ -x "$orig" ]; then exec "$orig" "$@"; fi
+exit 0
+'''
+FORWARD_DIR = '''orig_dir='%s'
+case "$orig_dir" in /*) ;; *) orig_dir="$(git rev-parse --show-toplevel)/$orig_dir" ;; esac
+'''
+WRAPPED = '''#!/bin/sh
+%s (installed by agent-core-kit's bin/git_hooks.py; runs the original from agentcore.origHooksPath after)
+%s%sif [ -x "$orig_dir/pre-commit" ]; then exec "$orig_dir/pre-commit" "$@"; fi
+exit 0
+'''
+FORWARD = '''#!/bin/sh
+# agent-core forwarder to the repo's own hooks folder (agentcore.origHooksPath)
+%sexec "$orig_dir/%s" "$@"
+'''
+
+
+def projects_root():
+    """The folder holding the user's repos: $AGENT_CORE_PROJECTS, else projects_root in local/config.json, expanded.
+    An empty string means none is set."""
+    root = str(os.environ.get('AGENT_CORE_PROJECTS') or common.config().get('projects_root') or '').strip()
+    return os.path.abspath(os.path.expanduser(root)) if root else ''
+
+
+def check_snippet():
+    return CHECK.replace('@CORE@', shlex.quote(common.CORE))
+
+
+def git(repo, *args):
+    out = subprocess.run(['git', '-C', repo] + list(args), capture_output=True, text=True, timeout=20)
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def find_repos(root, depth=3):
+    """Top folders of git repos and worktrees under root, up to depth levels down."""
+    found = []
+    for cur, dirs, files in os.walk(root):
+        level = cur[len(root):].count(os.sep)
+        if '.git' in dirs or '.git' in files:
+            found.append(cur)
+        dirs[:] = [d for d in dirs if d not in SKIP and d != '.git' and not d.startswith('.Trash')] \
+            if level < depth else []
+    return found
+
+
+def common_dir(repo):
+    return git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+
+
+def write_exec(path, text):
+    with open(path, 'w') as fh:
+        fh.write(text)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def read_head(path, n=4000):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            return fh.read(n)
+    except OSError:
+        return ''
+
+
+def is_ours(path):
+    return MARK in read_head(path)
+
+
+def tool_in(text):
+    """The hook manager that generated this hook text, or None."""
+    if 'File generated by pre-commit' in text:
+        return 'the pre-commit framework'
+    low = text.lower()
+    if 'husky' in low:
+        return 'husky'
+    if 'lefthook' in low:
+        return 'lefthook'
+    return None
+
+
+def tool_for_dir(repo, configured):
+    """The hook manager behind a core.hooksPath that is not ours: husky keeps its hooks in .husky/, otherwise the
+    folder's pre-commit is read."""
+    if '.husky' in configured.replace('\\', '/').split('/'):
+        return 'husky'
+    return tool_in(read_head(os.path.join(resolve(repo, configured), 'pre-commit')))
+
+
+def skipped(tool):
+    return ('skipped: the instruction-file check is not installed in this repo because %s generates its git hooks '
+            'and would overwrite or bypass ours' % tool)
+
+
+def hooks_path(repo):
+    """(configured core.hooksPath set in the repo's own config, or None, and our saved original)."""
+    return git(repo, 'config', '--local', '--get', 'core.hooksPath'), git(repo, 'config', '--local', '--get',
+                                                                        'agentcore.origHooksPath')
+
+
+def resolve(repo, path):
+    return path if os.path.isabs(path) else os.path.join(git(repo, 'rev-parse', '--show-toplevel') or repo, path)
+
+
+def unique_path(path):
+    out, n = path, 1
+    while os.path.exists(out):
+        n += 1
+        out = '%s-%d' % (path, n)
+    return out
+
+
+def install(repo, adopt=False):
+    """Put the check in the repo. With adopt=False (the default, used by the session-start hook) it acts only when there
+    is no hook or the hook is the kit's own; adopt=True also chains a pre-commit hook or hooks folder of the user's own.
+    Hooks written by the pre-commit framework, husky or lefthook are never wrapped."""
+    gdir = common_dir(repo)
+    if not gdir:
+        return 'skip (not a repo)'
+    configured, saved = hooks_path(repo)
+    own = os.path.join(gdir, OWN_DIR)
+    if configured and os.path.abspath(configured) != own:
+        tool = tool_for_dir(repo, configured)
+        if tool:
+            return skipped(tool)
+        if not adopt:
+            return 'skipped: core.hooksPath is %s; run bash install.sh --sync to chain the check in front of it' % configured
+        git(repo, 'config', '--local', 'agentcore.origHooksPath', configured)
+        saved = configured
+    if saved:
+        orig_dir = resolve(repo, saved)
+        os.makedirs(own, exist_ok=True)
+        prelude = FORWARD_DIR % saved.replace("'", "'\\''")
+        wanted = sorted(n for n in (os.listdir(orig_dir) if os.path.isdir(orig_dir) else [])
+                        if n != 'pre-commit' and not n.endswith('.sample') and os.path.isfile(os.path.join(orig_dir, n))
+                        and os.access(os.path.join(orig_dir, n), os.X_OK))
+        for name in os.listdir(own):
+            if name not in wanted and is_forwarder(os.path.join(own, name)):
+                os.unlink(os.path.join(own, name))  # a forwarder we generated for a hook the repo no longer has
+        for name in wanted:
+            write_exec(os.path.join(own, name), FORWARD % (prelude, name))
+        write_exec(os.path.join(own, 'pre-commit'), WRAPPED % (MARK, check_snippet(), prelude))
+        git(repo, 'config', '--local', 'core.hooksPath', own)
+        return 'installed (wrapping %s)' % saved
+    hooks = os.path.join(gdir, 'hooks')
+    target = os.path.join(hooks, 'pre-commit')
+    note = ''
+    if os.path.exists(target) and not is_ours(target):
+        tool = tool_in(read_head(target, 20000))
+        if tool:
+            return skipped(tool)
+        if not adopt:
+            return 'skipped: the repo has a pre-commit hook of its own; run bash install.sh --sync to chain the check in front of it'
+        keep = os.path.join(hooks, ORIG)
+        if os.path.exists(keep):  # a saved original is never overwritten
+            keep = unique_path('%s.%s' % (keep, time.strftime('%Y%m%d-%H%M%S')))
+            note = (' (a hook that replaced ours was saved as hooks/%s and is not chained; the original saved earlier '
+                    'still runs)' % os.path.basename(keep))
+        os.replace(target, keep)
+    os.makedirs(hooks, exist_ok=True)
+    write_exec(target, PLAIN % (MARK, ORIG, check_snippet(), ORIG))
+    return 'installed' + (' (chaining the previous pre-commit)' if os.path.exists(os.path.join(hooks, ORIG)) else '') + note
+
+
+def is_forwarder(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            return '# agent-core forwarder' in fh.read(400)
+    except OSError:
+        return False
+
+
+def check(repo):
+    """(ok, message). A repo whose hooks a framework generates is ok with a message starting 'skipped'."""
+    gdir = common_dir(repo)
+    if not gdir:
+        return True, 'skip (not a repo)'
+    configured, saved = hooks_path(repo)
+    own = os.path.join(gdir, OWN_DIR)
+    if configured and os.path.abspath(configured) != own:
+        tool = tool_for_dir(repo, configured)
+        if tool:
+            return True, skipped(tool)
+        return False, 'core.hooksPath is %s, so the agent-core hook is bypassed' % configured
+    if saved:
+        orig_dir = resolve(repo, saved)
+        missing = [n for n in (os.listdir(orig_dir) if os.path.isdir(orig_dir) else [])
+                   if n != 'pre-commit' and not n.endswith('.sample') and os.access(os.path.join(orig_dir, n), os.X_OK)
+                   and not os.path.exists(os.path.join(own, n))]
+        if not is_ours(os.path.join(own, 'pre-commit')):
+            return False, 'missing'
+        if missing:
+            return False, 'not forwarding %s from %s' % (', '.join(missing), saved)
+        return True, 'ok (wrapping %s)' % saved
+    target = os.path.join(gdir, 'hooks', 'pre-commit')
+    if is_ours(target):
+        return True, 'ok'
+    tool = tool_in(read_head(target, 20000)) if os.path.exists(target) else None
+    return (True, skipped(tool)) if tool else (False, 'missing')
+
+
+def uninstall(repo):
+    gdir = common_dir(repo)
+    if not gdir:
+        return 'skip (not a repo)'
+    configured, saved = hooks_path(repo)
+    own = os.path.join(gdir, OWN_DIR)
+    if saved:
+        if not configured or os.path.abspath(configured) == own:
+            git(repo, 'config', '--local', 'core.hooksPath', saved)
+        git(repo, 'config', '--local', '--unset', 'agentcore.origHooksPath')
+        return 'restored core.hooksPath=%s (left %s in place, unused)' % (saved, own)
+    hooks = os.path.join(gdir, 'hooks')
+    target = os.path.join(hooks, 'pre-commit')
+    if is_ours(target):
+        if os.path.exists(os.path.join(hooks, ORIG)):
+            os.replace(os.path.join(hooks, ORIG), target)
+            extra = sorted(n for n in os.listdir(hooks) if n.startswith(ORIG + '.'))
+            return 'restored the previous pre-commit' + (' (also kept: %s)' % ', '.join(extra) if extra else '')
+        os.replace(target, os.path.join(hooks, 'pre-commit.agent-core-removed'))
+        return 'removed (kept as hooks/pre-commit.agent-core-removed)'
+    return 'not installed'
+
+
+def targets(args):
+    if args.repos:
+        repos = [os.path.abspath(r) for r in args.repos]
+    elif args.root and os.path.isdir(args.root):
+        repos = find_repos(os.path.abspath(args.root))
+    else:
+        return []
+    seen, out = set(), []
+    for repo in repos:
+        gdir = common_dir(repo)
+        if gdir and gdir not in seen:
+            seen.add(gdir)
+            out.append(repo)
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument('action', choices=('install', 'check', 'uninstall'))
+    ap.add_argument('repos', nargs='*')
+    ap.add_argument('--root', default=None, help='projects folder (default: projects_root in local/config.json)')
+    ap.add_argument('-q', '--quiet', action='store_true', help='print only problems and a summary')
+    args = ap.parse_args(argv)
+    if not args.repos and not args.root:
+        args.root = projects_root()
+        if not args.root:
+            print('git pre-commit hook: projects_root is not set in %s, so no repos are covered '
+                  '(run /setup or set it in the config).' % common.tilde(common.CONFIG_PATH))
+            return 0
+    repos = targets(args)
+    bad = left = 0
+    for repo in repos:
+        try:
+            if args.action == 'check':
+                ok, msg = check(repo)
+                bad += not ok
+            elif args.action == 'install':
+                msg = install(repo, adopt=True)
+                ok = not msg.startswith('error')
+            else:
+                msg = uninstall(repo)
+                ok = not msg.startswith('error')
+        except Exception as exc:
+            ok, msg = False, 'error: %s' % exc
+            bad += 1
+        notice = msg.startswith('skipped')
+        left += notice
+        if not (args.quiet and ok) or (notice and args.action == 'install'):
+            print('%-60s %s' % (repo, msg))
+    print('git pre-commit %s: %d repos, %d problem(s)%s' % (args.action, len(repos), bad,
+                                                              ', %d skipped' % left if left else ''))
+    return 1 if bad else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

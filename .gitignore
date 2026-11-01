@@ -1,0 +1,6 @@
+# personal: the user's rulebook, config and learning data live here, in their own git repo
+/local/
+/build/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,16 @@
+{
+  "_comment": "Copied to local/config.json on first install; /setup fills it in. Keys starting with _ are ignored. See README for each key.",
+  "user_name": "",
+  "projects_root": "",
+  "protected_dirs": [],
+  "protected_supabase": {},
+  "gated_models": ["fable"],
+  "stop_hook": true,
+  "icloud_warning": true,
+  "spend_limit_usd": 5,
+  "permission_mode": "",
+  "auto_mode_environment": [],
+  "pr_gate": {"enabled": true, "branches": ["main", "master", "production"], "repos": "*", "reviewers": [], "trust_codex_bot": false},
+  "routing": {"claude_week_limit_pct": 80},
+  "codex": {"models": {}, "pin_memories_off": false}
+}
