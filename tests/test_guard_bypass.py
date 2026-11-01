@@ -203,8 +203,10 @@ class GitBypasses(Cases):
 
     def test_a_substitution_as_a_pathspec_cannot_be_judged(self):
         self.denied(['git add "$(git rev-parse --show-toplevel)"', 'git add $(git rev-parse --show-toplevel)', 'git add `git rev-parse --show-toplevel`',
-                     'git add src "$(pwd)"', 'git add "$(echo .)"'], message='stage')
-        self.passes(['git add "$FILE"', 'git add src/app.py "docs/my file.md"'])
+                     'git add src "$(pwd)"', 'git add "$(echo .)"',
+                     'git add "$FILE"'],  # the tokenizer loses the quotes, and an unquoted $FILE may hold several words
+                    message='stage')
+        self.passes(['git add src/app.py "docs/my file.md"'])
 
     def test_clean_is_blocked_unless_it_is_a_dry_run(self):
         self.denied(['git -c clean.requireForce=false clean -d', 'git -c clean.requireForce=false clean', 'git clean', 'git clean -d',
