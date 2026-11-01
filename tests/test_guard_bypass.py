@@ -312,12 +312,95 @@ class ForcePushOfTheCurrentBranch(Cases):
         self.passes(['cd sub && git push --force-with-lease', 'cd sub && git push --force-with-lease origin HEAD'], cwd=repo)
 
 
+class FollowUpToTheReviews(Cases):
+    """Everyday forms the first review denied, and the config and variable routes around the force-push check."""
+    repo = ForcePushOfTheCurrentBranch.repo
+
+    def test_a_chain_back_to_a_named_branch_clears_main(self):
+        repo = self.repo('feature/x')
+        open(os.path.join(repo, 'a.txt'), 'w').close()
+        self.passes(['git checkout main && git pull && git checkout feature/x && git rebase main && git push --force-with-lease',
+                     'git switch main && git switch -c feat2 && git push --force-with-lease origin HEAD',
+                     'git checkout main && git checkout feature/x && git push --force-with-lease origin HEAD'], cwd=repo)
+        self.denied(['git checkout main; git checkout feature/x; git push --force-with-lease',
+                     'git checkout main && git checkout feature/x; git push --force-with-lease',  # the switch may have failed
+                     'git checkout main || git checkout feature/x && git push --force-with-lease',
+                     'git checkout main && git checkout feature/x && echo hi; git push --force-with-lease',
+                     'git checkout main && git checkout a.txt && git push --force-with-lease'], message='force_main', cwd=repo)
+
+    def test_a_branch_change_in_another_worktree_does_not_count(self):
+        repo = self.repo('feature/x')
+        other = os.path.join(os.path.dirname(repo), os.path.basename(repo) + '-other')
+        git('worktree', 'add', '-q', '-b', 'other', other, cwd=repo)
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        self.passes(['git -C %s checkout main && git push --force-with-lease origin HEAD' % other,
+                     'git -C %s switch -c y && git push --force-with-lease' % other], cwd=repo)
+        self.denied(['git -C %s checkout main && git push --force-with-lease origin HEAD' % repo,
+                     'git -C %s/sub checkout main && git push --force-with-lease origin HEAD' % repo,
+                     'git -C . checkout main && git push --force-with-lease', 'git -C %s checkout main && git -C %s push --force-with-lease' % (repo, repo)],
+                    message='force_main', cwd=repo)
+
+    def test_a_later_substitution_runs_after_the_push(self):
+        repo = self.repo('feature/x')
+        self.passes(['git push --force-with-lease origin HEAD && echo "$(git checkout main)"',
+                     'git push --force-with-lease origin HEAD; echo `git checkout main`',
+                     "git push --force-with-lease origin HEAD && echo '$(git checkout main)'"], cwd=repo)
+        self.denied(['echo ok && git push --force-with-lease origin "$(git checkout -q main; echo HEAD)"',
+                     'echo "$(git checkout -q main)" && git push --force-with-lease', 'git push --force-with-lease origin $(git checkout -q main)'],
+                    message='force_main', cwd=repo)
+
+    def test_attached_and_long_create_values_name_the_branch(self):
+        repo = self.repo('feature/x')
+        self.passes(['git switch --create=feature main && git push --force-with-lease origin HEAD',
+                     'git switch -cfeature main && git push --force-with-lease origin HEAD',
+                     'git checkout -bfeature main && git push --force-with-lease origin HEAD',
+                     'git switch --force-create=feature main && git push --force-with-lease origin HEAD',
+                     'git switch -c feature --track origin/main && git push --force-with-lease origin HEAD'], cwd=repo)
+        self.denied(['git switch --create=main && git push --force-with-lease origin HEAD', 'git switch -cmain && git push -f',
+                     'git checkout -Bmain HEAD~1 && git push --force-with-lease', 'git switch --force-create=master && git push -f'],
+                    message='force_main', cwd=repo)
+
+    def test_only_the_whole_branch_name_is_main(self):
+        repo = self.repo('feature/y')
+        self.passes(['git switch feature/main && git push --force-with-lease origin HEAD', 'git checkout -b team/master && git push --force-with-lease origin HEAD',
+                     'git switch --detach HEAD~1; git push --force-with-lease origin feature/y'], cwd=repo)
+        self.denied(['git switch main && git push --force-with-lease origin HEAD', 'git switch --track origin/main && git push -f origin HEAD',
+                     'git symbolic-ref HEAD refs/heads/master && git push -f'], message='force_main', cwd=repo)
+        self.denied(['git push --force-with-lease origin feat:refs/heads/main', 'git push --force-with-lease origin feat:heads/master'],
+                    message='force_main', cwd=repo)
+
+    def test_a_mirror_or_saved_refspec_in_config_is_a_push_nobody_can_read(self):
+        repo = self.repo('feature/y')
+        self.denied(['git -c remote.origin.mirror=true push origin', 'git -c remote.origin.mirror push origin',
+                     'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.mirror GIT_CONFIG_VALUE_0=true git push origin',
+                     'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main git push origin',
+                     'env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main git push origin',
+                     'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main; git push origin',
+                     "GIT_CONFIG_PARAMETERS=\"'remote.origin.mirror=true'\" git push origin",
+                     'git --config-env=remote.origin.push=REFSPEC push origin', 'git config remote.origin.push +HEAD:main',
+                     'git config --global --add remote.origin.mirror true', 'git config set push.default matching',
+                     'git config --local remote.origin.push "+refs/heads/*:refs/heads/*"'], message='force_main', cwd=repo)
+        self.passes(['git -c push.autoSetupRemote=true push -u origin HEAD', 'git config remote.origin.url git@example.com:a/b.git',
+                     'git config --get remote.origin.push', 'git config --unset remote.origin.push', 'git config push.autoSetupRemote true',
+                     'git config user.name x', 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=vi git push -u origin HEAD',
+                     'git config --list'], cwd=repo)
+
+    def test_a_variable_in_a_forced_refspec_may_hold_main(self):
+        repo = self.repo('feature/y')
+        self.denied(['git push --force-with-lease origin "$BRANCH"', 'git push -f origin HEAD:$BRANCH', 'git push --force-with-lease origin ${B}',
+                     'git push origin +$B'], message='force_main', cwd=repo)
+        self.passes(['git push origin "$BRANCH"', 'git push -u origin "$BRANCH"', 'BRANCH=feat; git push --force-with-lease origin "$BRANCH"',
+                     'git push --force-with-lease origin $(git branch --show-current)'], cwd=repo)
+        self.denied(['git push --force-with-lease origin $(git branch --show-current)'], message='force_main', cwd=self.repo('main'))
+
+
 class HolesFromTheSecondReview(Cases):
     def test_forced_git_rm_of_the_whole_tree_is_blocked(self):
         self.denied(['git rm -rf .', 'git rm -r -f :/', 'git rm -rf *', 'git rm -fr ./', 'git rm -rf -- .', 'git rm --force -r .',
                      'git -C ../repo rm -rf .', "git rm -rf ':(top)'"], message='discard')
         self.denied(['git rm -rf --pathspec-from-file=list.txt', 'git ls-files | git rm -rf --pathspec-from-file=-', 'git ls-files | xargs git rm -rf',
                      'git ls-files -z | xargs -0 git rm -f', 'git rm -f', 'git rm -rf --pathspec-from-file list.txt'], message='discard')
+        self.passes(['git rm --dry-run -rf .', 'git rm -nrf .', 'git rm -n -r -f :/', 'git rm --dry-run --force -r *', 'git rm -rf -n .'])
         self.passes(['git rm --cached -r --pathspec-from-file=list.txt', 'git ls-files | xargs git rm --cached', 'git ls-files | xargs git rm -r --cached',
                      'git rm --pathspec-from-file=list.txt', 'git rm old.txt other.txt', 'git rm file.txt', 'git rm -r --cached build', 'git rm -rf --cached .', 'git rm -rf src/old', 'git rm -f old.txt',
                      'git rm -r --cached node_modules'])

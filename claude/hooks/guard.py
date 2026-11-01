@@ -82,8 +82,8 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'status', 'stripspace', 'submodule', 'subtree', 'switch', 'symbolic-ref', 'tag', 'update-index', 'update-ref',
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False,
-         'moved': False}  # cwd None = unknown
+STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'before': ';', 'plain': False,
+         'moved': {}, 'undo': [], 'envcfg': []}  # cwd None = unknown; moved: worktree -> 'main' | 'unknown'
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
 SQL_CLIENTS = {'psql', 'sqlite3', 'mysql', 'mariadb', 'duckdb', 'turso', 'pgcli', 'litecli', 'mycli'}
@@ -744,8 +744,8 @@ def gh_decision(args):
     key = api_destroys(args) if words[:1] == ['api'] else None
     if key:
         return 'deny', MSG[key]
-    if words[:2] == ['pr', 'checkout'] and STATE['moved'] != 'main':
-        STATE['moved'] = 'unknown'  # the PR's branch is not known here
+    if words[:2] == ['pr', 'checkout']:
+        mark_moved(STATE['cwd'] or os.getcwd(), 'unknown')  # the PR's branch is not known here
     return None
 
 
@@ -808,13 +808,16 @@ def stage_sweeps(specs, where):
 
 
 def git_head(args):
-    """(folder, subcommand, its arguments, -c settings) of a git call, or None when there is no subcommand."""
-    i, where, config = 0, STATE['cwd'] or os.getcwd(), []
+    """(folder, subcommand, its arguments, -c settings) of a git call, or None when there is no subcommand. The settings
+    are -c and --config-env on the command line and GIT_CONFIG_* variables set before it."""
+    i, where, config = 0, STATE['cwd'] or os.getcwd(), list(STATE['envcfg'])
     while i < len(args):
         if args[i] == '-C' and i + 1 < len(args):
             where = os.path.join(where, os.path.expanduser(args[i + 1]))
-        if args[i] == '-c' and i + 1 < len(args):
+        if args[i] in ('-c', '--config-env') and i + 1 < len(args):
             config.append(args[i + 1])
+        elif args[i].startswith('--config-env='):
+            config.append(args[i].split('=', 1)[1])
         if args[i] in GIT_VALUE:
             i += 2
         elif args[i].startswith('-'):
@@ -824,29 +827,81 @@ def git_head(args):
     return (where, args[i], args[i + 1:], config) if i < len(args) else None
 
 
-def branch_class(name):
-    """'main' for main/master (also origin/main, refs/heads/main), 'unknown' for a name that cannot be told (-, @{-1},
-    a variable), None for any other branch or a path."""
+def env_config(toks):
+    """The settings GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n / GIT_CONFIG_PARAMETERS give a git command,
+    from assignments in front of it and from variables set earlier, as key=value strings."""
+    env = dict(STATE['vars'])
+    for t in toks:
+        if os.path.basename(t) == 'git':
+            break
+        if ASSIGN.match(t):
+            k, v = t.split('=', 1)
+            env[k] = v
+    try:
+        count = min(int(env.get('GIT_CONFIG_COUNT') or 0), 64)
+    except ValueError:
+        count = 0
+    out = ['%s=%s' % (env['GIT_CONFIG_KEY_%d' % n], env.get('GIT_CONFIG_VALUE_%d' % n, '')) for n in range(count)
+           if env.get('GIT_CONFIG_KEY_%d' % n)]
+    return out + re.findall(r"'([^']*)'", env.get('GIT_CONFIG_PARAMETERS', ''))
+
+
+def wt_key(where):
+    """The worktree a git command works in, so a branch change in one is not held against a push in another."""
+    return os.path.realpath(common.repo_root(where) or where)
+
+
+def mark_moved(where, kind):
+    key = wt_key(where)
+    if kind == 'main' or (kind and STATE['moved'].get(key) != 'main'):
+        STATE['moved'][key] = kind
+
+
+def moved_in(where):
+    return STATE['moved'].get(wt_key(where))
+
+
+def restore_moves():
+    """The end of an && chain after a switch to a named branch: the switch may have failed, so what was known before is back."""
+    for key, kind in STATE['undo']:
+        STATE['moved'].setdefault(key, kind)
+    STATE['undo'] = []
+
+
+def branch_class(name, track=False):
+    """'main' for main/master (refs/heads/main too; origin/main only with --track, which makes a local main), 'unknown' for
+    a name that cannot be told (-, @{-1}, a variable), None for any other branch (feature/main is one) or a path."""
     if not name or name == '-' or '@{' in name or '$' in name or '`' in name:
         return 'unknown'
-    return 'main' if name.split('/')[-1] in MAINS else None
+    if name in MAIN_REFS or MAIN_DST.search(name) or (track and name.split('/')[-1] in MAINS):
+        return 'main'
+    return None
 
 
-def note_move(sub, rest, config):
-    """Remember in STATE['moved'] ('main' or 'unknown') that this git command may leave main, or a branch that cannot be
-    told, checked out for the commands after it. The branch read at hook time is stale from then on. Moving to another
-    named branch changes nothing for a later push."""
-    kind = None
+def note_move(sub, rest, config, where, clear=False):
+    """Remember in STATE['moved'] (per worktree: 'main' or 'unknown') that this git command may leave main, or a branch
+    that cannot be told, checked out for the commands after it. The branch read at hook time is stale from then on.
+    Moving to another named branch changes nothing for a later push, and with clear (&& on both sides: the rest of the
+    chain runs only if the switch worked) it even undoes an earlier 'main' for that && chain."""
+    kind, switched = None, False
     if any(c.lower().startswith('alias.') for c in config) or sub not in GIT_KNOWN:
         kind = 'unknown'  # an alias or an external git-<name> can do anything
     elif sub in ('checkout', 'switch'):
-        make = next((rest[k + 1] for k, a in enumerate(rest[:-1]) if a in ('-b', '-B', '-c', '-C', '--create', '--force-create')),
-                    next((a[2:] for a in rest if len(a) > 2 and a[:2] in ('-b', '-B') and not a.startswith('--')), None))
-        p = flag_parts(rest, value_opts={'-b', '-B', '-c', '-C', '--create', '--force-create', '--orphan', '--source', '-s',
-                                         '--conflict', '--pathspec-from-file'}, value_letters='bBcCs')[2]
+        made = {'-b', '-B', '-c', '-C', '--create', '--force-create'}
+        make = next((rest[k + 1] for k, a in enumerate(rest[:-1]) if a in made), None)
+        if make is None:  # -cNAME, -bNAME, --create=NAME, --force-create=NAME
+            make = next((a.split('=', 1)[1] if a.startswith('--') else a[2:] for a in rest if (
+                a[:2] in ('-b', '-B', '-c', '-C') and not a.startswith('--') and len(a) > 2) or a.startswith(
+                ('--create=', '--force-create='))), None)
+        flags = flag_parts(rest, value_opts=made | {'--orphan', '--source', '-s', '--conflict', '--pathspec-from-file'},
+                           value_letters='bBcCs')
+        track = 't' in flags[0] or '--track' in flags[1]
+        p = flags[2]
         target = make or (p[0] if p else None)
         if target and not (sub == 'checkout' and '--' in rest and not make):  # checkout [<tree>] -- <paths> restores files
-            kind = branch_class(target)
+            kind = branch_class(target, track and not make)
+            switched = bool(make) or sub == 'switch' or not os.path.lexists(os.path.join(where, target))
+            switched = switched and '--detach' not in flags[1] and not flags[0] & {'d'}
     elif sub == 'rebase':
         s_, l_, p = flag_parts(rest, value_opts={'--onto', '-s', '--strategy', '-X', '--strategy-option', '-x', '--exec', '-C',
                                                  '--whitespace', '--empty'}, value_letters='sXxC')
@@ -860,15 +915,19 @@ def note_move(sub, rest, config):
     elif sub == 'branch':
         s_, l_, p = flag_parts(rest)
         kind = branch_class(p[-1]) if p and (s_ & {'m', 'M'} or '--move' in l_) else None
-    if kind and STATE['moved'] != 'main':
-        STATE['moved'] = kind
+    if kind:
+        mark_moved(where, kind)
+    elif switched and clear:
+        key = wt_key(where)
+        if key in STATE['moved']:
+            STATE['undo'].append((key, STATE['moved'].pop(key)))
 
 
 def forced_rm(rest, where):
     """git rm that is forced, keeps the files in the tree out of the index only with --cached, and names the whole tree,
     a pathspec file, or nothing at all (xargs and pipes feed the paths)."""
     s, l, p = flag_parts(rest, value_opts={'--pathspec-from-file'})
-    if not ('f' in s or '--force' in l) or '--cached' in l:
+    if not ('f' in s or '--force' in l) or '--cached' in l or 'n' in s or '--dry-run' in l:
         return False
     return not p or '--pathspec-from-file' in l or stage_sweeps(p, where)
 
@@ -878,7 +937,7 @@ def git_decision(args):
     if not head:
         return None
     where, sub, rest, config = head
-    note_move(sub, rest, config)
+    note_move(sub, rest, config, where, clear=STATE['sep'] == STATE['before'] == '&&')
     if sub in LANE_SUBS:
         owner = lane_owner(where)
         if owner and owner != (os.environ.get('AGENT_CORE_TOOL') or 'claude'):
@@ -902,26 +961,27 @@ def git_decision(args):
         s, l, p = flag_parts(rest, value_opts={'--repo', '--receive-pack', '--exec', '--push-option', '-o'}, value_letters='o')
         force = 'f' in s or bool(l & {'--force', '--force-with-lease', '--force-if-includes'})
         deleting = 'd' in s or '--delete' in l
-        plus = colon_delete = main_hit = wild = False
+        plus = colon_delete = main_hit = wild = unresolved = False
         for ref in p[1:]:
             plus = plus or ref.startswith('+')
             src, sep, dst = ref.lstrip('+').partition(':')
             colon_delete = colon_delete or (bool(sep) and not src)
             main_hit = main_hit or (dst if sep else src) in MAIN_REFS or bool(MAIN_DST.search(dst if sep else src))
             wild = wild or '*' in ref
-        # a refspec in the command line config (remote.<name>.push, push.default) is a push nobody can read here
-        configured = any(re.match(r'remote\..*\.push=', c, re.I) or (re.match(r'push\.default=', c, re.I) and (force or plus))
+            unresolved = unresolved or bool(re.search(r'\$[A-Za-z_{]', ref))  # a variable: it may well hold main
+        # a refspec or mirror in the command line config (remote.<name>.push / .mirror, push.default) is a push nobody can read
+        configured = any(re.match(r'remote\..*\.(push|mirror)(=|$)', c, re.I) or (re.match(r'push\.default=', c, re.I) and (force or plus))
                          for c in config)
         if configured or ((force or plus or deleting or colon_delete) and main_hit):
             return 'deny', MSG['force_main']
-        if (force or plus) and (l & {'--all', '--branches'} or wild):
+        if (force or plus) and (l & {'--all', '--branches'} or wild or unresolved):
             return 'deny', MSG['force_main']
-        if (force or plus) and (len(p) < 2 or any(r.lstrip('+') in ('HEAD', '@') or '$(' in r or '`' in r for r in p[1:])):
+        if (force or plus) and (len(p) < 2 or any(r.lstrip('+') in ('HEAD', '@', '$') or '$(' in r or '`' in r for r in p[1:])):
             # no refspec (or one a substitution fills in), or HEAD: the current branch is what gets force-pushed, and an unreadable branch counts as main;
             # so is main as an earlier part of this command left it
-            if STATE['moved'] == 'main' or current_branch(where) in (None, 'main', 'master'):
+            if moved_in(where) == 'main' or current_branch(where) in (None, 'main', 'master'):
                 return 'deny', MSG['force_main']
-            if STATE['moved'] or STATE['cwd'] is None:  # switched to a branch we cannot name, or a folder we cannot follow
+            if moved_in(where) or STATE['cwd'] is None:  # switched to a branch we cannot name, or a folder we cannot follow
                 return 'deny', MSG['branch_unknown']
         if plus or (force and not (l & {'--force-with-lease', '--force-if-includes'})):
             return 'deny', MSG['force']
@@ -954,7 +1014,7 @@ def git_decision(args):
             return 'deny', MSG['branch']
         if '--stdin' in l or (p and p[0] in MAIN_REFS):
             return 'deny', MSG['move_main']
-        if p and p[0] == 'HEAD' and (STATE['moved'] == 'main' or current_branch(where) in (None, 'main', 'master')):
+        if p and p[0] == 'HEAD' and (moved_in(where) == 'main' or current_branch(where) in (None, 'main', 'master')):
             return 'deny', MSG['move_main']
     elif sub == 'branch':
         s, l, p = flag_parts(rest)
@@ -967,6 +1027,12 @@ def git_decision(args):
             # a forced rename or copy onto main; the first `git branch -M main` of a new repo has no main to overwrite
             if not (len(p) == 1 and current_branch(where) == p[0]) and branch_exists(where, p[-1]):
                 return 'deny', MSG['move_main']
+    elif sub == 'config':
+        s, l, p = flag_parts(rest, value_opts={'-f', '--file', '--blob', '--type', '-t', '--default'}, value_letters='ft')
+        p = p[1:] if p[:1] == ['set'] else p
+        reading = s & {'l', 'e'} or l & {'--get', '--get-all', '--get-regexp', '--list', '--unset', '--unset-all', '--edit'}
+        if len(p) >= 2 and not reading and re.match(r'(remote\..*\.(push|mirror)|push\.default)$', p[0], re.I):
+            return 'deny', MSG['force_main']  # a saved refspec or mirror makes every later `git push` a push nobody can read
     elif sub == 'rm':
         if forced_rm(rest, where):
             return 'deny', MSG['discard']  # forced, so it throws away uncommitted edits of every tracked file
@@ -1462,6 +1528,8 @@ def analyze(toks, depth):
             k, v = t.split('=', 1)
             STATE['vars'][k] = expand(v)
         return None
+    STATE['envcfg'] = env_config(toks) if any('GIT_CONFIG' in t for t in toks) or any(
+        k.startswith('GIT_CONFIG') for k in STATE['vars']) else []
     toks = [expand(t) for t in strip_prefix(toks)]
     if not toks:
         return None
@@ -1669,12 +1737,19 @@ def heredoc_substitutions(norm):
     return out
 
 
-def check_tokens(tokens, depth):
+def check_tokens(tokens, depth, norm=''):
     """Judge each simple command in order, first decision wins. ( ) groups, pipeline stages and background jobs run in a
-    child shell, so a cd or assignment there is undone afterwards."""
+    child shell, so a cd or assignment there is undone afterwards. norm is the text the tokens came from: the command
+    substitutions in it are scanned for branch changes right before the simple command they belong to."""
     stack, pipe = [], []
+    events = split_commands(tokens)
+    segs = top_segments(norm)
+    per_command = len(segs) == sum(1 for e in events if e[0] == 'cmd')
+    if not per_command:
+        scan_moves(norm)  # cannot tell which command holds which: take them all up front
+    seg = iter(segs)
     try:
-        for kind, cmd, before, after in split_commands(tokens):
+        for kind, cmd, before, after in events:
             if kind == 'open':
                 stack.append((STATE['cwd'], dict(STATE['vars'])))
                 pipe = []
@@ -1683,11 +1758,15 @@ def check_tokens(tokens, depth):
                     STATE['cwd'], STATE['vars'] = stack.pop()
                 pipe = [['<group>']]
             else:
+                if STATE['undo'] and before != '&&':
+                    restore_moves()
+                if per_command:
+                    scan_moves(next(seg))
                 if before not in PIPES:
                     pipe = []
                 forked = before in PIPES or after in PIPES or after == '&'
                 saved = (STATE['cwd'], dict(STATE['vars'])) if forked else None
-                STATE['pipe'], STATE['sep'] = [list(c) for c in pipe], after
+                STATE['pipe'], STATE['sep'], STATE['before'] = [list(c) for c in pipe], after, before
                 try:
                     decision = analyze(cmd, depth)
                 finally:
@@ -1698,13 +1777,45 @@ def check_tokens(tokens, depth):
                     return decision
                 pipe.append(cmd)
     finally:
+        if depth == 0:
+            restore_moves()
+        STATE['envcfg'] = []
         if stack:
             STATE['cwd'], STATE['vars'] = stack[0]
     return None
 
 
+def top_segments(text):
+    """The text of each simple command of text, split at ; & | and line breaks outside quotes and substitutions, without
+    the pieces that hold no command ({ } !)."""
+    out, start, i, n = [], 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '\\':
+            i += 2
+        elif ch == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+        elif ch == '"':
+            i = _skip_double(text, i + 1)
+        elif text.startswith('$(', i):
+            i = _close_paren(text, i + 2) + 1
+        elif ch == '`':
+            j = i + 1
+            while j < n and text[j] != '`':
+                j += 2 if text[j] == '\\' else 1
+            i = j + 1
+        elif ch in ';&|\n()':
+            out.append(text[start:i])
+            start = i = i + 1
+        else:
+            i += 1
+    out.append(text[start:])
+    return [x for x in out if x.strip() and x.strip() not in ('{', '}', '!')]
+
+
 def scan_moves(norm, depth=0):
-    """A command substitution runs before the command it sits in: note the branch changes in it first."""
+    """A command substitution runs before the command it sits in: note the branch changes in it."""
     if depth > MAX_DEPTH:
         return
     for inner in substitutions(norm) + heredoc_substitutions(norm):
@@ -1713,9 +1824,9 @@ def scan_moves(norm, depth=0):
             cmd = strip_prefix(cmd)
             head = git_head(cmd[1:]) if cmd and os.path.basename(cmd[0]) == 'git' else None
             if head:
-                note_move(head[1], head[2], head[3])
-            elif cmd and cmd[0] == 'gh' and gh_split(cmd[1:])[0][:2] == ['pr', 'checkout'] and STATE['moved'] != 'main':
-                STATE['moved'] = 'unknown'
+                note_move(head[1], head[2], head[3], head[0])
+            elif cmd and cmd[0] == 'gh' and gh_split(cmd[1:])[0][:2] == ['pr', 'checkout']:
+                mark_moved(STATE['cwd'] or os.getcwd(), 'unknown')
         scan_moves(text, depth + 1)
 
 
@@ -1723,13 +1834,12 @@ def check_script(text, depth=0):
     if depth > MAX_DEPTH:
         return 'deny', MSG['deep']
     if depth == 0:
-        STATE['moved'] = False
+        STATE['moved'], STATE['undo'] = {}, []
     try:
         norm = normalize(text)
         if depth == 0:
             STATE['plain'] = bool(PLAIN_RM.match(text))
-        scan_moves(norm)
-        decision = check_tokens(tokens_of(norm), depth)
+        decision = check_tokens(tokens_of(norm), depth, norm)
         if decision:
             return decision
         for inner in substitutions(norm) + heredoc_substitutions(norm):
