@@ -1014,10 +1014,11 @@ def need_object(data, key, where):
         raise ValueError('%s: "%s" must be a JSON object. Fix it, then rerun the installer.' % (where, key))
 
 
-def adopt_legacy_auto_env(st):
+def adopt_legacy_auto_env(st, live):
     """An install from before the autoMode.environment lines were recorded one by one kept {had, previous, set} for the
     whole list. Its `set` lines minus `previous` (yours) become the kit's recorded lines, and the old record goes.
-    Returns your `previous` lines, which that install replaced."""
+    Returns your `previous` lines, which that install replaced, while the live list (live) is still exactly what it
+    wrote; a list you edited since is left as it is."""
     old = st['changes'].get('autoMode.environment')
     if old is None or 'autoModeEnvironment' in st['settings']:
         return []
@@ -1026,7 +1027,7 @@ def adopt_legacy_auto_env(st):
     del st['changes']['autoMode.environment']
     if not old.get('had') and 'autoMode.environment' not in st['created']:
         st['created'].append('autoMode.environment')  # the kit made the list; it goes when it ends up empty
-    return mine_before
+    return mine_before if live == old.get('set') else []
 
 
 def merge_settings(mode):
@@ -1080,7 +1081,7 @@ def merge_settings(mode):
     out['env'] = env
     theirs, wanted = cur.get('permissions') or {}, ours.get('permissions') or {}
     made('permissions', 'permissions' in cur)
-    replaced = adopt_legacy_auto_env(st)
+    replaced = adopt_legacy_auto_env(st, (cur.get('autoMode') or {}).get('environment'))
     recorded = st['settings']
     own_rules = dict((k, len([r for r in theirs.get(k) or [] if r not in (recorded.get(k) or [])])) for k in ('allow', 'deny'))
     perms, owned = dict(theirs), {}
@@ -1309,10 +1310,12 @@ def uninstall_settings(bk, restored, moved):
     for key in ('allow', 'deny'):
         if key in perms:
             perms[key] = [r for r in perms[key] if r not in set(st['settings'].get(key) or [])]
-    adopt_legacy_auto_env(st)
     auto = out.get('autoMode') if isinstance(out.get('autoMode'), dict) else {}
+    replaced = adopt_legacy_auto_env(st, auto.get('environment'))
     if isinstance(auto.get('environment'), list):  # only the lines the kit added
-        auto['environment'] = [l for l in auto['environment'] if l not in set(st['settings'].get('autoModeEnvironment') or [])]
+        kit = set(st['settings'].get('autoModeEnvironment') or [])
+        auto['environment'] = [l for l in replaced if l not in auto['environment']] + \
+            [l for l in auto['environment'] if l not in kit]  # yours that the first release replaced come back
     reverted, changed_since = [], []
     for label, rec in sorted(st['changes'].items()):
         box, key = get_at(out, label)

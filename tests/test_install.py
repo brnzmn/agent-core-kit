@@ -1214,6 +1214,41 @@ class AutoModeRecordMigration(Sandbox):
         self.ok('--uninstall')
         self.assertEqual(self.settings()['autoMode'], {'environment': ['added by hand']})
 
+    def first_release_install_over_the_users_line(self):
+        s = self.settings()
+        s['autoMode'] = {'environment': ['mine']}
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+        self.configure(auto_mode_environment=[self.OLD])
+        self.ok()
+        self.as_first_release_left_it(True, ['mine'])
+
+    def edit_the_list(self, *lines):
+        s = self.settings()
+        s['autoMode']['environment'] += list(lines)
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+
+    def test_uninstall_after_the_upgrade_without_a_sync_puts_the_users_replaced_line_back(self):
+        self.first_release_install_over_the_users_line()
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['mine']})
+
+    def test_a_list_the_user_edited_since_does_not_get_the_replaced_line_back_on_sync(self):
+        self.first_release_install_over_the_users_line()
+        self.edit_the_list('added by hand')
+        self.configure(auto_mode_environment=[self.NEW])
+        self.ok('--sync')
+        env = self.settings()['autoMode']['environment']
+        self.assertNotIn('mine', env)
+        self.assertIn('added by hand', env)
+        self.assertIn(self.NEW, env)
+        self.assertNotIn(self.OLD, env)
+
+    def test_a_list_the_user_edited_since_does_not_get_the_replaced_line_back_on_uninstall(self):
+        self.first_release_install_over_the_users_line()
+        self.edit_the_list('added by hand')
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['added by hand']})
+
     def test_emptying_the_config_takes_the_kits_lines_out_on_the_next_sync(self):
         self.configure(auto_mode_environment=[self.OLD])
         self.ok()
