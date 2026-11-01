@@ -899,19 +899,20 @@ def git_head(args):
 
 def env_config(toks):
     """The settings GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n / GIT_CONFIG_PARAMETERS give a git command,
-    from assignments in front of it and from variables set earlier, as key=value strings."""
+    from assignments in front of it (expanded) and from variables set earlier, as key=value strings. When the count cannot
+    be read every key that is set is taken."""
     env = dict(STATE['vars'])
     for t in toks:
         if os.path.basename(t) == 'git':
             break
         if ASSIGN.match(t):
             k, v = t.split('=', 1)
-            env[k] = v
+            env[k] = expand(v)
     try:
-        count = min(int(env.get('GIT_CONFIG_COUNT') or 0), 64)
+        slots = range(min(int(env.get('GIT_CONFIG_COUNT') or 0), 64))
     except ValueError:
-        count = 0
-    out = ['%s=%s' % (env['GIT_CONFIG_KEY_%d' % n], env.get('GIT_CONFIG_VALUE_%d' % n, '')) for n in range(count)
+        slots = sorted({int(m.group(1)) for k in env for m in [re.match(r'GIT_CONFIG_KEY_(\d{1,2})$', k)] if m})
+    out = ['%s=%s' % (env['GIT_CONFIG_KEY_%d' % n], env.get('GIT_CONFIG_VALUE_%d' % n, '')) for n in slots
            if env.get('GIT_CONFIG_KEY_%d' % n)]
     # 'key=value' before git 2.31, 'key'='value' after it
     return out + [m.group(1) + ('' if m.group(2) is None else '=' + m.group(2))
@@ -984,25 +985,17 @@ def risky_config(entry, forcing=True):
     return key == 'push.default' and forcing and value not in ('current', 'simple', 'nothing')
 
 
+RM_LONG = {'--force', '--cached', '--dry-run', '--ignore-unmatch', '--quiet', '--sparse', '--pathspec-from-file',
+           '--pathspec-file-nul'}
+
+
 def forced_rm(rest, where):
-    """git rm that is forced, keeps the files in the tree out of the index only with --cached, is not a dry run (the last of
-    -n, --dry-run, --no-dry-run wins, likewise for force and cached), and names the whole tree, a pathspec file, or nothing
-    at all (xargs and pipes feed the paths)."""
-    force = cached = dry = False
-    for a in rest:
-        if a == '--':
-            break
-        if a in ('--force', '--no-force'):
-            force = a == '--force'
-        elif a in ('--cached', '--no-cached'):
-            cached = a == '--cached'
-        elif a in ('--dry-run', '--no-dry-run'):
-            dry = a == '--dry-run'
-        elif a.startswith('-') and not a.startswith('--'):
-            force = force or 'f' in a
-            dry = dry or 'n' in a
+    """git rm that is forced, keeps the files in the tree out of the index only with --cached, and names the whole tree,
+    a pathspec file, or nothing at all (xargs and pipes feed the paths). -n does not excuse it. A --no-<option> or an
+    abbreviated long option (--fo, --no-dry) may undo or stand for anything, so it counts as forcing and voids --cached."""
     s, l, p = flag_parts(rest, value_opts={'--pathspec-from-file'})
-    if not force or cached or dry:
+    odd = bool(l - RM_LONG)
+    if not ('f' in s or '--force' in l or odd) or ('--cached' in l and not odd):
         return False
     return not p or '--pathspec-from-file' in l or stage_sweeps(p, where)
 
@@ -1113,9 +1106,9 @@ def git_decision(args):
         if rest[:1] == ['add'] and any(a in ('--mirror', '--mirror=push') for a in rest):
             return 'deny', MSG['mirror']  # a mirror remote makes every plain push overwrite every ref there
     elif sub == 'config':
-        s, l, p = flag_parts(rest, value_opts={'-f', '--file', '--blob', '--type', '-t', '--default'}, value_letters='ft')
+        s, l, p = flag_parts(rest, value_opts={'-f', '--file', '--blob', '--type', '-t', '--default', '--comment'}, value_letters='ft')
         p = p[1:] if p[:1] == ['set'] else p
-        reading = s & {'l', 'e'} or l & {'--get', '--get-all', '--get-regexp', '--list', '--unset', '--unset-all', '--edit'}
+        reading = s & {'l', 'e'} or l & {'--list', '--unset', '--unset-all', '--edit'} or any(x.startswith('--get') for x in l)
         if len(p) >= 2 and not reading and risky_config(p[0] + '=' + p[1]):
             return 'deny', MSG['force_main']  # a saved refspec or mirror makes every later `git push` a push nobody can read
     elif sub == 'rm':

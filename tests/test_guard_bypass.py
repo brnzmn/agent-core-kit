@@ -393,6 +393,11 @@ class FollowUpToTheReviews(Cases):
                      'git config remote.origin.mirror true', 'git config remote.origin.mirror "$X"',
                      'git -c remote.origin.mirror=true push origin HEAD', 'git -c remote.origin.mirror=$X push origin HEAD',
                      'git -c remote.origin.mirror= push origin HEAD', 'git config --global remote.origin.mirror yes',
+                     'N=1; GIT_CONFIG_COUNT=$N GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main git push origin',
+                     'export N=1; GIT_CONFIG_COUNT=${N} GIT_CONFIG_KEY_0=remote.origin.mirror GIT_CONFIG_VALUE_0=true git push origin',
+                     'GIT_CONFIG_COUNT=$UNSET GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main git push origin',  # count unreadable
+                     'GIT_CONFIG_COUNT=x GIT_CONFIG_KEY_1=remote.origin.mirror GIT_CONFIG_VALUE_1=true git push origin',
+                     'git config --comment note remote.origin.push +HEAD:main', 'git config --comment x --global remote.origin.mirror true',
                      # a prefix's settings reach the shell, eval and xargs it starts
                      "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main sh -c 'git push origin'",
                      "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main bash -c 'git push origin'",
@@ -406,7 +411,10 @@ class FollowUpToTheReviews(Cases):
                      'git config --local remote.origin.push "+refs/heads/*:refs/heads/*"'], message='force_main', cwd=repo)
         self.denied(['git remote add --mirror up git@example.com:a/b.git', 'git remote add --mirror=push up git@example.com:a/b.git',
                      'git remote add -f --mirror=push up git@example.com:a/b.git'], message='mirror', cwd=repo)
-        self.passes(['git config remote.origin.mirror', 'git -c push.autoSetupRemote=true push -u origin HEAD', 'git config remote.origin.url git@example.com:a/b.git',
+        self.passes(['git config --get-urlmatch push.default https://example.com', 'git config --get-urlmatch remote.origin.mirror https://example.com',
+                     'git config --get-regexp remote.origin.push', 'git config --get-color push.default', 'git config --get-all remote.origin.push',
+                     'N=1; GIT_CONFIG_COUNT=$N GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=vi git push -u origin HEAD',
+                     'git config --comment note user.name x', 'git config remote.origin.mirror', 'git -c push.autoSetupRemote=true push -u origin HEAD', 'git config remote.origin.url git@example.com:a/b.git',
                      'git config --get remote.origin.push', 'git config --unset remote.origin.push', 'git config push.autoSetupRemote true',
                      'git config user.name x', 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=vi git push -u origin HEAD',
                      'git config --list', 'git config push.default simple', 'git config --global push.default current',
@@ -448,12 +456,13 @@ class HolesFromTheSecondReview(Cases):
                      'git -C ../repo rm -rf .', "git rm -rf ':(top)'"], message='discard')
         self.denied(['git rm -rf --pathspec-from-file=list.txt', 'git ls-files | git rm -rf --pathspec-from-file=-', 'git ls-files | xargs git rm -rf',
                      'git ls-files -z | xargs -0 git rm -f', 'git rm -f', 'git rm -rf --pathspec-from-file list.txt'], message='discard')
-        self.denied(['git rm -rf --dry-run --no-dry-run .', 'git rm -nrf --no-dry-run .', 'git rm -n -r -f --no-dry-run :/',
-                     'git rm --dry-run --no-dry-run --force -r .', 'git rm -f --cached --no-cached -r .', 'git rm --no-force -f -r .'],
-                    message='discard')
-        self.passes(['git rm --no-dry-run --dry-run -rf .', 'git rm -rf --no-dry-run -n .', 'git rm -rf --cached --no-dry-run .',
-                     'git rm -f --no-force -r .', 'git rm -rf --cached --no-cached --cached .'])
-        self.passes(['git rm --dry-run -rf .', 'git rm -nrf .', 'git rm -n -r -f :/', 'git rm --dry-run --force -r *', 'git rm -rf -n .'])
+        self.denied(['git rm -nrf --no-dry .', 'git rm -rf --pathspec-from-file -n', 'git rm -rf -n .', 'git rm -nrf .', 'git rm --dry-run -rf .',
+                     'git rm -n -r -f :/', 'git rm --dry-run --force -r *', 'git rm -rf --dry-run --no-dry-run .', 'git rm -nrf --no-dry-run .',
+                     'git rm --no-dry-run --dry-run -rf .', 'git rm -rf --no-dry-run -n .', 'git rm -f --no-force -r .', 'git rm --no-force -f -r .',
+                     'git rm -rf --cached --no-cached .', 'git rm -rf --cached --no-dry-run .', 'git rm -rf --cached --no-cached --cached .',
+                     'git rm --fo -r .', 'git rm --forc -r .', 'git rm --no-cached -rf .', 'git rm --cache --no-cach -r .',
+                     'git ls-files | xargs git rm -nrf'], message='discard')
+        self.passes(['git rm --no-cached -r dir', 'git rm --dry-run -r dir', 'git rm -n file.txt', 'git rm --pathspec-from-file -n'])
         self.passes(['git rm --cached -r --pathspec-from-file=list.txt', 'git ls-files | xargs git rm --cached', 'git ls-files | xargs git rm -r --cached',
                      'git rm --pathspec-from-file=list.txt', 'git rm old.txt other.txt', 'git rm file.txt', 'git rm -r --cached build', 'git rm -rf --cached .', 'git rm -rf src/old', 'git rm -f old.txt',
                      'git rm -r --cached node_modules'])
