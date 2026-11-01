@@ -24,7 +24,6 @@ Prints a decision as JSON, or nothing to let the call through.
 Its own errors never block a call; they go to learning/hook-errors.log.
 """
 import fnmatch
-import glob
 import json
 import os
 import re
@@ -67,7 +66,8 @@ PLAIN_RM = re.compile(r'^\s*rm\s(?!.*(?:[<>`({]|\$\(|(?<!&)&(?!&)|(?<!\|)\|(?!\|
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/folders', '/private/var/folders')
 MAIN_REFS = {'main', 'master', 'refs/heads/main', 'refs/heads/master'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False}  # cwd None = unknown
+STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False,
+         'raw': []}  # cwd None = unknown; raw = the current command's tokens before $VAR expansion
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
 SQL_CLIENTS = {'psql', 'sqlite3', 'mysql', 'mariadb', 'duckdb', 'turso', 'pgcli', 'litecli', 'mycli'}
@@ -755,7 +755,10 @@ def git_decision(args):
         if s & {'A', 'u'} or l & {'--all', '--update', '--no-ignore-removal'}:
             # -A and -u stage only the named paths; a bare one, a pathspec file, a pathspec the shell may expand to nothing
             # ($VAR, $(...), a glob) or a tree-wide pathspec is the sweep
-            if not p or '--pathspec-from-file' in l or any(re.search(r'[$`*?\[{]', x) for x in p) or stage_sweeps(p, where):
+            # (raw tokens: a variable that holds several words splits into several pathspecs). An unknown folder gives no
+            # repo root to compare with.
+            if (not p or '--pathspec-from-file' in l or STATE['cwd'] is None or any(re.search(r'[$`]', t) for t in STATE['raw'])
+                    or any(re.search(r'[*?\[{]', x) for x in p) or stage_sweeps(p, where)):
                 return 'deny', MSG['stage']
         elif stage_sweeps(p, where):
             return 'deny', MSG['stage']
@@ -1053,9 +1056,10 @@ def listed_names(cmd):
     s, l, p = flag_parts(args, value_opts=SEARCH_VALUE | PATTERN_OPTS, value_letters=SEARCH_LETTERS[prog])
     if not (s & {'l'} or l & {'--files-with-matches', '--name-only'}) or '--files' in l:
         return cmd[1:], []  # prints matching lines, filters its input by the pattern, or lists files without searching
-    patterns = [a.split('=', 1)[1] for a in args if a.startswith('--regexp=')]
-    patterns += [args[k + 1] for k, a in enumerate(args[:-1]) if a in ('-e', '--regexp')]
-    given = s & {'e', 'f'} or any(a in PATTERN_OPTS or a.startswith(('--file=', '--expression=')) for a in args)
+    opts = args[:args.index('--')] if '--' in args else args  # after -- everything is an operand
+    patterns = [a.split('=', 1)[1] for a in opts if a.startswith('--regexp=')]
+    patterns += [opts[k + 1] for k, a in enumerate(opts[:-1]) if a in ('-e', '--regexp')]
+    given = s & {'e', 'f'} or any(a in PATTERN_OPTS or a.startswith(('--file=', '--expression=')) for a in opts)
     if not given and not patterns and p:
         patterns = p[:1]  # no -e/-f: the first operand is the pattern
     names = list(args)
@@ -1070,7 +1074,8 @@ def listed_names(cmd):
 def pattern_env(pattern):
     """True when a search pattern reads as an env file name: .env, ^\\.env, env (process.env and import.meta.env do not)."""
     plain = re.sub(r'[\\^$]', '', pattern)
-    return env_hit(pattern) or env_hit(plain) or plain == 'env' or bool(re.search(r'(?<![A-Za-z0-9_])\.env', plain))
+    return (env_hit(pattern) or env_hit(plain) or plain == 'env' or
+            bool(re.search(r'(?<![A-Za-z0-9_])\.env(?!\.(example|sample|template|dist|defaults?)$)', plain)))
 
 
 def feeds_env(cmd):
@@ -1255,7 +1260,8 @@ def analyze(toks, depth):
             k, v = t.split('=', 1)
             STATE['vars'][k] = expand(v)
         return None
-    toks = [expand(t) for t in strip_prefix(toks)]
+    STATE['raw'] = strip_prefix(toks)
+    toks = [expand(t) for t in STATE['raw']]
     if not toks:
         return None
     if toks[0] in ('export', 'declare', 'typeset', 'local', 'readonly'):

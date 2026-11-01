@@ -206,7 +206,11 @@ class RoutineCommandsPass(unittest.TestCase):
                     'git add -u src/a.py src/b.py'], None, cwd=repo)
         self.check(['unset FILES; git add -A $FILES', 'git add -u $(git diff --name-only)', 'git add -A "$F"',
                     'git add -A src/*', 'git add -A {src,docs}', 'git add -A *.py', 'git add -A src/?.py',
-                    'git add -A `ls`'], 'deny', cwd=repo, key='stage')
+                    'git add -A `ls`', 'FILES="README.md ."; git add -A $FILES', 'D=src; git add -A $D',
+                    'git -C "$R" add -A src'], 'deny', cwd=repo, key='stage')
+        # an unresolved cd leaves no known repo root: the path may be the checkout itself
+        self.check(['cd "$REPO" && git add -A %s' % repo, 'cd "$REPO" && git add -A src/', 'cd "$REPO" && git add -u .'],
+                   'deny', cwd=repo, key='stage')
         self.check(['git add -A', 'git add -u', 'git add --all', 'git add --update', 'git add -A .', 'git add -u .',
                     'git add -A ./', 'git add -A :/', "git add -A '*'", 'git add -A src .', 'git add -A :!docs',
                     'git add -A --pathspec-from-file=list.txt', 'git add -A %s' % repo, 'git add .', 'git commit -a',
@@ -216,16 +220,41 @@ class RoutineCommandsPass(unittest.TestCase):
         with open(os.path.join(CORE, 'claude', 'settings.json'), encoding='utf-8') as fh:
             rules = [r[len('Bash('):-1] for r in json.load(fh)['permissions']['deny'] if r.startswith('Bash(')]
 
-        def blocked(cmd):  # Claude Code's wildcard: * matches any run of characters, spaces included
-            return any(re.fullmatch('.*'.join(re.escape(part) for part in r.split('*')), cmd) for r in rules)
+        def blocked(cmd):
+            # Claude Code's wildcard: * matches any run of characters, spaces included; a trailing :* is the legacy
+            # spelling of a trailing " *", and a lone trailing " *" also matches the bare command
+            for r in rules:
+                r = r[:-2] + ' *' if r.endswith(':*') else r
+                if re.fullmatch('.*'.join(re.escape(part) for part in r.split('*')), cmd):
+                    return True
+                if r.endswith(' *') and r.count('*') == 1 and cmd == r[:-2]:
+                    return True
+            return False
         for cmd in ('git add -A src/', 'git add -u src/', 'git push --force-with-lease origin maintenance/x',
-                    'git push -f origin main-fix', 'git push origin +main-fix', 'git push --force origin HEAD:main-fix', 'git push --force origin mainline', 'git push --force-with-lease origin feat'):
+                    'git push -f origin main-fix', 'git push origin +main-fix', 'git push --force origin HEAD:main-fix',
+                    'git push --force origin mainline', 'git push --force-with-lease origin feat',
+                    'git push --force origin x:mainline', 'git push origin +x:mainline'):
             self.assertFalse(blocked(cmd), cmd)
         for cmd in ('git add -A', 'git add -A .', 'git add .', 'git add --all', 'git push --force origin main',
                     'git push -f origin main', 'git push --force-with-lease origin main', 'git push --force origin main --no-verify',
                     'git push --force origin main:main', 'git push -f origin HEAD:main', 'git push --force-with-lease origin HEAD:main',
-                    'git push origin +main', 'git push origin +main:main'):
+                    'git push --force origin feat:main --no-verify', 'git push origin +main', 'git push origin +main:main',
+                    'git push origin +HEAD:main'):
             self.assertTrue(blocked(cmd), cmd)
+
+    def test_env_pattern_check_honours_the_safe_suffixes_and_stops_at_double_dash(self):
+        self.check(['grep -rl .env.example src | xargs cat', 'grep -rl .env.sample src | xargs cat',
+                    'rg -l "\\.env\\.template$" src | xargs cat', 'grep -l -- process.env src | xargs cat'], None)
+        self.check(["grep -rl '.env.example|.env' src | xargs cat", 'grep -rl .env.local src | xargs cat',
+                    'grep -l -- -e foo.env | xargs cat'], 'deny', key='env')
+
+    def test_guard_has_no_unused_imports(self):
+        import ast
+        with open(os.path.join(HOOKS, 'guard.py'), encoding='utf-8') as fh:
+            source = fh.read()
+        names = [a.asname or a.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.Import) for a in n.names]
+        for name in names:
+            self.assertRegex(source, r'\b%s\.' % re.escape(name), 'unused import ' + name)
 
 
 class MovesInsideARepo(unittest.TestCase):
