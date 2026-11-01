@@ -83,6 +83,7 @@ rewrite|git filter-branch --all
 rewrite|git filter-repo --path src
 
 repo_delete|gh repo delete acme/shop --yes
+alias|git -c alias.p=push p
 repo_delete|gh api -X DELETE repos/acme/shop
 
 rm|cd app && rm -rf data

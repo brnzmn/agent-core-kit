@@ -275,7 +275,7 @@ class ForcePushOfTheCurrentBranch(Cases):
         repo = self.repo('feature/x')
         self.denied(['git switch - && git push --force-with-lease', 'git checkout - && git push -f', 'git checkout @{-1} && git push -f',
                      'git checkout "$B" && git push --force-with-lease', 'gh pr checkout 5 && git push --force-with-lease',
-                     'git co feat && git push --force-with-lease', 'git -c alias.go=checkout go main && git push -f',
+                     'git co feat && git push --force-with-lease',
                      'git bisect reset && git push --force-with-lease'], message='branch_unknown', cwd=repo)
 
     def test_a_folder_that_cannot_be_followed_is_unknown(self):
@@ -377,14 +377,42 @@ class FollowUpToTheReviews(Cases):
                      'git checkout -Bmain HEAD~1 && git push --force-with-lease', 'git switch --force-create=master && git push -f'],
                     message='force_main', cwd=repo)
 
-    def test_only_the_whole_branch_name_is_main(self):
+    def test_a_ref_ending_in_main_is_main(self):
+        """The last path component decides (origin/main, feature/main too): a false deny there is the price of not parsing
+        every way git can name a start point."""
         repo = self.repo('feature/y')
-        self.passes(['git switch feature/main && git push --force-with-lease origin HEAD', 'git checkout -b team/master && git push --force-with-lease origin HEAD',
-                     'git switch --detach HEAD~1; git push --force-with-lease origin feature/y'], cwd=repo)
+        self.passes(['git switch --detach HEAD~1; git push --force-with-lease origin feature/y'], cwd=repo)
         self.denied(['git switch main && git push --force-with-lease origin HEAD', 'git switch --track origin/main && git push -f origin HEAD',
-                     'git symbolic-ref HEAD refs/heads/master && git push -f'], message='force_main', cwd=repo)
+                     'git symbolic-ref HEAD refs/heads/master && git push -f', 'git switch feature/main && git push --force-with-lease origin HEAD',
+                     'git checkout origin/main && git push --force-with-lease origin HEAD'], message='force_main', cwd=repo)
         self.denied(['git push --force-with-lease origin feat:refs/heads/main', 'git push --force-with-lease origin feat:heads/master'],
                     message='force_main', cwd=repo)
+
+    def test_options_the_guard_does_not_know_exactly_leave_the_branch_unknown(self):
+        repo = self.repo('feature/y')
+        self.denied(['git switch --force-cre=main origin/main && git push -f', 'git switch --force-cre main origin/main && git push --force-with-lease'],
+                    message='force_main', cwd=repo)  # named main by its start point as well
+        self.denied(['git switch --create=feat --no-create main && git push -f', 'git switch --create=feat --no-force-create && git push -f',
+                     'git checkout --crea=main && git push -f', 'git checkout -b feat --no-track origin/x && git push --force-with-lease',
+                     'git switch --made-up -c feat && git push --force-with-lease', 'git checkout --no-guess feat && git push -f',
+                     'git checkout --forc -- a.txt && git push --force-with-lease'],
+                    message='branch_unknown', cwd=repo)
+        self.denied(['git switch --orphan main && git push -f', 'git switch --orphan main && git push --force-with-lease origin HEAD', 'git checkout --orphan=main && git push -f',
+                     'git checkout --orphan main origin/main && git push --force-with-lease'], message='force_main', cwd=repo)
+        self.passes(['git checkout -qb feat && git push -u origin feat', 'git checkout -b feat origin/main && git push -u origin feat',
+                     'git switch --orphan fresh && git push -u origin HEAD', 'git switch -c feat --track=direct origin/x && git push -u origin HEAD',
+                     'git checkout --quiet -b feat && git push -u origin feat'], cwd=repo)
+
+    def test_an_alias_set_on_the_command_line_is_denied(self):
+        self.denied(["git -c alias.go=checkout go main && git push -f", "git -c 'alias.p=push -f origin HEAD:main' p", "git -c alias.p='push --force-with-lease origin HEAD:main' p origin",
+                     "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0='push -f origin HEAD:main' git p",
+                     "ALIAS=push git --config-env=alias.p=ALIAS p -f origin HEAD:main", "git --config-env alias.p=PATH p"], message='alias', cwd=self.repo('feature/y'))
+        self.passes(['git -c alias.p=push status', 'git -c alias.push=pull push', 'git -c core.editor=vi commit -m x'], cwd=self.repo('feature/y'))
+
+    def test_config_env_splits_on_the_last_equals(self):
+        self.denied(['SIMPLE=upstream git --config-env=push.default=SIMPLE push --force-with-lease'], message='force_main', cwd=self.repo('feature/y'))
+        self.assertEqual(guard.config_env('push.default=SIMPLE'), 'push.default=$SIMPLE')
+        self.assertEqual(guard.config_env('a=b=AKIT_UNSET'), 'a=b=$AKIT_UNSET')
 
     def test_a_mirror_or_saved_refspec_in_config_is_a_push_nobody_can_read(self):
         repo = self.repo('feature/y')

@@ -262,6 +262,8 @@ MSG = {
                   'and open a PR instead.'),
     'branch_unknown': ('An earlier part of this command switches branch or folder, so the force push cannot be checked. '
                        'Push in its own call or name the refspec (git push origin <branch>).'),
+    'alias': ('An alias set on the command line (-c alias.*, GIT_CONFIG_*) can run any git command, a force push to main '
+              'included. Run the real git command instead.'),
     'stash': 'Dropping stashes is blocked. Leave them; list them in your final message.',
     'worktree': 'Removing or pruning worktrees is blocked. Use the worktree skill: git worktree move into _archive/.',
     'rewrite': 'History rewrites are blocked. Add a new commit instead.',
@@ -902,7 +904,9 @@ def git_head(args):
 def config_env(entry):
     """key=value for a --config-env=key=ENVNAME setting: the value is what the variable ENVNAME holds, from the assignments in
     front of the command, the variables set earlier and the hook's own environment; $ENVNAME when it cannot be told."""
-    key, _, name = entry.partition('=')
+    key, eq, name = entry.rpartition('=')
+    if not eq:
+        key, name = entry, ''
     value = STATE['penv'].get(name, STATE['vars'].get(name, os.environ.get(name)))
     return '%s=%s' % (key, '$' + name if value is None else value)
 
@@ -941,20 +945,24 @@ def env_config(toks):
                   for m in re.finditer(r"'([^']*)'(?:='([^']*)')?", env.get('GIT_CONFIG_PARAMETERS', ''))]
 
 
-def branch_class(name, track=False):
-    """'main' for main/master (refs/heads/main too; origin/main only with --track, which makes a local main), 'unknown' for
-    a name that cannot be told (-, @{-1}, a variable), None for any other branch (feature/main is one) or a path."""
+def branch_class(name):
+    """'main' for a ref whose last component is main or master (origin/main and feature/main too), 'unknown' for a name that
+    cannot be told (-, @{-1}, a variable), None for any other branch or a path."""
     if not name or name == '-' or '@{' in name or '$' in name or '`' in name:
         return 'unknown'
-    if name in MAIN_REFS or MAIN_DST.search(name) or (track and name.split('/')[-1] in MAINS):
-        return 'main'
-    return None
+    return 'main' if name.split('/')[-1] in MAINS else None
+
+
+SWITCH_LONG = {'--quiet', '--force', '--merge', '--conflict', '--detach', '--track', '--orphan', '--create', '--force-create',
+               '--patch', '--ours', '--theirs', '--ignore-skip-worktree-bits', '--overwrite-ignore', '--recurse-submodules',
+               '--pathspec-from-file', '--pathspec-file-nul', '--discard-changes', '--progress', '--ignore-other-worktrees',
+               '--source', '--unified'}
 
 
 def create_name(rest):
     """The new branch name of git checkout / switch: -b NAME, -cNAME, -qBNAME, -qB NAME (the create letter can sit in a
     bundle of short flags; what follows it is the name, or the next argument when nothing does), --create NAME,
-    --force-create=NAME. The last one wins. A letter that takes a value (-t's optional mode, -U) ends the bundle: what
+    --force-create=NAME, --orphan NAME. The last one wins. A letter that takes a value (-t's optional mode, -U) ends the bundle: what
     follows it is that value (-tdirect), not more flags. Options with a separate value are skipped over."""
     name, k = None, 0
     while k < len(rest) and rest[k] != '--':
@@ -963,7 +971,11 @@ def create_name(rest):
             name, k = (rest[k + 1] if k + 1 < len(rest) else None), k + 1
         elif a.startswith(('--create=', '--force-create=')):
             name = a.split('=', 1)[1]
-        elif a in ('--orphan', '--conflict', '--pathspec-from-file', '--source', '--unified'):
+        elif a == '--orphan':
+            name, k = (rest[k + 1] if k + 1 < len(rest) else None), k + 1
+        elif a.startswith('--orphan='):
+            name = a.split('=', 1)[1]
+        elif a in ('--conflict', '--pathspec-from-file', '--source', '--unified'):
             k += 1
         elif a.startswith('-') and not a.startswith('--'):
             at = next((i for i, ch in enumerate(a) if i and ch in 'bBcCtU'), None)
@@ -987,13 +999,14 @@ def note_move(sub, rest, config, where):
         make = create_name(rest)
         flags = flag_parts(rest, value_opts=made | {'--orphan', '--source', '-s', '--conflict', '--pathspec-from-file'},
                            value_letters='bBcCs')
-        track = 't' in flags[0] or '--track' in flags[1]
         p = flags[2]
         target = make or (p[0] if p else None)
         if target and not (sub == 'checkout' and '--' in rest and not make):  # checkout [<tree>] -- <paths> restores files
-            kind = branch_class(target, track and not make)
+            kind = branch_class(target)
             switched = bool(make) or sub == 'switch' or not os.path.lexists(os.path.join(where, target))
             switched = switched and '--detach' not in flags[1] and not flags[0] & {'d'}
+        if flags[1] - SWITCH_LONG and kind != 'main':
+            kind = 'unknown'  # an abbreviation (--force-cre), a negation (--no-create) or something new: git may read it as anything
     elif sub == 'rebase':
         s_, l_, p = flag_parts(rest, value_opts={'--onto', '-s', '--strategy', '-X', '--strategy-option', '-x', '--exec', '-C',
                                                  '--whitespace', '--empty'}, value_letters='sXxC')
@@ -1059,6 +1072,8 @@ def git_decision(args):
         return None
     where, sub, rest, config = head
     note_move(sub, rest, config, where)
+    if sub not in GIT_KNOWN and any(c.lower().startswith('alias.') for c in config):
+        return 'deny', MSG['alias']  # the alias is what runs, and it is not readable here
     if sub in LANE_SUBS:
         owner = lane_owner(where)
         if owner and owner != (os.environ.get('AGENT_CORE_TOOL') or 'claude'):
