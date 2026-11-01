@@ -58,16 +58,23 @@ SEARCH_VALUE = {'--include', '--exclude', '--exclude-dir', '--exclude-from', '--
 PATTERN_OPTS = {'-e', '-f', '--regexp', '--file', '--expression'}
 FILE_FLAGS = {'-g', '--glob', '--iglob', '--include', '-f', '--file'}  # options whose value is a file or a file glob
 LAKE_WRITERS = {'tee', 'truncate', 'chmod', 'chown', 'touch', 'shred', 'unlink', 'rmdir'}
-REGENERABLE = {'node_modules', 'dist', 'build', 'out', '.next', '.turbo', '.cache', 'coverage', '.pytest_cache',
-               '.mypy_cache', '.ruff_cache', '__pycache__', '.parcel-cache', '.svelte-kit', 'target', '.vite', '.nuxt',
-               '.output', '.venv', 'venv', '.vercel', '.wrangler', 'test-results', 'playwright-report', '.eggs', 'tmp'}
+REGENERABLE = {'node_modules', 'dist', '.next', '.turbo', '.cache', 'coverage', '.pytest_cache',
+               '.mypy_cache', '.ruff_cache', '__pycache__', '.parcel-cache', '.svelte-kit', '.vite', '.nuxt',
+               '.output', '.venv', 'venv', '.vercel', '.wrangler', 'test-results', 'playwright-report', '.eggs'}
+GENERIC = {'build', 'out', 'target', 'tmp'}  # build folders only inside a project; anywhere else they are somebody's folder
+PROJECT_MARKERS = ('.git', 'package.json', 'pyproject.toml', 'setup.py', 'requirements.txt', 'Cargo.toml', 'go.mod',
+                   'pom.xml', 'build.gradle', 'build.gradle.kts', 'Gemfile', 'composer.json', 'mix.exs', 'Makefile',
+                   'CMakeLists.txt', 'Package.swift', 'deno.json', 'tsconfig.json')
+PROJECT_HOMES = {'projects', 'project', 'code', 'dev', 'repos', 'src', 'work', 'workspace', 'github'}
 # a script whose first command is rm and that has nothing running before or beside it: no heredoc, substitution, redirect,
 # pipe, background job, group or eval (&& and || are fine)
 PLAIN_RM = re.compile(r'^\s*rm\s(?!.*(?:[<>`({]|\$\(|(?<!&)&(?!&)|(?<!\|)\|(?!\|)|\b(?:eval|exec|source)\b))', re.S)
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/folders', '/private/var/folders')
 MAIN_REFS = {'main', 'master', 'refs/heads/main', 'refs/heads/master'}
+BRANCH_MOVERS = {'checkout', 'switch', 'rebase', 'symbolic-ref', 'bisect'}  # change which branch the next command sees
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False}  # cwd None = unknown
+STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False,
+         'moved': False}  # cwd None = unknown
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
 SQL_CLIENTS = {'psql', 'sqlite3', 'mysql', 'mariadb', 'duckdb', 'turso', 'pgcli', 'litecli', 'mycli'}
@@ -96,6 +103,7 @@ XARGS_VALUE = {'-I', '-i', '-L', '-l', '-n', '-P', '-s', '-E', '-e', '-d', '-a',
 MKTEMP = re.compile(r'^(?:\$\(mktemp[^()`;&|<>$\n]*\)|`mktemp[^()`;&|<>$\n]*`)(?:/[^$`()\n]*)?$')
 TMPDIR_REF = re.compile(r'^(?:\$TMPDIR|\$\{TMPDIR(?::-/?tmp)?\})/(.+)$')
 API_MERGE = re.compile(r'(^|/)pulls/[^/\s]+/merge/?(\?.*)?$')
+API_REPO = re.compile(r'^(https://api\.github\.com)?/?repos/[^/\s]+/[^/\s]+/?(\?.*)?$')
 GRAPHQL_MERGE = re.compile(r'\b(mergePullRequest|enablePullRequestAutoMerge)\b')
 HTTP_CLIENTS = {'curl', 'wget', 'http', 'https', 'xh'}
 WORKTREE = re.compile(r'(^|/)([^/]*-wt(/[^/]+)?|\.claude/worktrees(/[^/]+)?|[^/]*\.worktree)/?$')
@@ -238,9 +246,12 @@ MSG = {
     'clean': 'git clean is blocked. Move the untracked files into _to_delete/ and list what moved.',
     'discard': 'Discarding all changes is blocked. Run git stash push -u -m "backup <date>" instead.',
     'branch': 'Force-deleting a branch is blocked. Use git branch -d for merged branches; list unmerged ones.',
+    'move_main': ('Moving main/master with git branch -f or git update-ref rewrites it silently. Commit on a branch '
+                  'and open a PR instead.'),
     'stash': 'Dropping stashes is blocked. Leave them; list them in your final message.',
     'worktree': 'Removing or pruning worktrees is blocked. Use the worktree skill: git worktree move into _archive/.',
     'rewrite': 'History rewrites are blocked. Add a new commit instead.',
+    'repo_delete': 'Deleting a GitHub repo is blocked; ' + USER + ' deletes repos. Name the repo in your final message.',
     'review_wait': ('PR #%s goes into %s, a gated branch of %s (pr_gate in config), so the merge waits for both '
                     'reviews of its head %s. Missing: %s. Run ' + _esc(PR_REVIEW) + ' %s codex (or claude) from a '
                     'checkout of the head, read the comment it posts, then merge.'),
@@ -268,6 +279,8 @@ MSG = {
                      'full list, and after a yes move them by name (or with ' + TRASH + ' --approved).'),
     'bulk_move': ('Bulk moves out of a repo go to the trash: ' + TRASH + ' <paths> keeps a manifest and restore. '
                   'Moving into an _archive/ folder by explicit names is fine.'),
+    'rm_cwd': ('That deletes the whole working folder. Name the files or folders to delete; a recursive delete of plain '
+               'paths then goes to the trash.'),
     'mv_wt': 'Moving a worktree with mv breaks git links. Use git worktree move.',
     'env': 'Reading an env file puts secrets into the conversation. Read .env.example or check variable names instead.',
     'lake': ('This writes to a protected folder (protected_dirs in config), which is read-only unless ' + USER +
@@ -300,6 +313,10 @@ CODEX_RULES = [
      'clean'),
     (['git', 'switch', ['--discard-changes', '-f', '--force']], 'discard'),
     (['git', 'update-ref', ['-d', '--delete']], 'branch'),
+    (['git', 'update-ref', ['refs/heads/main', 'refs/heads/master']], 'move_main'),
+    (['git', 'branch', ['-f', '--force'], MAINS], 'move_main'),
+    (['git', 'rm', ['-rf', '-fr'], ['.', './', ':/', '*']], 'discard'),
+    (['gh', 'repo', 'delete'], 'repo_delete'),
     (['git', 'worktree', 'remove'], 'worktree'),
 ]
 
@@ -675,12 +692,29 @@ def gh_split(args):
     return words, repo, rest
 
 
+def api_deletes_repo(args):
+    """gh api -X DELETE on a repos/<owner>/<repo> path, the method given as -X DELETE, -XDELETE or --method[=]DELETE."""
+    method = ''
+    for k, a in enumerate(args):
+        if a in ('-X', '--method') and k + 1 < len(args):
+            method = args[k + 1]
+        elif a.startswith('--method='):
+            method = a.split('=', 1)[1]
+        elif a.startswith('-X') and len(a) > 2:
+            method = a[2:]
+    return method.upper() == 'DELETE' and any(API_REPO.match(a) for a in args)
+
+
 def gh_decision(args):
     words, repo, rest = gh_split(args)
     if words[:2] == ['pr', 'merge']:
         return merge_decision(rest, repo)
     if words[:1] == ['api'] and gate_branches() and any(API_MERGE.search(a) or GRAPHQL_MERGE.search(a) for a in args):
         return 'deny', MSG['api_merge']
+    if words[:2] == ['repo', 'delete'] or (words[:1] == ['api'] and api_deletes_repo(args)):
+        return 'deny', MSG['repo_delete']
+    if words[:2] == ['pr', 'checkout']:
+        STATE['moved'] = True
     return None
 
 
@@ -692,6 +726,16 @@ def current_branch(where):
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+
+
+def branch_exists(where, name):
+    """True when refs/heads/<name> exists in where, or cannot be told (git missing, no repo)."""
+    try:
+        out = subprocess.run(['git', '-C', where, 'show-ref', '--verify', '--quiet', 'refs/heads/' + name],
+                             capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return out.returncode != 1
 
 
 def stage_sweeps(specs, where):
@@ -746,6 +790,8 @@ def git_decision(args):
     if i >= len(args):
         return None
     sub, rest = args[i], args[i + 1:]
+    if sub in BRANCH_MOVERS or (sub == 'branch' and {'-m', '-M', '--move'} & set(rest)):
+        STATE['moved'] = True  # a later push in the same command runs on another branch than the one read now
     if sub in LANE_SUBS:
         owner = lane_owner(where)
         if owner and owner != (os.environ.get('AGENT_CORE_TOOL') or 'claude'):
@@ -780,8 +826,9 @@ def git_decision(args):
         if (force or plus) and l & {'--all', '--branches'}:
             return 'deny', MSG['force_main']
         if (force or plus) and (len(p) < 2 or any(r.lstrip('+') in ('HEAD', '@') for r in p[1:])):
-            # no refspec, or HEAD: the current branch is what gets force-pushed, and an unreadable branch counts as main
-            if current_branch(where) in (None, 'main', 'master'):
+            # no refspec, or HEAD: the current branch is what gets force-pushed, and an unreadable branch counts as main;
+            # so is one an earlier part of this command may have switched, or a folder we could not follow
+            if STATE['moved'] or STATE['cwd'] is None or current_branch(where) in (None, 'main', 'master'):
                 return 'deny', MSG['force_main']
         if plus or (force and not (l & {'--force-with-lease', '--force-if-includes'})):
             return 'deny', MSG['force']
@@ -812,10 +859,23 @@ def git_decision(args):
         s, l, p = flag_parts(rest, value_opts={'-m'}, value_letters='m')
         if 'd' in s or '--delete' in l:
             return 'deny', MSG['branch']
+        if p and p[0] in MAIN_REFS:
+            return 'deny', MSG['move_main']
     elif sub == 'branch':
         s, l, p = flag_parts(rest)
-        if 'D' in s or (('d' in s or '--delete' in l) and ('f' in s or '--force' in l)):
+        force = 'f' in s or '--force' in l
+        if 'D' in s or (('d' in s or '--delete' in l) and force):
             return 'deny', MSG['branch']
+        if force and not s & {'d', 'm', 'M', 'c', 'C'} and p and p[0] in MAINS:
+            return 'deny', MSG['move_main']
+        if p and p[-1] in MAINS and (s & {'M', 'C'} or (s & {'m', 'c'} or l & {'--move', '--copy'}) and force):
+            # a forced rename or copy onto main; the first `git branch -M main` of a new repo has no main to overwrite
+            if not (len(p) == 1 and current_branch(where) == p[0]) and branch_exists(where, p[-1]):
+                return 'deny', MSG['move_main']
+    elif sub == 'rm':
+        s, l, p = flag_parts(rest, value_opts={'--pathspec-from-file'})
+        if ('f' in s or '--force' in l) and '--cached' not in l and stage_sweeps(p, where):
+            return 'deny', MSG['discard']  # forced, so it throws away uncommitted edits of every tracked file
     elif sub == 'stash':
         if rest[:1] and rest[0] in ('drop', 'clear'):
             return 'deny', MSG['stash']
@@ -839,6 +899,29 @@ def _temp_path(path):
     return any(path.startswith(r + '/') and real.startswith(q + '/') for r in TEMP_ROOTS for q in roots)
 
 
+def _not_a_project(folder):
+    """True for a folder that holds projects instead of being one: home, a volume root, projects_root from the config, and
+    a Projects/Code/... folder directly under home or a volume."""
+    folder = os.path.normpath(folder)
+    parent = os.path.dirname(folder)
+    root = common.config().get('projects_root')
+    tops = {common.HOME, os.path.realpath(common.HOME)} | ({os.path.normpath(os.path.expanduser(str(root)))} if root else set())
+    return (folder in ('/', '/Volumes', '/Users') or parent == '/Volumes' or folder in tops or os.path.realpath(folder) in tops
+            or (os.path.basename(folder).lower() in PROJECT_HOMES and (parent in tops or os.path.dirname(parent) == '/Volumes')))
+
+
+def _in_project(folder):
+    """True when folder or a folder above it (below home, a volume or the projects folder) has a project marker."""
+    while folder and not _not_a_project(folder):
+        if any(os.path.exists(os.path.join(folder, m)) for m in PROJECT_MARKERS):
+            return True
+        up = os.path.dirname(folder)
+        if up == folder:
+            break
+        folder = up
+    return False
+
+
 def disposable(target):
     """True for a target `rm -r` may delete without the trash: a fresh mktemp, a path under temp, a build folder.
     A target with .. segments, or with a variable or substitution other than a bare $TMPDIR/..., never is."""
@@ -853,16 +936,22 @@ def disposable(target):
     if '$' in target or '`' in target:
         return False
     if target.startswith(('/', '~')):
-        norm = os.path.normpath(target)
+        norm = os.path.normpath(os.path.expanduser(target))
     else:
         if STATE['cwd'] is None and (PROTECTED.name_re or PROTECTED.paths):
             return False  # a relative target with the folder unknown could sit in a protected folder
         norm = os.path.normpath(os.path.join(STATE['cwd'], target) if STATE['cwd'] else target)
     if _temp_path(norm):
         return True
-    base = os.path.basename(norm.rstrip('/'))
-    if GLOB.search(base):
-        base = os.path.basename(os.path.dirname(norm))
+    folder = norm.rstrip('/')
+    if GLOB.search(os.path.basename(folder)):
+        folder = os.path.dirname(folder)
+    base, parent = os.path.basename(folder), os.path.dirname(folder)
+    known = os.path.isabs(folder)  # with the working folder unknown only an unambiguous build name is enough
+    if known and _not_a_project(parent):
+        return False  # ~/tmp, /Volumes/disk/target, ~/Projects/build: somebody's folder, whatever it is called
+    if base in GENERIC:
+        return known and _in_project(parent)
     return base in REGENERABLE or base.endswith('.egg-info') or base.startswith(('dist-', 'build-'))
 
 
@@ -892,12 +981,23 @@ def rm_parts(args):
     return recursive, force, targets
 
 
+def whole_cwd(target):
+    """True for ., ./, *, .., or the working folder by name: a delete that would take the whole folder with it."""
+    if '$' in target or '`' in target:
+        return False
+    parts = [x for x in target.split('/') if x not in ('', '.')]
+    if not target.startswith(('/', '~')) and (not parts or parts == ['*'] or set(parts) == {'..'}):
+        return True
+    return bool(STATE['cwd']) and not GLOB.search(target) and '..' not in parts and (
+        os.path.normpath(os.path.join(STATE['cwd'], os.path.expanduser(target))) == os.path.normpath(STATE['cwd']))
+
+
 def rm_decision(args):
     recursive, _, targets = rm_parts(args)
     if any(PROTECTED.hit(t, ancestor=recursive) for t in targets):
         return 'deny', MSG['lake']
     if recursive and (not targets or not all(disposable(t) or plain_files(t) for t in targets)):
-        return 'deny', MSG['rm']
+        return 'deny', MSG['rm_cwd'] if any(whole_cwd(t) for t in targets) else MSG['rm']
     return None
 
 
@@ -1499,6 +1599,8 @@ def check_tokens(tokens, depth):
 def check_script(text, depth=0):
     if depth > MAX_DEPTH:
         return 'deny', MSG['deep']
+    if depth == 0:
+        STATE['moved'] = False
     try:
         norm = normalize(text)
         if depth == 0:

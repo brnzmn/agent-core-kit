@@ -122,11 +122,12 @@ class RoutineCommandsPass(unittest.TestCase):
     def test_clean_reinstall_deletes_lockfiles(self):
         self.check(['rm -rf node_modules package-lock.json && npm install', 'rm -rf node_modules pnpm-lock.yaml && pnpm install',
                     'rm -rf package-lock.json'], None, cwd=self.cwd)
-        self.check(['rm -rf src', 'rm -rf node_modules src', 'rm -rf package-lock.json src', 'rm -rf *', 'rm -rf srclink',
+        self.check(['rm -rf src', 'rm -rf node_modules src', 'rm -rf package-lock.json src', 'rm -rf srclink',
                     'rm -rf srclink/', 'rm -rf package-lock.json missing-dir', 'rm -rf $X/package-lock.json',
                     'rm -rf dist *.tsbuildinfo', 'rm -rf *.tsbuildinfo', 'rm -rf [^n]*', 'rm -rf lake-*/x.csv',
                     'rm -rf package-lock.js?n', 'rm -rf package-lock.json{,}', 'rm -rf ~/package-lock.json'],
                    'deny', cwd=self.cwd, key='rm', tail=' && true')
+        self.check(['rm -rf *'], 'deny', cwd=self.cwd, key='rm_cwd', tail=' && true')
 
     def test_a_file_check_holds_only_for_a_first_rm_with_nothing_beside_it(self):
         for cmd in ('mv README.md README.bak && mv tests README.md && rm -rf README.md',

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import CORE, HOOKS, LOCAL, bash, make_local  # noqa: E402
@@ -19,6 +20,7 @@ from helpers import CORE, HOOKS, LOCAL, bash, make_local  # noqa: E402
 os.environ['AGENT_CORE_DIR'] = CORE  # so the in-process import sees the same kit and local/ as the hook subprocesses
 os.environ['AGENT_CORE_LOCAL'] = LOCAL
 sys.path.insert(0, HOOKS)
+import common  # noqa: E402
 import guard  # noqa: E402
 
 WORK = '/work/project'  # does not exist
@@ -120,6 +122,7 @@ class HiddenRecursiveDeletes(Cases):
                      'cd /tmp && cd ~root && rm -rf src', 'cd /tmp && cd /tmp/* && rm -rf src', 'cd /tmp && popd && rm -rf src',
                      'cd - && rm -rf node_modules'])
         self.passes(['cd /tmp && cd sub && rm -rf src', 'cd /tmp && rm -rf /tmp/x', 'cd - && rm -rf /tmp/x', 'pushd /tmp && rm -rf src'])
+        self.denied(['cd - && rm -rf .', 'cd - && rm -rf ..'], message='rm_cwd')
 
     def test_a_cd_into_a_missing_folder_only_counts_when_and_and_guards_the_rest(self):
         self.denied(['cd /tmp/does-not-exist-1; rm -rf src', 'cd /tmp/does-not-exist-1 || true; rm -rf src',
@@ -255,6 +258,109 @@ class ForcePushOfTheCurrentBranch(Cases):
         self.denied(['git push --force-with-lease origin HEAD'], message='force_main', cwd=detached)
         self.denied(['git push --force-with-lease', 'git push -f origin HEAD'], message='force_main', cwd=WORK)  # not a repo at all
         self.denied(['git push --force-with-lease --all', 'git push -f --branches'], message='force_main', cwd=self.repo('feature/z'))
+
+    def test_a_switch_earlier_in_the_command_makes_the_branch_unknown(self):
+        repo = self.repo('feature/x')
+        self.denied(['git checkout main && git push --force-with-lease', 'git switch main; git push --force-with-lease origin HEAD',
+                     'git checkout -q main && git push -f', '(git checkout main); git push --force-with-lease',
+                     'git -C . checkout main && git push --force-with-lease', 'git branch -M main && git push --force-with-lease',
+                     'gh pr checkout 5 && git push --force-with-lease', 'git rebase main feature/x && git push --force-with-lease'],
+                    message='force_main', cwd=repo)
+
+    def test_a_folder_that_cannot_be_followed_makes_the_branch_unknown(self):
+        self.denied(['cd "$DIR" && git push --force-with-lease', 'cd - && git push --force-with-lease origin HEAD'],
+                    message='force_main', cwd=self.repo('feature/x'))
+
+    def test_everyday_pushes_stay_allowed(self):
+        repo = self.repo('feature/x')
+        self.passes(['git push -u origin HEAD', 'git checkout -b feat && git push -u origin feat', 'git switch -c feat && git push -u origin HEAD',
+                     'git checkout feat && git push --force-with-lease origin feat', 'git checkout main && git push origin main',
+                     'git push --force-with-lease && git checkout main', 'git branch -d merged'], cwd=repo)
+
+
+class HolesFromTheSecondReview(Cases):
+    def test_forced_git_rm_of_the_whole_tree_is_blocked(self):
+        self.denied(['git rm -rf .', 'git rm -r -f :/', 'git rm -rf *', 'git rm -fr ./', 'git rm -rf -- .', 'git rm --force -r .',
+                     'git -C ../repo rm -rf .', "git rm -rf ':(top)'"], message='discard')
+        self.passes(['git rm file.txt', 'git rm -r --cached build', 'git rm -rf --cached .', 'git rm -rf src/old', 'git rm -f old.txt',
+                     'git rm -r --cached node_modules'])
+
+    def test_deleting_a_repo_is_blocked(self):
+        self.denied(['gh repo delete acme/shop --yes', 'gh repo delete acme/shop', 'gh repo delete', 'gh -R acme/shop repo delete --yes',
+                     'gh api -X DELETE repos/acme/shop', 'gh api --method DELETE /repos/acme/shop', 'gh api repos/acme/shop -XDELETE',
+                     'gh api --method=delete repos/acme/shop', 'gh api -X DELETE repos/{owner}/{repo}'], message='repo_delete')
+        self.passes(['gh repo view acme/shop', 'gh repo create acme/new --private', 'gh repo clone acme/shop', 'gh pr create --fill',
+                     'gh api repos/acme/shop', 'gh api -X DELETE repos/acme/shop/issues/comments/5', 'gh api -X PATCH repos/acme/shop'])
+
+    def test_moving_main_with_branch_or_update_ref_is_blocked(self):
+        self.denied(['git branch -f main HEAD~5', 'git branch -f master abc1234', 'git branch --force main HEAD~1', 'git branch -f main',
+                     'git branch main HEAD~5 -f', 'git update-ref refs/heads/main abc1234', 'git update-ref -m reset refs/heads/master HEAD~1',
+                     'git -C ../repo branch -f main HEAD~5', 'git branch -M x main', 'git branch -C x master', 'git branch -m -f x main'],
+                    message='move_main')
+        self.passes(['git branch -d merged', 'git branch -f feature main', 'git branch -m old new', 'git branch feat', 'git branch -c a b',
+                     'git update-ref refs/heads/scratch HEAD', 'git branch -m master main'])
+
+    def test_a_rename_onto_main_depends_on_main_existing(self):
+        fresh = os.path.realpath(tempfile.mkdtemp(prefix='akit-branch-'))
+        self.addCleanup(shutil.rmtree, fresh, ignore_errors=True)
+        git('init', '-q', '-b', 'master', fresh, cwd=fresh)
+        git('commit', '-q', '--allow-empty', '-m', 'init', cwd=fresh)
+        self.passes(['git branch -M main'], cwd=fresh)  # no main yet: the first rename of a new repo
+        git('branch', 'main', cwd=fresh)
+        self.denied(['git branch -M main', 'git branch -M scratch main'], message='move_main', cwd=fresh)
+        git('checkout', '-q', 'main', cwd=fresh)
+        self.passes(['git branch -M main'], cwd=fresh)  # already main: nothing moves
+
+    def test_rm_of_the_working_folder_is_denied_not_trashed(self):
+        self.denied(['rm -rf .', 'rm -rf ./', 'rm -rf *', 'rm -rf ./*', 'rm -rf ..', 'rm -rf %s' % WORK, 'rm -rf %s/' % WORK,
+                     'rm -rf src .'], message='rm_cwd')
+        for cmd in ('rm -rf src/old', 'rm -rf .git', 'rm -rf ./src'):  # a named path is still moved to the trash
+            self.never_direct([cmd])
+            self.assertEqual(bash(cmd, cwd=WORK)[0], 'allow', cmd)
+
+
+class GenericFolderNames(unittest.TestCase):
+    """build, out, target and tmp are disposable only inside a project; node_modules, dist and the like anywhere."""
+    def setUp(self):
+        patch = mock.patch.object(guard, 'TEMP_ROOTS', ())  # the test folders live under a temp root otherwise
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(guard.STATE.update, cwd='')
+        self.base = os.path.realpath(tempfile.mkdtemp(prefix='akit-proj-'))
+        self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+        self.project = os.path.join(self.base, 'app')
+        os.makedirs(os.path.join(self.project, 'packages', 'web'))
+        open(os.path.join(self.project, 'package.json'), 'w').close()
+        self.bare = os.path.join(self.base, 'notes')
+        os.makedirs(self.bare)
+
+    def at(self, cwd, target):
+        guard.STATE['cwd'] = cwd
+        return guard.disposable(target)
+
+    def test_inside_a_project_they_are_disposable(self):
+        for name in ('build', 'out', 'target', 'tmp', 'node_modules', 'dist', '.next', 'build/*'):
+            self.assertTrue(self.at(self.project, name), name)
+        self.assertTrue(self.at(self.project, 'packages/web/build'))  # the marker is in a folder above
+        self.assertTrue(self.at(os.path.join(self.project, 'packages', 'web'), 'target'))
+
+    def test_outside_a_project_only_the_unambiguous_names_are(self):
+        for name in ('build', 'out', 'target', 'tmp'):
+            self.assertFalse(self.at(self.bare, name), name)
+        for name in ('node_modules', 'dist', '.next', '__pycache__'):
+            self.assertTrue(self.at(self.bare, name), name)
+
+    def test_home_a_volume_and_the_projects_folder_are_never_a_project(self):
+        home = common.HOME
+        for target in ('~/tmp', '~/out', '~/build', '~/target', '~/node_modules', '~/dist', '%s/build' % home, '/Volumes/Data/target',
+                       '/Volumes/Data/tmp', '/Volumes/Data/Projects/target', '/Volumes/Data/Projects/build', '~/Projects/out',
+                       '~/code/tmp', '/Volumes/Data/dist'):
+            self.assertFalse(self.at(self.project, target), target)
+
+    def test_a_projects_root_from_the_config_is_never_a_project(self):
+        with mock.patch.object(common, 'config', return_value={'projects_root': self.base}):
+            self.assertFalse(self.at(self.project, os.path.join(self.base, 'build')))
+            self.assertTrue(self.at(self.project, os.path.join(self.project, 'build')))
 
 
 class LearningProposals(Cases):
