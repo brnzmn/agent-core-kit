@@ -121,25 +121,34 @@ class RoutineCommandsPass(unittest.TestCase):
 
     def test_clean_reinstall_deletes_lockfiles(self):
         self.check(['rm -rf node_modules package-lock.json && npm install', 'rm -rf node_modules pnpm-lock.yaml && pnpm install',
-                    'rm -rf package-lock.json', 'ls && rm -rf node_modules package-lock.json && npm install',
-                    'rm -rf dist && rm -rf package-lock.json && npm install'], None, cwd=self.cwd)
+                    'rm -rf package-lock.json'], None, cwd=self.cwd)
         self.check(['rm -rf src', 'rm -rf node_modules src', 'rm -rf package-lock.json src', 'rm -rf *', 'rm -rf srclink',
                     'rm -rf srclink/', 'rm -rf package-lock.json missing-dir', 'rm -rf $X/package-lock.json',
                     'rm -rf dist *.tsbuildinfo', 'rm -rf *.tsbuildinfo', 'rm -rf [^n]*', 'rm -rf lake-*/x.csv',
                     'rm -rf package-lock.js?n', 'rm -rf package-lock.json{,}', 'rm -rf ~/package-lock.json'],
                    'deny', cwd=self.cwd, key='rm', tail=' && true')
 
-    def test_a_file_check_is_void_once_something_may_have_moved_files(self):
+    def test_a_file_check_holds_only_for_a_first_rm_with_nothing_beside_it(self):
         for cmd in ('mv README.md README.bak && mv tests README.md && rm -rf README.md',
                     'mv src package-lock.json; rm -rf package-lock.json && true', 'touch x && rm -rf package-lock.json && true',
                     'echo $(mv src package-lock.json) && rm -rf package-lock.json && true',
                     'echo `mv src package-lock.json`; rm -rf package-lock.json && true',
                     'bash -c "mv src package-lock.json" && rm -rf package-lock.json && true',
-                    'shopt -s dotglob; rm -rf * && true',
-                    'while true; do rm -rf package-lock.json; mv src package-lock.json; done',
+                    'cat <<EOF\n$(rm -f README.md; mv tests README.md)\nEOF\nrm -rf README.md && true',
+                    'rg --pre ./prep pat README.md; rm -rf README.md && true',
+                    'ls\t(\t) { rm -rf README.md; }; rm -f README.md; mv tests README.md; ls && true',
+                    '(sleep 1; rm -rf package-lock.json) & rm package-lock.json; mv src package-lock.json',
+                    '{ sleep 1; rm -rf README.md; } | { rm README.md; mv tests README.md; }',
+                    'rm -rf package-lock.json & mv src package-lock.json', 'rm -rf package-lock.json | cat',
+                    'rm -rf package-lock.json <<EOF\n$(mv src package-lock.json)\nEOF',
+                    'rm -rf package-lock.json < <(mv src package-lock.json)', 'rm -rf package-lock.json > out.txt && true',
+                    'while rm -rf package-lock.json; do mv src package-lock.json; done',
                     'for i in 1 2; do rm -rf package-lock.json; mv src package-lock.json; done',
-                    'ls() { rm -rf package-lock.json; }; mv src package-lock.json; ls && true',
-                    'npm run clean && rm -rf package-lock.json && true', 'cat a > b && rm -rf package-lock.json && true'):
+                    'sudo rm -rf package-lock.json && true', 'cd . && rm -rf package-lock.json && true',
+                    'rm -rf node_modules && rm -rf package-lock.json && true', 'rm -rf package-lock.json && eval "mv src x"',
+                    'rm -rf package-lock.json && bash -c "mv src package-lock.json; rm -rf package-lock.json"',
+                    'rm -rf package-lock.json && mv src package-lock.json && rm -rf package-lock.json',
+                    'shopt -s dotglob; rm -rf * && true', 'npm run clean && rm -rf package-lock.json && true'):
             with self.subTest(cmd=cmd):
                 os.makedirs(os.path.join(self.cwd, 'tests'), exist_ok=True)
                 open(os.path.join(self.cwd, 'README.md'), 'w').close()

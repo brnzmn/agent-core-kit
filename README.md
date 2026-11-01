@@ -128,7 +128,7 @@ Codex reviews block on any P0 or P1 finding. The adversarial review blocks on a 
 
 ## The guard hook
 
-A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs, `sudo` and `env` wrappers) and denies the dangerous ones, including commands hidden in `eval`, `$( )`, backticks, pipes into `sh` and heredocs fed to a shell. Each denial names the alternative. It asks only for gated models; everything else is a plain deny, so bypass mode does not stall on it. The same policy runs in Codex through its hooks, with a rules file as a second layer for the git commands.
+A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs, `sudo` and `env` wrappers) and denies the dangerous ones, including commands hidden in `eval`, `$( )`, backticks, pipes into `sh` and heredocs fed to a shell. Each denial names the alternative. It asks only for gated models; everything else is a plain deny, so bypass mode does not stall on it. The same policy runs in Codex through its hooks, with a rules file as a second layer for the git commands. Codex rules match a command prefix, so they also forbid `git add -A <path>`, which the hook allows.
 
 | Blocked | Use instead |
 |---|---|

@@ -58,16 +58,16 @@ SEARCH_VALUE = {'--include', '--exclude', '--exclude-dir', '--exclude-from', '--
 PATTERN_OPTS = {'-e', '-f', '--regexp', '--file', '--expression'}
 FILE_FLAGS = {'-g', '--glob', '--iglob', '--include', '-f', '--file'}  # options whose value is a file or a file glob
 LAKE_WRITERS = {'tee', 'truncate', 'chmod', 'chown', 'touch', 'shred', 'unlink', 'rmdir'}
-# commands that cannot create or move a file (rm only deletes), so a file seen before them is still a file after
-READ_ONLY = {'cd', 'pushd', 'popd', 'pwd', 'ls', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'cat', 'head', 'tail', 'wc',
-             'grep', 'rg', 'which', 'type', 'date', 'sleep', 'rm', 'rmdir', 'export', 'declare', 'typeset', 'local', 'readonly'}
 REGENERABLE = {'node_modules', 'dist', 'build', 'out', '.next', '.turbo', '.cache', 'coverage', '.pytest_cache',
                '.mypy_cache', '.ruff_cache', '__pycache__', '.parcel-cache', '.svelte-kit', 'target', '.vite', '.nuxt',
                '.output', '.venv', 'venv', '.vercel', '.wrangler', 'test-results', 'playwright-report', '.eggs', 'tmp'}
+# a script whose first command is rm and that has nothing running before or beside it: no heredoc, substitution, redirect,
+# pipe, background job, group or eval (&& and || are fine)
+PLAIN_RM = re.compile(r'^\s*rm\s(?!.*(?:[<>`({]|\$\(|(?<!&)&(?!&)|(?<!\|)\|(?!\|)|\b(?:eval|exec|source)\b))', re.S)
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/folders', '/private/var/folders')
 MAIN_REFS = {'main', 'master', 'refs/heads/main', 'refs/heads/master'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'dirty': False}  # cwd None = unknown
+STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False}  # cwd None = unknown
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
 SQL_CLIENTS = {'psql', 'sqlite3', 'mysql', 'mariadb', 'duckdb', 'turso', 'pgcli', 'litecli', 'mycli'}
@@ -867,10 +867,10 @@ def disposable(target):
 
 
 def plain_files(target):
-    """True when target is a literal path to an existing regular file and nothing earlier in the script could have changed
-    the folder since the guard looked: rm -r on it is rm -f. A glob or variable never counts (the shell may expand it
-    to more than the guard saw)."""
-    if STATE['cwd'] is None or STATE['dirty'] or re.search(r'[$`*?\[{~\\]', target):
+    """True when target is a literal path to an existing regular file and this rm is the very first command of a script
+    that has nothing running before or beside it (PLAIN_RM): the file is still a file when rm reaches it, so rm -r is
+    rm -f. A glob or variable never counts (the shell may expand it to more than the guard saw)."""
+    if STATE['cwd'] is None or not STATE['plain'] or re.search(r'[$`*?\[{~\\]', target):
         return False
     path = os.path.join(STATE['cwd'], target)
     return os.path.isfile(path) and not PROTECTED.hit(os.path.realpath(path), ancestor=True)
@@ -1484,13 +1484,11 @@ def check_tokens(tokens, depth):
                 try:
                     decision = analyze(cmd, depth)
                 finally:
+                    STATE['plain'] = False  # only the first command of the script may rely on PLAIN_RM
                     if saved:
                         STATE['cwd'], STATE['vars'] = saved
                 if decision:
                     return decision
-                head = strip_prefix(cmd)
-                if (head and os.path.basename(head[0]) not in READ_ONLY) or any('>' in t for t in cmd):
-                    STATE['dirty'] = True
                 pipe.append(cmd)
     finally:
         if stack:
@@ -1503,11 +1501,9 @@ def check_script(text, depth=0):
         return 'deny', MSG['deep']
     try:
         norm = normalize(text)
-        tokens = tokens_of(norm)
-        if ('$(' in norm or '`' in norm or '<(' in norm or '>(' in norm or '()' in norm.replace(' ', '') or
-                {'for', 'while', 'until', 'select', 'function', 'eval'} & set(tokens)):
-            STATE['dirty'] = True  # these can run commands out of the order the guard reads them
-        decision = check_tokens(tokens, depth)
+        if depth == 0:
+            STATE['plain'] = bool(PLAIN_RM.match(text))
+        decision = check_tokens(tokens_of(norm), depth)
         if decision:
             return decision
         for inner in substitutions(norm) + heredoc_substitutions(norm):
