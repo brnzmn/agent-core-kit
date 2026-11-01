@@ -381,24 +381,59 @@ class FollowUpToTheReviews(Cases):
                      "GIT_CONFIG_PARAMETERS=\"'remote.origin.mirror=true'\" git push origin",
                      'git --config-env=remote.origin.push=REFSPEC push origin', 'git config remote.origin.push +HEAD:main',
                      'git config --global --add remote.origin.mirror true', 'git config set push.default matching',
-                     'git config --global push.default matching',
+                     'git config --global push.default matching', 'git config push.default upstream', 'git config --global push.default tracking',
+                     'git config set push.default Upstream', 'git config push.default ""',
+                     'git -c push.default=upstream push --force-with-lease', 'git -c push.default=tracking push --force-with-lease origin HEAD',
+                     'git switch -c feat origin/main && git -c push.default=upstream push --force-with-lease',
+                     'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=push.default GIT_CONFIG_VALUE_0=upstream git push --force-with-lease',
+                     "GIT_CONFIG_PARAMETERS=\"'push.default'='upstream'\" git push --force-with-lease",
+                     "GIT_CONFIG_PARAMETERS=\"'push.default=tracking'\" git push --force-with-lease",
+                     'git config remote.origin.mirror true', 'git config remote.origin.mirror "$X"',
+                     'git -c remote.origin.mirror=true push origin HEAD', 'git -c remote.origin.mirror=$X push origin HEAD',
+                     'git -c remote.origin.mirror= push origin HEAD', 'git config --global remote.origin.mirror yes',
+                     # a prefix's settings reach the shell, eval and xargs it starts
+                     "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main sh -c 'git push origin'",
+                     "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main bash -c 'git push origin'",
+                     "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main eval 'git push origin'",
+                     "echo origin | GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main xargs git push",
+                     "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.mirror GIT_CONFIG_VALUE_0=true sh -c 'sh -c \"git push origin\"'",
                      "GIT_CONFIG_PARAMETERS=\"'remote.origin.mirror'='true'\" git push origin",
                      "GIT_CONFIG_PARAMETERS=\"'remote.origin.push'='+HEAD:main'\" git push origin",
                      "GIT_CONFIG_PARAMETERS=\"'push.default'='matching'\" git push --force-with-lease",
                      "GIT_CONFIG_PARAMETERS=\"'push.default=matching'\" git push --force-with-lease",
                      'git config --local remote.origin.push "+refs/heads/*:refs/heads/*"'], message='force_main', cwd=repo)
-        self.passes(['git -c push.autoSetupRemote=true push -u origin HEAD', 'git config remote.origin.url git@example.com:a/b.git',
+        self.denied(['git remote add --mirror up git@example.com:a/b.git', 'git remote add --mirror=push up git@example.com:a/b.git',
+                     'git remote add -f --mirror=push up git@example.com:a/b.git'], message='mirror', cwd=repo)
+        self.passes(['git config remote.origin.mirror', 'git -c push.autoSetupRemote=true push -u origin HEAD', 'git config remote.origin.url git@example.com:a/b.git',
                      'git config --get remote.origin.push', 'git config --unset remote.origin.push', 'git config push.autoSetupRemote true',
                      'git config user.name x', 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=vi git push -u origin HEAD',
                      'git config --list', 'git config push.default simple', 'git config --global push.default current',
-                     'git config push.default upstream', 'git -c push.default=simple push --force-with-lease origin feat',
+                     'git config push.default nothing', 'git -c push.default=simple push --force-with-lease origin feat',
+                     'git -c push.default=upstream push -u origin HEAD',  # no force: left alone on the command line
+                     'git config remote.origin.mirror false', 'git config --global remote.origin.mirror no',
+                     'git config remote.origin.mirror off', 'git config remote.origin.mirror 0',
+                     'git -c remote.origin.mirror=false push origin HEAD', 'git -c remote.origin.mirror=off push origin HEAD',
+                     'git remote add -f up git@example.com:a/b.git', 'git remote add --mirror=fetch up git@example.com:a/b.git',
+                     'git remote add up git@example.com:a/b.git', 'git remote -v',
+                     "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.mirror GIT_CONFIG_VALUE_0=false git push origin HEAD",
                      "GIT_CONFIG_PARAMETERS=\"'push.default'='simple'\" git push -u origin HEAD",
                      "GIT_CONFIG_PARAMETERS=\"'push.default=current'\" git push --force-with-lease origin feat",
                      "GIT_CONFIG_PARAMETERS=\"'core.editor'='vi'\" git push -u origin HEAD"], cwd=repo)
 
+    def test_update_ref_of_head_after_any_move(self):
+        repo = self.repo('feature/y')
+        open(os.path.join(repo, 'README.md'), 'w').close()
+        self.denied(['git checkout main && git checkout HEAD README.md && git update-ref HEAD HEAD~1',
+                     'git checkout main; git checkout typo-branch; git update-ref HEAD abc1234', 'git switch main && git update-ref HEAD HEAD~1',
+                     'git checkout - && git update-ref HEAD HEAD~1', 'gh pr checkout 5 && git update-ref HEAD HEAD~1'],
+                    message='move_main', cwd=repo)
+        self.passes(['git update-ref HEAD HEAD~0', 'git checkout -b feat && git update-ref HEAD HEAD~0'], cwd=repo)
+
     def test_a_variable_in_a_forced_refspec_may_hold_main(self):
         repo = self.repo('feature/y')
-        self.denied(['git push --force-with-lease origin "$BRANCH"', 'git push -f origin HEAD:$BRANCH', 'git push --force-with-lease origin ${B}',
+        self.denied(['git push --force-with-lease origin "$1"', 'set -- main; git push --force-with-lease origin "$1"',
+                     'git push -f origin "$@"', 'git push --force-with-lease origin $*', 'git push --force-with-lease origin ${1}',
+                     'git push --force-with-lease origin "$BRANCH"', 'git push -f origin HEAD:$BRANCH', 'git push --force-with-lease origin ${B}',
                      'git push origin +$B'], message='force_main', cwd=repo)
         self.passes(['git push origin "$BRANCH"', 'git push -u origin "$BRANCH"', 'BRANCH=feat; git push --force-with-lease origin "$BRANCH"',
                      'git push --force-with-lease origin $(git branch --show-current)'], cwd=repo)
@@ -411,6 +446,11 @@ class HolesFromTheSecondReview(Cases):
                      'git -C ../repo rm -rf .', "git rm -rf ':(top)'"], message='discard')
         self.denied(['git rm -rf --pathspec-from-file=list.txt', 'git ls-files | git rm -rf --pathspec-from-file=-', 'git ls-files | xargs git rm -rf',
                      'git ls-files -z | xargs -0 git rm -f', 'git rm -f', 'git rm -rf --pathspec-from-file list.txt'], message='discard')
+        self.denied(['git rm -rf --dry-run --no-dry-run .', 'git rm -nrf --no-dry-run .', 'git rm -n -r -f --no-dry-run :/',
+                     'git rm --dry-run --no-dry-run --force -r .', 'git rm -f --cached --no-cached -r .', 'git rm --no-force -f -r .'],
+                    message='discard')
+        self.passes(['git rm --no-dry-run --dry-run -rf .', 'git rm -rf --no-dry-run -n .', 'git rm -rf --cached --no-dry-run .',
+                     'git rm -f --no-force -r .', 'git rm -rf --cached --no-cached --cached .'])
         self.passes(['git rm --dry-run -rf .', 'git rm -nrf .', 'git rm -n -r -f :/', 'git rm --dry-run --force -r *', 'git rm -rf -n .'])
         self.passes(['git rm --cached -r --pathspec-from-file=list.txt', 'git ls-files | xargs git rm --cached', 'git ls-files | xargs git rm -r --cached',
                      'git rm --pathspec-from-file=list.txt', 'git rm old.txt other.txt', 'git rm file.txt', 'git rm -r --cached build', 'git rm -rf --cached .', 'git rm -rf src/old', 'git rm -f old.txt',

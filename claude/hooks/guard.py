@@ -83,7 +83,7 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
 STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False,
-         'moved': False, 'envcfg': []}  # cwd None = unknown
+         'moved': False, 'envcfg': [], 'inherit': []}  # cwd None = unknown
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
 SQL_CLIENTS = {'psql', 'sqlite3', 'mysql', 'mariadb', 'duckdb', 'turso', 'pgcli', 'litecli', 'mycli'}
@@ -901,11 +901,38 @@ def note_move(sub, rest, config, where):
         STATE['moved'] = 'unknown'  # still not pushable, but not "on main" either: the message says to push on its own
 
 
+def risky_config(entry, forcing=True):
+    """True for a key=value git setting that makes a later push one nobody can read here: a saved refspec, a mirror that is
+    not switched off, and a push.default that pushes to the upstream or to every matching branch (only current, simple and
+    nothing are plain; without a force push.default is left alone on the command line)."""
+    key, _, value = entry.partition('=')
+    key, value = key.strip().lower(), value.strip().lower()
+    if re.match(r'remote\..*\.push$', key):
+        return True
+    if re.match(r'remote\..*\.mirror$', key):
+        return value not in ('false', 'no', 'off', '0')
+    return key == 'push.default' and forcing and value not in ('current', 'simple', 'nothing')
+
+
 def forced_rm(rest, where):
-    """git rm that is forced, keeps the files in the tree out of the index only with --cached, and names the whole tree,
-    a pathspec file, or nothing at all (xargs and pipes feed the paths)."""
+    """git rm that is forced, keeps the files in the tree out of the index only with --cached, is not a dry run (the last of
+    -n, --dry-run, --no-dry-run wins, likewise for force and cached), and names the whole tree, a pathspec file, or nothing
+    at all (xargs and pipes feed the paths)."""
+    force = cached = dry = False
+    for a in rest:
+        if a == '--':
+            break
+        if a in ('--force', '--no-force'):
+            force = a == '--force'
+        elif a in ('--cached', '--no-cached'):
+            cached = a == '--cached'
+        elif a in ('--dry-run', '--no-dry-run'):
+            dry = a == '--dry-run'
+        elif a.startswith('-') and not a.startswith('--'):
+            force = force or 'f' in a
+            dry = dry or 'n' in a
     s, l, p = flag_parts(rest, value_opts={'--pathspec-from-file'})
-    if not ('f' in s or '--force' in l) or '--cached' in l or 'n' in s or '--dry-run' in l:
+    if not force or cached or dry:
         return False
     return not p or '--pathspec-from-file' in l or stage_sweeps(p, where)
 
@@ -946,10 +973,9 @@ def git_decision(args):
             colon_delete = colon_delete or (bool(sep) and not src)
             main_hit = main_hit or (dst if sep else src) in MAIN_REFS or bool(MAIN_DST.search(dst if sep else src))
             wild = wild or '*' in ref
-            unresolved = unresolved or bool(re.search(r'\$[A-Za-z_{]', ref))  # a variable: it may well hold main
+            unresolved = unresolved or bool(re.search(r'\$[A-Za-z_{0-9@*]', ref))  # a variable: it may well hold main
         # a refspec or mirror in the command line config (remote.<name>.push / .mirror, push.default) is a push nobody can read
-        configured = any(re.match(r'remote\..*\.(push|mirror)(=|$)', c, re.I) or (re.match(r'push\.default=matching$', c, re.I) and (force or plus))
-                         for c in config)
+        configured = any(risky_config(c, force or plus) for c in config)
         if configured or ((force or plus or deleting or colon_delete) and main_hit):
             return 'deny', MSG['force_main']
         if (force or plus) and (l & {'--all', '--branches'} or wild or unresolved):
@@ -992,7 +1018,7 @@ def git_decision(args):
             return 'deny', MSG['branch']
         if '--stdin' in l or (p and p[0] in MAIN_REFS):
             return 'deny', MSG['move_main']
-        if p and p[0] == 'HEAD' and (STATE['moved'] == 'main' or current_branch(where) in (None, 'main', 'master')):
+        if p and p[0] == 'HEAD' and (STATE['moved'] or current_branch(where) in (None, 'main', 'master')):
             return 'deny', MSG['move_main']
     elif sub == 'branch':
         s, l, p = flag_parts(rest)
@@ -1005,12 +1031,14 @@ def git_decision(args):
             # a forced rename or copy onto main; the first `git branch -M main` of a new repo has no main to overwrite
             if not (len(p) == 1 and current_branch(where) == p[0]) and branch_exists(where, p[-1]):
                 return 'deny', MSG['move_main']
+    elif sub == 'remote':
+        if rest[:1] == ['add'] and any(a in ('--mirror', '--mirror=push') for a in rest):
+            return 'deny', MSG['mirror']  # a mirror remote makes every plain push overwrite every ref there
     elif sub == 'config':
         s, l, p = flag_parts(rest, value_opts={'-f', '--file', '--blob', '--type', '-t', '--default'}, value_letters='ft')
         p = p[1:] if p[:1] == ['set'] else p
         reading = s & {'l', 'e'} or l & {'--get', '--get-all', '--get-regexp', '--list', '--unset', '--unset-all', '--edit'}
-        if len(p) >= 2 and not reading and (re.match(r'remote\..*\.(push|mirror)$', p[0], re.I) or (
-                p[0].lower() == 'push.default' and p[1].lower() == 'matching')):  # current, simple, upstream are plain setup
+        if len(p) >= 2 and not reading and risky_config(p[0] + '=' + p[1]):
             return 'deny', MSG['force_main']  # a saved refspec or mirror makes every later `git push` a push nobody can read
     elif sub == 'rm':
         if forced_rm(rest, where):
@@ -1500,6 +1528,16 @@ def applying(prog_args):
     return False
 
 
+def nested(run, *args):
+    """Run a nested script, shell or command with the git settings the command in front of it carries (GIT_CONFIG_* in its
+    prefix) still in force."""
+    saved, STATE['inherit'] = STATE['inherit'], STATE['envcfg']
+    try:
+        return run(*args)
+    finally:
+        STATE['inherit'] = saved
+
+
 def analyze(toks, depth):
     assigns = [t for t in toks if ASSIGN.match(t)]
     if assigns and len(assigns) == len(toks):
@@ -1507,8 +1545,8 @@ def analyze(toks, depth):
             k, v = t.split('=', 1)
             STATE['vars'][k] = expand(v)
         return None
-    STATE['envcfg'] = env_config(toks) if any('GIT_CONFIG' in t for t in toks) or any(
-        k.startswith('GIT_CONFIG') for k in STATE['vars']) else []
+    STATE['envcfg'] = STATE['inherit'] + (env_config(toks) if any('GIT_CONFIG' in t for t in toks) or any(
+        k.startswith('GIT_CONFIG') for k in STATE['vars']) else [])
     toks = [expand(t) for t in strip_prefix(toks)]
     if not toks:
         return None
@@ -1529,9 +1567,9 @@ def analyze(toks, depth):
             return 'deny', MSG['lake']
     prog, args = os.path.basename(toks[0]), toks[1:]
     if prog in SHELLS:
-        return shell_decision(args, depth)
+        return nested(shell_decision, args, depth)
     if prog == 'eval':
-        return check_script(' '.join(args), depth + 1)
+        return nested(check_script, ' '.join(args), depth + 1)
     if prog == 'xargs':
         k, files = 0, []
         while k < len(args) and args[k].startswith('-'):
@@ -1549,7 +1587,7 @@ def analyze(toks, depth):
             return 'deny', MSG['find_delete']
         if inner in READERS and any(feeds_env(c) for c in STATE['pipe'] if c):
             return 'deny', MSG['env']  # something that names an env file feeds the reader through the pipe
-        return analyze(args[k:], depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])
+        return nested(analyze, args[k:], depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])
     if prog == 'git':
         return git_decision(args)
     if prog == 'gh':
