@@ -1113,15 +1113,21 @@ def merge_settings(mode):
     if ours.get('autoMode'):
         made('autoMode', 'autoMode' in cur)
         auto = dict(cur.get('autoMode') or {})
-        made('autoMode.environment', 'environment' in auto)
-        auto['environment'], owned['autoModeEnvironment'] = merge_rules(
-            dedupe(replaced + list(auto.get('environment') or [])), ours['autoMode']['environment'],
-            recorded.get('autoModeEnvironment') or [])
+        if auto.get('environment') is not None and not isinstance(auto['environment'], list):
+            print('warning: autoMode.environment in %s is not a list, so it was left as it is and the auto_mode_environment '
+                  'lines from your config were not added. Make it a list, then rerun: %s' % (where, sync_cmd()))
+            owned['autoModeEnvironment'] = recorded.get('autoModeEnvironment') or []
+        else:
+            made('autoMode.environment', 'environment' in auto)
+            auto['environment'], owned['autoModeEnvironment'] = merge_rules(
+                dedupe(replaced + (auto.get('environment') or [])), ours['autoMode']['environment'],
+                recorded.get('autoModeEnvironment') or [])
         out['autoMode'] = auto
     elif recorded.get('autoModeEnvironment') and isinstance(cur.get('autoMode'), dict):
         auto = dict(cur['autoMode'])  # config dropped the lines: take the kit's out, as for allow and deny rules
         if isinstance(auto.get('environment'), list):
-            auto['environment'] = [l for l in auto['environment'] if l not in set(recorded['autoModeEnvironment'])]
+            auto['environment'] = [l for l in replaced if l not in auto['environment']] + \
+                [l for l in auto['environment'] if l not in set(recorded['autoModeEnvironment'])]
             if not auto['environment'] and 'autoMode.environment' in created:
                 del auto['environment']
                 created.remove('autoMode.environment')
@@ -1198,7 +1204,8 @@ def check():
         problems.append('settings: defaultMode is not %s (config permission_mode)' % want_mode)
     if want_mode == 'bypassPermissions' and (cur.get('permissions') or {}).get('ask'):
         problems.append('settings: ask rules are set, which prompt even in bypassPermissions')
-    if ours.get('autoMode') and any(l not in ((cur.get('autoMode') or {}).get('environment') or [])
+    live_env = (cur.get('autoMode') or {}).get('environment')
+    if ours.get('autoMode') and any(l not in (live_env if isinstance(live_env, list) else [])
                                     for l in ours['autoMode']['environment']):
         problems.append('settings: autoMode.environment differs from auto_mode_environment in config')
     if os.path.isdir(CODEX_DIR):
@@ -1607,12 +1614,12 @@ def restore(name):
         if dst and os.path.islink(src):  # a symlink that was moved aside comes back as the same link
             if not (os.path.islink(dst) and os.readlink(dst) == os.readlink(src)):
                 if os.path.lexists(dst):
-                    cur.move(dst)
+                    cur.archive(dst)  # noted as archived, so restoring that backup swaps it back as a whole
                 os.symlink(os.readlink(src), dst)
                 done += 1
         elif dst and os.path.isdir(src):
             if os.path.lexists(dst):
-                cur.move(dst)
+                cur.archive(dst)  # a symlink here goes back as the link, never written through
             shutil.copytree(src, dst, symlinks=True)
             done += 1
     for r, dirs, files in os.walk(bk):

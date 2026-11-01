@@ -1100,6 +1100,24 @@ class KeepsTheUsersFiles(Sandbox):
         self.assertEqual(os.readlink(link), '../dotfiles/skills')
         self.assertEqual(os.listdir(target), ['my-skill'])
 
+    def test_restores_in_a_chain_never_write_through_the_users_symlink_and_the_link_comes_back(self):
+        link, target = self.archive_through_a_link(lambda target: '../dotfiles/skills')
+        dotfiles = snapshot(os.path.dirname(target))
+        self.ok('--clean-slate')
+        first = self.backups()[0]
+        self.assertEqual(snapshot(os.path.dirname(target)), dotfiles)
+        seen = set([first])
+        for step in range(3):  # restore the first backup, then the before-restore backup each one leaves, twice more
+            self.ok('--restore', first)
+            self.assertEqual(snapshot(os.path.dirname(target)), dotfiles, 'step %d' % step)
+            expect_link = step % 2 == 0
+            self.assertEqual(os.path.islink(link), expect_link, 'step %d' % step)
+            new = [b for b in self.backups() if '-before-restore' in b and b not in seen]
+            seen.update(new)
+            first = new[-1]
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.readlink(link), '../dotfiles/skills')
+
     def test_the_edits_note_names_the_path_where_a_symlinked_claude_md_really_landed(self):
         link = os.path.join(self.claude, 'CLAUDE.md')
         target = os.path.join(self.home, 'dotfiles', 'CLAUDE.md')
@@ -1248,6 +1266,28 @@ class AutoModeRecordMigration(Sandbox):
         self.edit_the_list('added by hand')
         self.ok('--uninstall')
         self.assertEqual(self.settings()['autoMode'], {'environment': ['added by hand']})
+
+    def test_emptying_the_config_after_the_upgrade_still_brings_the_replaced_line_back(self):
+        self.first_release_install_over_the_users_line()
+        self.configure(auto_mode_environment=[])
+        self.ok('--sync')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['mine']})
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['mine']})
+
+    def test_an_environment_that_is_not_a_list_is_left_alone_with_a_warning(self):
+        s = self.settings()
+        s['autoMode'] = {'environment': 'one line as a string'}
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+        self.configure(auto_mode_environment=[self.OLD])
+        out = self.ok()
+        self.assertIn('not a list', out.stdout)
+        self.assertEqual(self.settings()['autoMode'], {'environment': 'one line as a string'})
+        self.ok('--sync')
+        self.assertEqual(self.settings()['autoMode'], {'environment': 'one line as a string'})
+        self.assertIn('differs', self.install('--check').stdout)
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': 'one line as a string'})
 
     def test_emptying_the_config_takes_the_kits_lines_out_on_the_next_sync(self):
         self.configure(auto_mode_environment=[self.OLD])
