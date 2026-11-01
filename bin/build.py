@@ -164,6 +164,7 @@ def sync_cmd():
 # ---------------------------------------------------------------- backups and install state
 
 LINKS = 'LINKS.json'  # in a backup folder: files that were symlinks when saved, with where the link pointed
+REAL_DIRS = 'REALDIRS'  # in an uninstall backup: folders (~/.claude/skills ...) that were real folders when the kit's files left
 
 
 def file_mode(path, default):
@@ -176,6 +177,14 @@ def file_mode(path, default):
 
 def read_links(folder):
     return load_json_safe(os.path.join(folder, LINKS)) or {}
+
+
+def read_lines(folder, name):
+    try:
+        with open(os.path.join(folder, name), encoding='utf-8') as fh:
+            return [l.strip() for l in fh if l.strip()]
+    except OSError:
+        return []
 
 
 class Backup(object):
@@ -1005,6 +1014,21 @@ def need_object(data, key, where):
         raise ValueError('%s: "%s" must be a JSON object. Fix it, then rerun the installer.' % (where, key))
 
 
+def adopt_legacy_auto_env(st):
+    """An install from before the autoMode.environment lines were recorded one by one kept {had, previous, set} for the
+    whole list. Its `set` lines minus `previous` (yours) become the kit's recorded lines, and the old record goes.
+    Returns your `previous` lines, which that install replaced."""
+    old = st['changes'].get('autoMode.environment')
+    if old is None or 'autoModeEnvironment' in st['settings']:
+        return []
+    mine_before = old.get('previous') if old.get('had') and isinstance(old.get('previous'), list) else []
+    st['settings']['autoModeEnvironment'] = [l for l in old.get('set') or [] if l not in mine_before]
+    del st['changes']['autoMode.environment']
+    if not old.get('had') and 'autoMode.environment' not in st['created']:
+        st['created'].append('autoMode.environment')  # the kit made the list; it goes when it ends up empty
+    return mine_before
+
+
 def merge_settings(mode):
     """fresh = first install, clean = first install after --clean-slate, keep = sync. All of them keep your own
     permission rules, hooks and other settings, and record what the kit sets so --uninstall can put it back."""
@@ -1056,6 +1080,7 @@ def merge_settings(mode):
     out['env'] = env
     theirs, wanted = cur.get('permissions') or {}, ours.get('permissions') or {}
     made('permissions', 'permissions' in cur)
+    replaced = adopt_legacy_auto_env(st)
     recorded = st['settings']
     own_rules = dict((k, len([r for r in theirs.get(k) or [] if r not in (recorded.get(k) or [])])) for k in ('allow', 'deny'))
     perms, owned = dict(theirs), {}
@@ -1089,10 +1114,21 @@ def merge_settings(mode):
         auto = dict(cur.get('autoMode') or {})
         made('autoMode.environment', 'environment' in auto)
         auto['environment'], owned['autoModeEnvironment'] = merge_rules(
-            auto.get('environment'), ours['autoMode']['environment'], recorded.get('autoModeEnvironment') or [])
+            dedupe(replaced + list(auto.get('environment') or [])), ours['autoMode']['environment'],
+            recorded.get('autoModeEnvironment') or [])
         out['autoMode'] = auto
-    elif recorded.get('autoModeEnvironment'):
-        owned['autoModeEnvironment'] = recorded['autoModeEnvironment']  # config dropped them; uninstall still takes them out
+    elif recorded.get('autoModeEnvironment') and isinstance(cur.get('autoMode'), dict):
+        auto = dict(cur['autoMode'])  # config dropped the lines: take the kit's out, as for allow and deny rules
+        if isinstance(auto.get('environment'), list):
+            auto['environment'] = [l for l in auto['environment'] if l not in set(recorded['autoModeEnvironment'])]
+            if not auto['environment'] and 'autoMode.environment' in created:
+                del auto['environment']
+                created.remove('autoMode.environment')
+        if auto or 'autoMode' not in created:
+            out['autoMode'] = auto
+        else:
+            del out['autoMode']
+            created.remove('autoMode')
     floor = ours.get('cleanupPeriodDays')
     have = cur.get('cleanupPeriodDays')
     if floor and not (isinstance(have, (int, float)) and not isinstance(have, bool) and have >= floor):
@@ -1273,6 +1309,7 @@ def uninstall_settings(bk, restored, moved):
     for key in ('allow', 'deny'):
         if key in perms:
             perms[key] = [r for r in perms[key] if r not in set(st['settings'].get(key) or [])]
+    adopt_legacy_auto_env(st)
     auto = out.get('autoMode') if isinstance(out.get('autoMode'), dict) else {}
     if isinstance(auto.get('environment'), list):  # only the lines the kit added
         auto['environment'] = [l for l in auto['environment'] if l not in set(st['settings'].get('autoModeEnvironment') or [])]
@@ -1367,16 +1404,17 @@ def uninstall_instruction_files(bk, restored, targets):
         if not generated_by_kit(f):
             print('left %s alone: it is not the generated file (edited or replaced since)' % common.tilde(f))
             continue
-        written = state()['files'].get(os.path.realpath(f) if os.path.islink(f) else f)
-        if written and written != digest(f):
-            print('note: you edited the generated %s; your edits are kept in %s'
-                  % (common.tilde(f), common.tilde(os.path.join(bk.dir(), Backup.rel(f)))))
         orig, recorded = original_copy(f)
         if not recorded:
             orig = first_backup_copy(f)
         elif orig is None and state()['originals'][f].get('backup'):
             print('note: your original %s was recorded in %s but that copy is gone; the generated file moves into the backup'
                   % (common.tilde(f), state()['originals'][f]['backup']))
+        written = state()['files'].get(os.path.realpath(f) if os.path.islink(f) else f)
+        if written and written != digest(f):  # a link with no original of yours has its target moved, so that is where it lands
+            lands = Backup.rel(os.path.realpath(f)) if os.path.islink(f) and not orig else Backup.rel(f)
+            print('note: you edited the generated %s; your edits are kept in %s'
+                  % (common.tilde(f), common.tilde(os.path.join(bk.dir(), lands))))
         if orig:
             put_original(f, orig, bk)
             how = '; it is a symlink to %s and was written through the link' % common.tilde(os.path.realpath(f)) \
@@ -1500,11 +1538,17 @@ def uninstall():
         targets += [os.path.join(dest, n) for n in read_manifest(dest)]
         targets.append(manifest_path(dest))
     targets.append(os.path.join(CODEX_DIR, 'rules', 'agent-core.rules'))
-    groups = {}
+    groups, real_dirs = {}, []
     for t in targets:
         if os.path.lexists(t):
+            parent = os.path.dirname(t)
+            if parent not in (CLAUDE_DIR, CODEX_DIR, HOME, common.LOCAL) and os.path.isdir(parent) and not os.path.islink(parent):
+                real_dirs.append(Backup.rel(parent))
             bk.move(t)
             groups.setdefault(os.path.dirname(t), []).append(os.path.basename(t))
+    if real_dirs:  # so a later --restore never writes these files through a symlink that has taken the folder's place
+        with open(os.path.join(bk.dir(), REAL_DIRS), 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(sorted(set(real_dirs))) + '\n')
     for parent in sorted(groups):  # folders the install made and the move emptied
         if parent not in (CLAUDE_DIR, CODEX_DIR, HOME):
             try:
@@ -1552,12 +1596,7 @@ def restore(name):
         print('no backup named %s in %s. Available: %s' % (name, common.tilde(root), ' '.join(have) or '(none)'))
         return 1
     cur = Backup(unique(os.path.join(root, time.strftime('%Y%m%d-%H%M%S') + '-before-restore')))
-    archived = []
-    try:
-        with open(os.path.join(bk, 'ARCHIVED'), encoding='utf-8') as fh:
-            archived = [l.strip() for l in fh if l.strip()]
-    except OSError:
-        pass
+    archived, real_dirs = read_lines(bk, 'ARCHIVED'), read_lines(bk, REAL_DIRS)
     links = read_links(bk)
     done, through = 0, []
     for rel in archived:  # folders archived as a whole come back as a whole
@@ -1577,11 +1616,16 @@ def restore(name):
         for f in sorted(files):
             p = os.path.join(r, f)
             rel = os.path.relpath(p, bk)
-            if rel in ('ARCHIVED', LINKS) or rel in archived or any(rel.startswith(a + os.sep) for a in archived):
+            if rel in ('ARCHIVED', LINKS, REAL_DIRS) or rel in archived or any(rel.startswith(a + os.sep) for a in archived):
                 continue
             if not os.path.exists(p):
                 print('skipped %s (a link that points at nothing)' % rel)
                 continue
+            for d in real_dirs:  # the kit's folder stood here; a symlink there now is yours and is not written through
+                at = restore_target(d)
+                if at and rel.startswith(d + os.sep) and os.path.islink(at):
+                    print('moved %s aside (a symlink to %s): the backup holds a real folder there' % (common.tilde(at), os.readlink(at)))
+                    cur.archive(at)
             dst = restore_target(rel)
             if not dst:
                 print('skipped %s (not under ~/.claude, ~/.codex, ~ or local/)' % rel)
