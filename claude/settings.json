@@ -30,8 +30,17 @@
       "Bash(git commit --all*)",
       "Bash(git push --force* origin main)",
       "Bash(git push --force* origin main *)",
+      "Bash(git push --force* origin main:*)",
+      "Bash(git push --force* origin HEAD:main)",
+      "Bash(git push --force* origin HEAD:main *)",
       "Bash(git push -f* origin main)",
       "Bash(git push -f* origin main *)",
+      "Bash(git push -f* origin main:*)",
+      "Bash(git push -f* origin HEAD:main)",
+      "Bash(git push -f* origin HEAD:main *)",
+      "Bash(git push origin +main)",
+      "Bash(git push origin +main *)",
+      "Bash(git push origin +main:*)",
       "Bash(sudo *)"
     ],
     "allow": [

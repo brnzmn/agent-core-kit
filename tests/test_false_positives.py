@@ -121,10 +121,29 @@ class RoutineCommandsPass(unittest.TestCase):
 
     def test_clean_reinstall_deletes_lockfiles(self):
         self.check(['rm -rf node_modules package-lock.json && npm install', 'rm -rf node_modules pnpm-lock.yaml && pnpm install',
-                    'rm -rf dist *.tsbuildinfo && npm run build', 'rm -rf package-lock.json'], None, cwd=self.cwd)
+                    'rm -rf package-lock.json', 'ls && rm -rf node_modules package-lock.json && npm install',
+                    'rm -rf dist && rm -rf package-lock.json && npm install'], None, cwd=self.cwd)
         self.check(['rm -rf src', 'rm -rf node_modules src', 'rm -rf package-lock.json src', 'rm -rf *', 'rm -rf srclink',
-                    'rm -rf srclink/', 'rm -rf package-lock.json missing-dir', 'rm -rf $X/package-lock.json'],
+                    'rm -rf srclink/', 'rm -rf package-lock.json missing-dir', 'rm -rf $X/package-lock.json',
+                    'rm -rf dist *.tsbuildinfo', 'rm -rf *.tsbuildinfo', 'rm -rf [^n]*', 'rm -rf lake-*/x.csv',
+                    'rm -rf package-lock.js?n', 'rm -rf package-lock.json{,}', 'rm -rf ~/package-lock.json'],
                    'deny', cwd=self.cwd, key='rm', tail=' && true')
+
+    def test_a_file_check_is_void_once_something_may_have_moved_files(self):
+        for cmd in ('mv README.md README.bak && mv tests README.md && rm -rf README.md',
+                    'mv src package-lock.json; rm -rf package-lock.json && true', 'touch x && rm -rf package-lock.json && true',
+                    'echo $(mv src package-lock.json) && rm -rf package-lock.json && true',
+                    'echo `mv src package-lock.json`; rm -rf package-lock.json && true',
+                    'bash -c "mv src package-lock.json" && rm -rf package-lock.json && true',
+                    'shopt -s dotglob; rm -rf * && true',
+                    'while true; do rm -rf package-lock.json; mv src package-lock.json; done',
+                    'for i in 1 2; do rm -rf package-lock.json; mv src package-lock.json; done',
+                    'ls() { rm -rf package-lock.json; }; mv src package-lock.json; ls && true',
+                    'npm run clean && rm -rf package-lock.json && true', 'cat a > b && rm -rf package-lock.json && true'):
+            with self.subTest(cmd=cmd):
+                os.makedirs(os.path.join(self.cwd, 'tests'), exist_ok=True)
+                open(os.path.join(self.cwd, 'README.md'), 'w').close()
+                self.assertEqual(bash(cmd, cwd=self.cwd)[0], 'deny')
 
     def test_deleting_a_file_keeps_the_protected_folder_check(self):
         for cmd in ('rm -rf lake-data/x.csv', 'rm -f lake-data/x.csv', 'rm -rf lake-data', 'rm -rf dist lake-data/x.csv'):
@@ -136,20 +155,39 @@ class RoutineCommandsPass(unittest.TestCase):
     def test_grep_l_pattern_is_not_an_env_file(self):
         self.check(['grep -l "process.env" -r src | xargs cat', 'rg -l "import.meta.env" src | xargs head -20',
                     'git grep -l process.env | xargs sed -n 1,5p', 'rg -l -e process.env src | xargs cat',
-                    'grep -rl --include="*.ts" "process.env" src | xargs wc -l'], None)
+                    'grep -rl --include="*.ts" "process.env" src | xargs wc -l', 'git -C app grep -l process.env | xargs cat',
+                    'grep -rl --regexp=process.env src | xargs cat'], None)
         self.check(['ls .env* | xargs cat', 'find . -name .env | xargs cat', 'grep -l KEY .env | xargs cat',
                     'grep -le KEY .env | xargs cat', 'grep -l -f pats .env | xargs cat', 'rg -l -e KEY -- .env | xargs cat',
                     'git grep -l KEY -- .env | xargs cat', 'grep -l "process.env" .env.local | xargs cat',
-                    'ls -a | grep ".env" | xargs cat', 'grep -r "process.env" src | xargs cat .env'], 'deny', key='env')
+                    'ls -a | grep ".env" | xargs cat', 'grep -r "process.env" src | xargs cat .env',
+                    'ls -a | rg -L "^\\.env" | xargs cat', 'ls -a | grep -L "^\\.env" | xargs cat',
+                    'rg -l --files .env | xargs cat', 'grep -lT KEY .env | xargs cat',
+                    'git log -S grep --name-only .env | xargs cat', 'ls -a | grep -l "^\\.env" . | xargs cat',
+                    'grep -l .env README.md | xargs cat', 'rg -l -e "\\.env$" src | xargs cat', 'grep -l env src | xargs cat',
+                    'rg -l -g ".env*" KEY | xargs cat', 'ls -a | git grep -l "^.env" | xargs cat',
+                    'grep -l --regexp=.env src | xargs cat'], 'deny', key='env')
 
-    def test_build_folders_go_when_the_folder_is_unknown(self):
-        self.check(['cd "$(git rev-parse --show-toplevel)" && rm -rf dist', 'cd $REPO && rm -rf node_modules',
-                    'for d in packages/*; do rm -rf "$d/dist"; done', 'cd $REPO && rm -rf packages/web/.next',
-                    'cd $REPO && rm -rf dist .turbo'], None)
-        self.check(['cd $REPO && rm -rf src', 'cd $REPO && rm -rf .', 'cd $REPO && rm -rf ..', 'cd $REPO && rm -rf ../dist',
-                    'cd $REPO && rm -rf dist/..', 'cd $REPO && rm -rf *', 'for d in packages/*; do rm -rf "$d"; done',
-                    'for d in packages/*; do rm -rf "$d/src"; done', 'rm -rf $HOME/.cache', 'rm -rf "$(pwd)/dist"',
-                    'rm -rf "$d/../dist"', 'rm -rf "${d:-x}/dist"'], 'deny', key='rm', tail=' && true')
+    def test_build_folders_go_by_name_when_the_folder_is_unknown_and_nothing_is_protected(self):
+        local = make_local(config={'user_name': 'Alex', 'protected_dirs': []})
+        for cmd in ('cd "$(git rev-parse --show-toplevel)" && rm -rf dist', 'cd $REPO && rm -rf node_modules',
+                    'cd $REPO && rm -rf packages/web/.next', 'cd $REPO && rm -rf dist .turbo'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(bash(cmd, cwd=REPO, local=local)[0])
+        for cmd in ('cd $REPO && rm -rf src', 'cd $REPO && rm -rf .', 'cd $REPO && rm -rf ..', 'cd $REPO && rm -rf ../dist',
+                    'cd $REPO && rm -rf dist/..', 'cd $REPO && rm -rf *', 'rm -rf $d/dist', 'rm -rf "$d/dist"',
+                    'for d in "src docs"; do rm -rf $d/dist; done', 'for d in packages/*; do rm -rf "$d/dist"; done',
+                    'rm -rf $HOME/.cache', 'rm -rf "$(pwd)/dist"', 'rm -rf "${d:-x}/dist"'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(bash(cmd + ' && true', cwd=REPO, local=local)[0], 'deny')
+
+    def test_with_a_protected_folder_configured_an_unknown_folder_stays_denied(self):
+        for config in (TEST_CONFIG, {'user_name': 'Alex', 'protected_dirs': ['/srv/lake']}):
+            local = make_local(config=config)
+            for cmd in ('cd "$(pwd)" && rm -rf dist', 'cd "$LAKE_DIR" && rm -rf build', 'rm -rf "$LAKE_DIR/out"',
+                        'cd $REPO && rm -rf node_modules', 'cd "$(git rev-parse --show-toplevel)" && rm -rf dist'):
+                with self.subTest(cmd=cmd, config=config):
+                    self.assertEqual(bash(cmd + ' && true', cwd=REPO, local=local)[0], 'deny')
 
     def test_add_with_a_pathspec_stages_only_that_path(self):
         repo = os.path.realpath(tempfile.mkdtemp(prefix='akit-add-'))
@@ -157,6 +195,9 @@ class RoutineCommandsPass(unittest.TestCase):
         subprocess.run(['git', 'init', '-q', repo], check=True, capture_output=True)
         self.check(['git add -A src/', 'git add -u src/', 'git add --all src docs', 'git add -A -- src/a.py',
                     'git add -u src/a.py src/b.py'], None, cwd=repo)
+        self.check(['unset FILES; git add -A $FILES', 'git add -u $(git diff --name-only)', 'git add -A "$F"',
+                    'git add -A src/*', 'git add -A {src,docs}', 'git add -A *.py', 'git add -A src/?.py',
+                    'git add -A `ls`'], 'deny', cwd=repo, key='stage')
         self.check(['git add -A', 'git add -u', 'git add --all', 'git add --update', 'git add -A .', 'git add -u .',
                     'git add -A ./', 'git add -A :/', "git add -A '*'", 'git add -A src .', 'git add -A :!docs',
                     'git add -A --pathspec-from-file=list.txt', 'git add -A %s' % repo, 'git add .', 'git commit -a',
@@ -169,10 +210,12 @@ class RoutineCommandsPass(unittest.TestCase):
         def blocked(cmd):  # Claude Code's wildcard: * matches any run of characters, spaces included
             return any(re.fullmatch('.*'.join(re.escape(part) for part in r.split('*')), cmd) for r in rules)
         for cmd in ('git add -A src/', 'git add -u src/', 'git push --force-with-lease origin maintenance/x',
-                    'git push -f origin main-fix', 'git push --force origin mainline', 'git push --force-with-lease origin feat'):
+                    'git push -f origin main-fix', 'git push origin +main-fix', 'git push --force origin HEAD:main-fix', 'git push --force origin mainline', 'git push --force-with-lease origin feat'):
             self.assertFalse(blocked(cmd), cmd)
         for cmd in ('git add -A', 'git add -A .', 'git add .', 'git add --all', 'git push --force origin main',
-                    'git push -f origin main', 'git push --force-with-lease origin main', 'git push --force origin main --no-verify'):
+                    'git push -f origin main', 'git push --force-with-lease origin main', 'git push --force origin main --no-verify',
+                    'git push --force origin main:main', 'git push -f origin HEAD:main', 'git push --force-with-lease origin HEAD:main',
+                    'git push origin +main', 'git push origin +main:main'):
             self.assertTrue(blocked(cmd), cmd)
 
 

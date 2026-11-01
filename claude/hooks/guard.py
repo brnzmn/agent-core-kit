@@ -50,19 +50,24 @@ READERS = {'cat', 'less', 'more', 'head', 'tail', 'bat', 'nl', 'open', 'strings'
            'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'awk', 'gawk', 'mawk', 'sed', 'source', '.',
            'cut', 'sort', 'uniq', 'paste', 'column', 'fold', 'rev', 'base64', 'diff', 'cmp', 'comm', 'hexdump', 'jq', 'yq'}
 PATTERN_FIRST = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'awk', 'gawk', 'mawk', 'sed'}  # first operand is the pattern
-SEARCHERS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack'}  # content searches (PATTERN_FIRST without the scripting ones)
-SEARCH_VALUE = {'-m', '-A', '-B', '-C', '-g', '-t', '-T', '--include', '--exclude', '--exclude-dir', '--glob', '--type',
-                '--max-count', '--max-depth'}
+# short options that take a value, per search program (grep -T and ag -t take none: a wrong table drops nothing safe)
+SEARCH_LETTERS = {'grep': 'efmABCdD', 'egrep': 'efmABCdD', 'fgrep': 'efmABCdD', 'rg': 'efmABCdgjrtTEM'}
+SEARCH_VALUE = {'--include', '--exclude', '--exclude-dir', '--exclude-from', '--glob', '--iglob', '--type', '--type-not',
+                '--max-count', '--max-depth', '--after-context', '--before-context', '--context', '--label', '--replace',
+                '--directories', '--devices', '--binary-files', '--threads', '--max-columns', '--sort', '--sortr'}
 PATTERN_OPTS = {'-e', '-f', '--regexp', '--file', '--expression'}
 FILE_FLAGS = {'-g', '--glob', '--iglob', '--include', '-f', '--file'}  # options whose value is a file or a file glob
 LAKE_WRITERS = {'tee', 'truncate', 'chmod', 'chown', 'touch', 'shred', 'unlink', 'rmdir'}
+# commands that cannot create or move a file (rm only deletes), so a file seen before them is still a file after
+READ_ONLY = {'cd', 'pushd', 'popd', 'pwd', 'ls', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'cat', 'head', 'tail', 'wc',
+             'grep', 'rg', 'which', 'type', 'date', 'sleep', 'rm', 'rmdir', 'export', 'declare', 'typeset', 'local', 'readonly'}
 REGENERABLE = {'node_modules', 'dist', 'build', 'out', '.next', '.turbo', '.cache', 'coverage', '.pytest_cache',
                '.mypy_cache', '.ruff_cache', '__pycache__', '.parcel-cache', '.svelte-kit', 'target', '.vite', '.nuxt',
                '.output', '.venv', 'venv', '.vercel', '.wrangler', 'test-results', 'playwright-report', '.eggs', 'tmp'}
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/folders', '/private/var/folders')
 MAIN_REFS = {'main', 'master', 'refs/heads/main', 'refs/heads/master'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';'}  # cwd None = unknown
+STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'dirty': False}  # cwd None = unknown
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
 SQL_CLIENTS = {'psql', 'sqlite3', 'mysql', 'mariadb', 'duckdb', 'turso', 'pgcli', 'litecli', 'mycli'}
@@ -89,7 +94,6 @@ REDIRECTS = {'>', '>>', '>|', '&>', '&>>'}
 GIT_VALUE = {'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--config-env', '--super-prefix'}
 XARGS_VALUE = {'-I', '-i', '-L', '-l', '-n', '-P', '-s', '-E', '-e', '-d', '-a', '-J', '-R'}
 MKTEMP = re.compile(r'^(?:\$\(mktemp[^()`;&|<>$\n]*\)|`mktemp[^()`;&|<>$\n]*`)(?:/[^$`()\n]*)?$')
-VAR_BUILD = re.compile(r'^\$(?:\{?([A-Za-z_]\w*)\}?)/(?:[^$`()*?\[\]\n]+/)?([^$`()*?\[\]/\n]+)/?$')
 TMPDIR_REF = re.compile(r'^(?:\$TMPDIR|\$\{TMPDIR(?::-/?tmp)?\})/(.+)$')
 API_MERGE = re.compile(r'(^|/)pulls/[^/\s]+/merge/?(\?.*)?$')
 GRAPHQL_MERGE = re.compile(r'\b(mergePullRequest|enablePullRequestAutoMerge)\b')
@@ -749,8 +753,9 @@ def git_decision(args):
     if sub in ('add', 'stage'):
         s, l, p = flag_parts(rest, value_opts={'--chmod', '--pathspec-from-file'})
         if s & {'A', 'u'} or l & {'--all', '--update', '--no-ignore-removal'}:
-            # -A and -u stage only the named paths; a bare one, a pathspec file or a tree-wide pathspec is the sweep
-            if not p or '--pathspec-from-file' in l or stage_sweeps(p, where):
+            # -A and -u stage only the named paths; a bare one, a pathspec file, a pathspec the shell may expand to nothing
+            # ($VAR, $(...), a glob) or a tree-wide pathspec is the sweep
+            if not p or '--pathspec-from-file' in l or any(re.search(r'[$`*?\[{]', x) for x in p) or stage_sweeps(p, where):
                 return 'deny', MSG['stage']
         elif stage_sweeps(p, where):
             return 'deny', MSG['stage']
@@ -845,35 +850,30 @@ def disposable(target):
     m = TMPDIR_REF.match(target)
     if m:
         return '$' not in m.group(1) and '`' not in m.group(1)
-    m = VAR_BUILD.match(target)
-    if m:
-        return m.group(1) != 'HOME' and build_name(m.group(2))  # $d/dist: wherever $d points, only a build folder goes
     if '$' in target or '`' in target:
         return False
     if target.startswith(('/', '~')):
         norm = os.path.normpath(target)
     else:
-        # with the folder unknown a relative target stays disposable only by its name (no .. here, so it can't climb out)
+        if STATE['cwd'] is None and (PROTECTED.name_re or PROTECTED.paths):
+            return False  # a relative target with the folder unknown could sit in a protected folder
         norm = os.path.normpath(os.path.join(STATE['cwd'], target) if STATE['cwd'] else target)
     if _temp_path(norm):
         return True
     base = os.path.basename(norm.rstrip('/'))
     if GLOB.search(base):
         base = os.path.basename(os.path.dirname(norm))
-    return build_name(base)
-
-
-def build_name(base):
     return base in REGENERABLE or base.endswith('.egg-info') or base.startswith(('dist-', 'build-'))
 
 
 def plain_files(target):
-    """True when target is an existing regular file, or a glob matching only regular files: rm -r on those is rm -f."""
-    if STATE['cwd'] is None or '$' in target or '`' in target:
+    """True when target is a literal path to an existing regular file and nothing earlier in the script could have changed
+    the folder since the guard looked: rm -r on it is rm -f. A glob or variable never counts (the shell may expand it
+    to more than the guard saw)."""
+    if STATE['cwd'] is None or STATE['dirty'] or re.search(r'[$`*?\[{~\\]', target):
         return False
-    path = os.path.join(STATE['cwd'], os.path.expanduser(target))
-    hits = glob.glob(path) if GLOB.search(path) else [path]
-    return bool(hits) and all(os.path.isfile(h) and not os.path.isdir(h) for h in hits)
+    path = os.path.join(STATE['cwd'], target)
+    return os.path.isfile(path) and not PROTECTED.hit(os.path.realpath(path), ancestor=True)
 
 
 def rm_parts(args):
@@ -1037,25 +1037,46 @@ def env_hint(token):
 
 
 def listed_names(cmd):
-    """The tokens of an upstream pipeline command that can name the files it prints. A content search that only lists
-    matching files (grep -l, rg -l, git grep -l) prints names it found, never its pattern, so the pattern is left out."""
+    """(tokens, patterns) of an upstream pipeline command. A content search that only lists matching files (grep -l,
+    rg -l, git grep -l) prints names it found, never its pattern, so the pattern moves to the second list, where only a
+    pattern that looks like an env file name still counts. Anything unclear drops nothing."""
     prog, args = os.path.basename(cmd[0]), cmd[1:]
-    if prog == 'git' and 'grep' in args:
-        prog, args = 'grep', args[args.index('grep') + 1:]
-    if prog not in SEARCHERS:
-        return cmd[1:]
-    s, l, p = flag_parts(args, value_opts=SEARCH_VALUE | PATTERN_OPTS, value_letters='efmABCgtT')
-    if not (s & {'l', 'L'} or l & {'--files-with-matches', '--files-without-match', '--name-only'}):
-        return cmd[1:]  # prints matching lines, or filters its input by the pattern: the pattern names what it keeps
-    patterns = [args[k + 1] for k, a in enumerate(args[:-1]) if a in ('-e', '--regexp')]
-    given = s & {'e', 'f'} or any(a in PATTERN_OPTS or a.startswith(('--regexp=', '--file=', '--expression=')) for a in args)
-    if not given and p:
+    if prog == 'git':
+        k = 0
+        while k < len(args) and args[k].startswith('-'):
+            k += 2 if args[k] in GIT_VALUE else 1
+        if k >= len(args) or args[k] != 'grep':
+            return cmd[1:], []
+        prog, args = 'grep', args[k + 1:]
+    if prog not in SEARCH_LETTERS:
+        return cmd[1:], []
+    s, l, p = flag_parts(args, value_opts=SEARCH_VALUE | PATTERN_OPTS, value_letters=SEARCH_LETTERS[prog])
+    if not (s & {'l'} or l & {'--files-with-matches', '--name-only'}) or '--files' in l:
+        return cmd[1:], []  # prints matching lines, filters its input by the pattern, or lists files without searching
+    patterns = [a.split('=', 1)[1] for a in args if a.startswith('--regexp=')]
+    patterns += [args[k + 1] for k, a in enumerate(args[:-1]) if a in ('-e', '--regexp')]
+    given = s & {'e', 'f'} or any(a in PATTERN_OPTS or a.startswith(('--file=', '--expression=')) for a in args)
+    if not given and not patterns and p:
         patterns = p[:1]  # no -e/-f: the first operand is the pattern
     names = list(args)
     for pat in patterns:
-        if pat in names:
-            names.remove(pat)
-    return names
+        for tok in ('--regexp=' + pat, pat):
+            if tok in names:
+                names.remove(tok)
+                break
+    return names, patterns
+
+
+def pattern_env(pattern):
+    """True when a search pattern reads as an env file name: .env, ^\\.env, env (process.env and import.meta.env do not)."""
+    plain = re.sub(r'[\\^$]', '', pattern)
+    return env_hit(pattern) or env_hit(plain) or plain == 'env' or bool(re.search(r'(?<![A-Za-z0-9_])\.env', plain))
+
+
+def feeds_env(cmd):
+    """True when an upstream pipeline command names env files for the reader after it."""
+    names, patterns = listed_names(cmd)
+    return any(env_hint(t) for t in names) or any(pattern_env(q) for q in patterns)
 
 
 def reads_env(prog, args):
@@ -1272,7 +1293,7 @@ def analyze(toks, depth):
             return 'deny', MSG['pattern_move']
         if inner in ('rm', 'unlink') and rm_parts(args[k + 1:])[0]:
             return 'deny', MSG['find_delete']
-        if inner in READERS and any(env_hint(t) for c in STATE['pipe'] for t in listed_names(c)):
+        if inner in READERS and any(feeds_env(c) for c in STATE['pipe'] if c):
             return 'deny', MSG['env']  # something that names an env file feeds the reader through the pipe
         return analyze(args[k:], depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])
     if prog == 'git':
@@ -1467,6 +1488,9 @@ def check_tokens(tokens, depth):
                         STATE['cwd'], STATE['vars'] = saved
                 if decision:
                     return decision
+                head = strip_prefix(cmd)
+                if (head and os.path.basename(head[0]) not in READ_ONLY) or any('>' in t for t in cmd):
+                    STATE['dirty'] = True
                 pipe.append(cmd)
     finally:
         if stack:
@@ -1479,7 +1503,11 @@ def check_script(text, depth=0):
         return 'deny', MSG['deep']
     try:
         norm = normalize(text)
-        decision = check_tokens(tokens_of(norm), depth)
+        tokens = tokens_of(norm)
+        if ('$(' in norm or '`' in norm or '<(' in norm or '>(' in norm or '()' in norm.replace(' ', '') or
+                {'for', 'while', 'until', 'select', 'function', 'eval'} & set(tokens)):
+            STATE['dirty'] = True  # these can run commands out of the order the guard reads them
+        decision = check_tokens(tokens, depth)
         if decision:
             return decision
         for inner in substitutions(norm) + heredoc_substitutions(norm):
