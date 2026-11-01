@@ -316,37 +316,39 @@ class FollowUpToTheReviews(Cases):
     """Everyday forms the first review denied, and the config and variable routes around the force-push check."""
     repo = ForcePushOfTheCurrentBranch.repo
 
-    def test_a_chain_back_to_a_named_branch_clears_main(self):
+    def test_nothing_clears_a_move_to_main(self):
+        """Once an earlier step may have left main checked out, a later switch, another worktree or the end of a chain do not
+        undo it: a clear "push in its own call" is the price of never missing a force push to main."""
         repo = self.repo('feature/x')
         open(os.path.join(repo, 'a.txt'), 'w').close()
-        self.passes(['git checkout main && git pull && git checkout feature/x && git rebase main && git push --force-with-lease',
-                     'git switch main && git switch -c feat2 && git push --force-with-lease origin HEAD',
-                     'git checkout main && git checkout feature/x && git push --force-with-lease origin HEAD'], cwd=repo)
-        self.denied(['git checkout main; git checkout feature/x; git push --force-with-lease',
-                     'git checkout main && git checkout feature/x; git push --force-with-lease',  # the switch may have failed
-                     'git checkout main || git checkout feature/x && git push --force-with-lease',
-                     'git checkout main && git checkout feature/x && echo hi; git push --force-with-lease',
-                     'git checkout main && git checkout a.txt && git push --force-with-lease'], message='force_main', cwd=repo)
-
-    def test_a_branch_change_in_another_worktree_does_not_count(self):
-        repo = self.repo('feature/x')
         other = os.path.join(os.path.dirname(repo), os.path.basename(repo) + '-other')
         git('worktree', 'add', '-q', '-b', 'other', other, cwd=repo)
         self.addCleanup(shutil.rmtree, other, ignore_errors=True)
-        self.passes(['git -C %s checkout main && git push --force-with-lease origin HEAD' % other,
-                     'git -C %s switch -c y && git push --force-with-lease' % other], cwd=repo)
-        self.denied(['git -C %s checkout main && git push --force-with-lease origin HEAD' % repo,
+        self.denied(['git checkout main && git pull && git checkout feature/x && git rebase main && git push --force-with-lease',
+                     'git checkout main && git checkout feature/x && git push --force-with-lease origin HEAD',
+                     'git checkout main; git checkout feature/x; git push --force-with-lease',
+                     'git checkout main && git checkout feature/x notes.md && git push --force-with-lease',  # a branch and paths
+                     'git checkout main && git checkout HEAD README.md && git push --force-with-lease',
+                     'git switch main && git switch -c feat2 && git push --force-with-lease origin HEAD'],
+                    message='branch_unknown', cwd=repo)
+        self.denied(['git checkout main && git checkout -p && git push --force-with-lease',  # no new branch named
+                     'git checkout main && git checkout a.txt && git push --force-with-lease',
+                     'git -C %s checkout main && git push --force-with-lease origin HEAD' % other,
+                     'git -C %s checkout main && git push --force-with-lease origin HEAD' % repo,
                      'git -C %s/sub checkout main && git push --force-with-lease origin HEAD' % repo,
-                     'git -C . checkout main && git push --force-with-lease', 'git -C %s checkout main && git -C %s push --force-with-lease' % (repo, repo)],
+                     'git --git-dir=%s/.git symbolic-ref HEAD refs/heads/main && git -C %s push --force-with-lease origin HEAD' % (other, other),
+                     'echo "$(cd %s && git checkout main)" && git -C %s push --force-with-lease origin HEAD' % (other, other),
+                     'cd "$REPO" && git checkout main && cd %s && git push --force-with-lease origin HEAD' % other,
+                     'git checkout main && cd %s && git push --force-with-lease origin HEAD' % other],
                     message='force_main', cwd=repo)
 
-    def test_a_later_substitution_runs_after_the_push(self):
+    def test_a_substitution_is_found_wherever_it_sits(self):
+        """Substitutions are all scanned before the first command, so no count of commands has to line up with them."""
         repo = self.repo('feature/x')
-        self.passes(['git push --force-with-lease origin HEAD && echo "$(git checkout main)"',
-                     'git push --force-with-lease origin HEAD; echo `git checkout main`',
-                     "git push --force-with-lease origin HEAD && echo '$(git checkout main)'"], cwd=repo)
-        self.denied(['echo ok && git push --force-with-lease origin "$(git checkout -q main; echo HEAD)"',
-                     'echo "$(git checkout -q main)" && git push --force-with-lease', 'git push --force-with-lease origin $(git checkout -q main)'],
+        self.denied(['find . -name x -exec true \\; ; echo "$(git checkout -q main)"; git push --force-with-lease',
+                     'ls 2>&1 | cat; echo "$(git checkout -q main)" 2>&1 && git push --force-with-lease',
+                     'echo `git checkout -q main; true`; git push --force-with-lease',
+                     'git push --force-with-lease origin HEAD && echo "$(git checkout main)"'],  # scanned up front: held at the first push
                     message='force_main', cwd=repo)
 
     def test_attached_and_long_create_values_name_the_branch(self):
@@ -379,11 +381,20 @@ class FollowUpToTheReviews(Cases):
                      "GIT_CONFIG_PARAMETERS=\"'remote.origin.mirror=true'\" git push origin",
                      'git --config-env=remote.origin.push=REFSPEC push origin', 'git config remote.origin.push +HEAD:main',
                      'git config --global --add remote.origin.mirror true', 'git config set push.default matching',
+                     'git config --global push.default matching',
+                     "GIT_CONFIG_PARAMETERS=\"'remote.origin.mirror'='true'\" git push origin",
+                     "GIT_CONFIG_PARAMETERS=\"'remote.origin.push'='+HEAD:main'\" git push origin",
+                     "GIT_CONFIG_PARAMETERS=\"'push.default'='matching'\" git push --force-with-lease",
+                     "GIT_CONFIG_PARAMETERS=\"'push.default=matching'\" git push --force-with-lease",
                      'git config --local remote.origin.push "+refs/heads/*:refs/heads/*"'], message='force_main', cwd=repo)
         self.passes(['git -c push.autoSetupRemote=true push -u origin HEAD', 'git config remote.origin.url git@example.com:a/b.git',
                      'git config --get remote.origin.push', 'git config --unset remote.origin.push', 'git config push.autoSetupRemote true',
                      'git config user.name x', 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=vi git push -u origin HEAD',
-                     'git config --list'], cwd=repo)
+                     'git config --list', 'git config push.default simple', 'git config --global push.default current',
+                     'git config push.default upstream', 'git -c push.default=simple push --force-with-lease origin feat',
+                     "GIT_CONFIG_PARAMETERS=\"'push.default'='simple'\" git push -u origin HEAD",
+                     "GIT_CONFIG_PARAMETERS=\"'push.default=current'\" git push --force-with-lease origin feat",
+                     "GIT_CONFIG_PARAMETERS=\"'core.editor'='vi'\" git push -u origin HEAD"], cwd=repo)
 
     def test_a_variable_in_a_forced_refspec_may_hold_main(self):
         repo = self.repo('feature/y')
