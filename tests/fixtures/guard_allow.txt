@@ -66,6 +66,13 @@ gh --repo acme/shop pr checks 7
 gh api user
 gh api repos/acme/shop/pulls/7
 gh api repos/acme/shop/issues/7/comments
+gh repo view acme/shop
+gh repo create acme/new --private
+git push -u origin HEAD
+git checkout -b feat && git push -u origin feat
+git rm old.txt
+git rm -r --cached build
+git branch -f feature main
 
 # deletes that go straight through: build folders, temp, single files
 rm -rf node_modules
@@ -84,6 +91,7 @@ D="$(mktemp -d)"; rm -rf "$D/x"
 cd /private/tmp/x && rm -rf probe
 mkdir -p /tmp/x && cd /tmp/x && rm -rf logins
 rm -rf node_modules/.cache
+rm -rf node_modules dist
 for d in a b; do echo $d; done
 if true; then ls; fi
 S=/private/tmp/x/probe; cd $S && rm -rf logins
