@@ -82,7 +82,8 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
 STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False,
-         'raw': [], 'moved': False}  # cwd None = unknown; raw = the current command's tokens before $VAR expansion
+         'raw': [], 'moved': False,
+         'marks': {'active': set(), 'unquoted': set(), 'braced': set()}}  # cwd None = unknown; raw = the command's tokens before $VAR expansion
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
 SQL_CLIENTS = {'psql', 'sqlite3', 'mysql', 'mariadb', 'duckdb', 'turso', 'pgcli', 'litecli', 'mycli'}
@@ -100,6 +101,7 @@ DB_WRITE = re.compile(r'\b(insert|update|delete|replace|drop|alter|create|vacuum
                       r'(^|\s)\.(restore|import|recover)\b|\bpragma\s+\w+\s*=', re.I)
 DB_DUMP_TO = re.compile(r'(?:^|\s)\.(?:backup|save|clone)\s+(?:\w+\s+)?[\'"]?([^\s\'"]+)', re.I)
 ASSIGN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+STRICT_REF = re.compile(r'\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})')
 VAR_REF = re.compile(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?')
 HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 SEPARATORS = {';', '&&', '||', '|', '&', '|&', ';;', '(', ')', '{', '}', '!'}
@@ -424,6 +426,61 @@ def tokens_of(text):
         return list(lex)
     except ValueError:
         return []  # unbalanced quotes: bash refuses to run it, so there is nothing to judge
+
+
+def note_quoting(text, tokens):
+    """Record in STATE['marks'] which words of the script (as shlex decodes them) hold a $ or backtick that is not
+    single-quoted or escaped ('active'), one that is not quoted at all ('unquoted'), or an unquoted brace expansion
+    ('braced'). The tokenizer drops the quotes; this reads them again. When its words do not match the tokenizer's, every
+    word counts as all three."""
+    words, cur, i, n = [], None, 0, len(text)
+    while i < n:
+        c = text[i]
+        i += 1
+        if c.isspace() or c in ';&|()<>':
+            if cur is not None:
+                words.append(cur)
+            cur = None
+            continue
+        if cur is None:
+            cur = ['', False, False, '']  # decoded word, active, unquoted, unquoted text
+        if c == '\\' and i < n:
+            cur[0] += text[i]
+            i += 1
+        elif c == "'":
+            j = text.find("'", i)
+            j = n if j < 0 else j
+            cur[0] += text[i:j]
+            i = j + 1
+        elif c == '"':
+            while i < n and text[i] != '"':
+                if text[i] == '\\' and i + 1 < n:  # shlex drops the backslash only before " and \; bash also lets it escape $ and `
+                    cur[0] += text[i + 1] if text[i + 1] in '"\\' else text[i:i + 2]
+                    i += 2
+                    continue
+                cur[1] = cur[1] or text[i] in '$`'
+                cur[0] += text[i]
+                i += 1
+            i += 1
+        else:
+            if c in '$`':
+                cur[1] = cur[2] = True
+            cur[0] += c
+            cur[3] += c
+    if cur is not None:
+        words.append(cur)
+    marks = STATE['marks']
+    if [w[0] for w in words] != [t for t in tokens if not all(c in ';&|()<>' for c in t)]:
+        for k in marks:
+            marks[k].update(tokens)
+        return
+    for word, active, unquoted, bare in words:
+        if active:
+            marks['active'].add(word)
+        if unquoted:
+            marks['unquoted'].add(word)
+        if '{' in bare and (',' in bare or '..' in bare):
+            marks['braced'].add(word)
 
 
 def simple_commands(tokens):
@@ -806,6 +863,20 @@ def stage_sweeps(specs, where):
     return bool(specs) and excluded == len(specs)
 
 
+def expands(token):
+    """True when a raw token holds a $ or backtick the shell will act on and the guard cannot see the result of: not
+    single-quoted or escaped, and, inside double quotes, not just references to variables the guard knows (one word)."""
+    marks = STATE['marks']
+    if not re.search(r'[$`]', token) or token not in marks['active']:
+        return False
+    if token in marks['unquoted']:
+        return True  # unquoted, a value with spaces splits into several words
+    names = [a or b for a, b in STRICT_REF.findall(token)]
+    left = STRICT_REF.sub('', token)
+    return bool(re.search(r'[$`]', left)) or any(n not in STATE['vars'] for n in names) or bool(
+        re.search(r'[$`]', expand(token)))
+
+
 def git_head(args):
     """(folder, subcommand, its arguments, -c settings) of a git call, or None when there is no subcommand."""
     i, where, config = 0, STATE['cwd'] or os.getcwd(), []
@@ -885,10 +956,12 @@ def git_decision(args):
     if sub in ('add', 'stage'):
         s, l, p = flag_parts(rest, value_opts={'--chmod', '--pathspec-from-file'})
         sweeping = bool(s & {'A', 'u'} or l & {'--all', '--update', '--no-ignore-removal'})
-        # raw tokens: a variable that holds several words splits into several pathspecs. An unknown folder gives no repo
-        # root to compare with, so only a plain relative pathspec can be judged then.
-        if any(re.search(r'[$`]', t) for t in STATE['raw']) or (STATE['cwd'] is None and (sweeping or any(
-                x.startswith(('/', '~', ':')) or '..' in x.split('/') for x in p))):
+        # An unknown folder (unless -C names one) gives no repo root to compare with, so only a plain relative pathspec
+        # can be judged then. A word the shell expands or splits ($VAR, brace expansion) is not what the guard sees.
+        known = STATE['cwd'] is not None or any(
+            a == '-C' and k + 1 < len(args) and os.path.isabs(os.path.expanduser(args[k + 1])) for k, a in enumerate(args))
+        if (any(expands(t) for t in STATE['raw']) or any(x in STATE['marks']['braced'] for x in p) or (not known and (
+                sweeping or any(x.startswith(('/', '~', ':')) or '..' in x.split('/') for x in p)))):
             return 'deny', MSG['stage']
         if sweeping:
             # -A and -u stage only the named paths; a bare one, a pathspec file, a pathspec the shell may expand to nothing
@@ -1265,7 +1338,16 @@ def listed_names(cmd):
     s, l, p = flag_parts(args, value_opts=SEARCH_VALUE | PATTERN_OPTS, value_letters=SEARCH_LETTERS[prog])
     if not (s & {'l'} or l & {'--files-with-matches', '--name-only'}) or '--files' in l:
         return cmd[1:], []  # prints matching lines, filters its input by the pattern, or lists files without searching
-    opts = args[:args.index('--')] if '--' in args else args  # after -- everything is an operand
+    opts, k = args, 0
+    while k < len(args):  # after a -- that is not an option's value everything is an operand
+        a = args[k]
+        k += 1
+        if a == '--':
+            opts = args[:k - 1]
+            break
+        if a in SEARCH_VALUE or a in PATTERN_OPTS or (a[:1] == '-' and a[1:2] != '-' and next(
+                (ch == a[-1] for ch in a[1:] if ch in SEARCH_LETTERS[prog]), False)):
+            k += 1
     patterns = [a.split('=', 1)[1] for a in opts if a.startswith('--regexp=')]
     patterns += [opts[k + 1] for k, a in enumerate(opts[:-1]) if a in ('-e', '--regexp')]
     given = s & {'e', 'f'} or any(a in PATTERN_OPTS or a.startswith(('--file=', '--expression=')) for a in opts)
@@ -1462,15 +1544,16 @@ def applying(prog_args):
     return False
 
 
-def analyze(toks, depth):
+def analyze(toks, depth, raw=None):
     assigns = [t for t in toks if ASSIGN.match(t)]
     if assigns and len(assigns) == len(toks):
         for t in assigns:
             k, v = t.split('=', 1)
             STATE['vars'][k] = expand(v)
         return None
-    STATE['raw'] = strip_prefix(toks)
-    toks = [expand(t) for t in STATE['raw']]
+    stripped = strip_prefix(toks)
+    STATE['raw'] = (toks if raw is None else raw)[len(toks) - len(stripped):]  # index-aligned with toks, before expansion
+    toks = [expand(t) for t in stripped]
     if not toks:
         return None
     if toks[0] in ('export', 'declare', 'typeset', 'local', 'readonly'):
@@ -1510,7 +1593,9 @@ def analyze(toks, depth):
             return 'deny', MSG['find_delete']
         if inner in READERS and any(feeds_env(c) for c in STATE['pipe'] if c):
             return 'deny', MSG['env']  # something that names an env file feeds the reader through the pipe
-        return analyze(STATE['raw'][1 + k:], depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])  # raw: see git add
+        if k < len(args) and re.search(r'[$`]', args[k]):
+            return 'deny', MSG['deep']  # the program xargs runs is not known
+        return analyze(args[k:], depth + 1, STATE['raw'][1 + k:]) if depth < MAX_DEPTH else ('deny', MSG['deep'])
     if prog == 'git':
         return git_decision(args)
     if prog == 'gh':
@@ -1737,7 +1822,9 @@ def check_script(text, depth=0):
         if depth == 0:
             STATE['plain'] = bool(PLAIN_RM.match(text))
         scan_moves(norm)
-        decision = check_tokens(tokens_of(norm), depth)
+        tokens = tokens_of(norm)
+        note_quoting(norm, tokens)
+        decision = check_tokens(tokens, depth)
         if decision:
             return decision
         for inner in substitutions(norm) + heredoc_substitutions(norm):

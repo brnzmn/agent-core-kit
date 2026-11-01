@@ -215,9 +215,16 @@ class RoutineCommandsPass(unittest.TestCase):
                     'cd "$REPO" && git add %s' % repo, 'cd "$REPO" && git add ../x', 'cd "$REPO" && git stage ~/x'],
                    'deny', cwd=repo, key='stage')
         # plain adds keep working, also when the folder is unknown and the path is relative
-        self.check(['git add README.md src/a.py', 'git stage src/', 'cd "$REPO" && git add src/a.py'], None, cwd=repo)
+        self.check(['git add README.md src/a.py', 'git stage src/', 'cd "$REPO" && git add src/a.py',
+                    "git add 'app/routes/users.$id.tsx'", 'git add "users.\\$id.tsx"', 'git add users.\\$id.tsx',
+                    'F=src/a.py; git add "$F"', 'git add "{a,b}"', "git add 'a{b}.tsx'",
+                    'cd "$REPO" && git -C %s add -A README.md' % repo], None, cwd=repo)
+        self.check(['cd "$REPO" && git -C sub add -A README.md', 'cd "$REPO" && git -C %s add -A %s' % (repo, repo)],
+                   'deny', cwd=repo, key='stage')
         # a variable that holds several words splits into several pathspecs, with or without -A, also behind xargs
-        self.check(['F="README.md ."; git add $F', 'F="README.md ."; git stage $F', 'F=src/a.py; git add "$F"',
+        self.check(['F="README.md ."; git add $F', 'F="README.md ."; git stage $F', 'F="a b"; git add $F',
+                    'git add "$UNKNOWN"', 'F=.; git add "$F"', "F='*'; git add \"$F\"", 'F=$X; git add "$F"',
+                    'git add {README.md,.}', 'git add {a..z}', 'git add src/{a,.}', 'git add -u {a,.}',
                     'F="a ."; xargs git add -A $F </dev/null', 'F="a ."; echo x | xargs git add $F',
                     'F="a ."; echo x | xargs -I{} git add -A $F {}'], 'deny', cwd=repo, key='stage')
         self.check(['git add -A', 'git add -u', 'git add --all', 'git add --update', 'git add -A .', 'git add -u .',
@@ -251,11 +258,17 @@ class RoutineCommandsPass(unittest.TestCase):
                     'git push origin +HEAD:main'):
             self.assertTrue(blocked(cmd), cmd)
 
+    def test_xargs_runs_the_program_the_variables_name(self):
+        self.check(['W=env; echo README.md | xargs "$W" cat .env', 'echo README.md | xargs $U cat .env',
+                    'W=cat; echo README.md | xargs "$W" .env', 'echo x | xargs "$(which cat)" .env'], 'deny', key=None)
+        self.check(['W=cat; echo README.md | xargs "$W" README.md'], None)
+
     def test_env_pattern_check_honours_the_safe_suffixes_and_stops_at_double_dash(self):
         self.check(['grep -rl .env.example src | xargs cat', 'grep -rl .env.sample src | xargs cat',
-                    'rg -l "\\.env\\.template$" src | xargs cat', 'grep -l -- process.env src | xargs cat'], None)
+                    'rg -l "\\.env\\.template$" src | xargs cat', 'grep -l -- process.env src | xargs cat',
+                    'grep -l -e -- -e process.env README.md | xargs cat'], None)
         self.check(["grep -rl '.env.example|.env' src | xargs cat", 'grep -rl .env.local src | xargs cat',
-                    'grep -l -- -e foo.env | xargs cat'], 'deny', key='env')
+                    'grep -l -- -e foo.env | xargs cat', 'grep -l -e -- -e KEY .env | xargs cat'], 'deny', key='env')
 
     def test_guard_has_no_unused_imports(self):
         import ast
