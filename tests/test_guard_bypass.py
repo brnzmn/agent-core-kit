@@ -118,8 +118,9 @@ class HiddenRecursiveDeletes(Cases):
     def test_cd_minus_or_an_unknown_target_makes_the_folder_unknown(self):
         self.denied(['cd /tmp && cd - && rm -rf src', 'cd /tmp && cd "$WHERE" && rm -rf src', 'cd /tmp && cd $(pwd)/.. && rm -rf src',
                      'cd /tmp && cd ~root && rm -rf src', 'cd /tmp && cd /tmp/* && rm -rf src', 'cd /tmp && popd && rm -rf src',
-                     'cd - && rm -rf node_modules'])
-        self.passes(['cd /tmp && cd sub && rm -rf src', 'cd /tmp && rm -rf /tmp/x', 'cd - && rm -rf /tmp/x', 'pushd /tmp && rm -rf src'])
+                     'cd - && rm -rf .', 'cd - && rm -rf ..'])
+        self.passes(['cd - && rm -rf node_modules',  # a build folder goes by its name, wherever the folder is
+                     'cd /tmp && cd sub && rm -rf src', 'cd /tmp && rm -rf /tmp/x', 'cd - && rm -rf /tmp/x', 'pushd /tmp && rm -rf src'])
 
     def test_a_cd_into_a_missing_folder_only_counts_when_and_and_guards_the_rest(self):
         self.denied(['cd /tmp/does-not-exist-1; rm -rf src', 'cd /tmp/does-not-exist-1 || true; rm -rf src',
