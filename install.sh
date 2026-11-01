@@ -262,6 +262,9 @@ case "${1:-}" in
     ;;
   --clean-slate)
     preflight
+    if is_installed; then
+      die "agent-core-kit is already installed, and --clean-slate is for a first install only. To move more of your own files aside, run bash $KIT_T/install.sh --uninstall first, then --clean-slate again."
+    fi
     first_install clean
     ;;
   --check)

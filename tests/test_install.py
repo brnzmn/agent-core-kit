@@ -198,7 +198,8 @@ class FirstInstall(Sandbox):
         self.assertEqual(read(os.path.join(self.claude, 'agents', 'worker.md')), '---\nname: worker\n---\nmy own worker\n')
         self.assertFalse(os.path.exists(os.path.join(bk, 'claude', 'agents', 'worker.md')))
         self.assertEqual(json.loads(read(os.path.join(bk, 'claude', 'settings.json')))['theme'], 'dark')
-        self.assertEqual(read(os.path.join(bk, 'codex', 'config.toml')), 'model = "my-model"\n')
+        # the pin is off, so the kit never changes config.toml and does not copy it
+        self.assertFalse(os.path.exists(os.path.join(bk, 'codex', 'config.toml')))
         self.assertIn('echo my codex stop', read(os.path.join(bk, 'codex', 'hooks.json')))
         self.assertFalse(os.path.exists(os.path.join(bk, 'ARCHIVED')))
 
@@ -566,7 +567,6 @@ class InstallState(Sandbox):
     """The record of what the kit added lives in local/, so --clean-slate (which archives ~/.claude/hooks) cannot take it."""
 
     def test_install_clean_slate_uninstall_leaves_none_of_the_kits_rules(self):
-        self.ok()
         self.ok('--clean-slate')
         self.assertTrue(os.path.isfile(os.path.join(self.local, 'install-state.json')))
         self.assertFalse(os.path.exists(os.path.join(self.claude, 'hooks', 'agent-core', '.install-state.json')))
@@ -992,6 +992,320 @@ class FileModes(Sandbox):
         self.assertFalse(os.path.exists(os.path.join(self.codex, 'config.toml')), 'the kit made it, so it goes into the backup')
         self.assertFalse(os.path.exists(os.path.join(self.codex, 'hooks.json')))
         self.assertFalse(os.path.exists(os.path.join(self.claude, 'settings.json')))
+
+
+class KeepsTheUsersFiles(Sandbox):
+    """Uninstall and --restore touch only what the kit changed, and --clean-slate does not follow a symlink."""
+
+    def pin(self):
+        self.configure(codex={'models': {}, 'pin_memories_off': True})
+
+    def test_uninstall_takes_out_only_the_memories_pin_of_a_config_edited_since(self):
+        self.pin()
+        self.ok()
+        config = os.path.join(self.codex, 'config.toml')
+        write(config, 'model = "my-model"\n\n[mcp_servers.github]\ncommand = "gh-mcp"\n')  # the pin is gone
+        self.ok('--sync')  # pins again
+        self.assertIn('memories = false', read(config))
+        out = self.ok('--uninstall')
+        text = read(config)
+        self.assertIn('[mcp_servers.github]', text)
+        self.assertIn('command = "gh-mcp"', text)
+        self.assertIn('model = "my-model"', text)
+        self.assertNotIn('memories', text)
+        self.assertNotIn('[features]', text, 'the table the kit added goes with its only key')
+        self.assertIn('config.toml', out.stdout)
+
+    def test_uninstall_keeps_what_was_added_after_the_pin_and_restores_the_users_own_memories_line(self):
+        write(os.path.join(self.codex, 'config.toml'), '[features]\nmemories = true # mine\napps = true\n')
+        self.pin()
+        self.ok()
+        config = os.path.join(self.codex, 'config.toml')
+        self.assertIn('memories = false', read(config))
+        write(config, read(config) + '\n[mcp_servers.github]\ncommand = "gh-mcp"\n')
+        self.ok('--uninstall')
+        self.assertEqual(read(config), '[features]\nmemories = true # mine\napps = true\n\n[mcp_servers.github]\ncommand = "gh-mcp"\n')
+
+    def test_restoring_the_first_backup_does_not_revert_a_config_the_kit_never_changed(self):
+        self.ok()  # pin off
+        first = self.backups()[0]
+        self.assertFalse(os.path.exists(os.path.join(self.local, 'backups', first, 'codex', 'config.toml')))
+        config = os.path.join(self.codex, 'config.toml')
+        write(config, 'model = "my-model"\n[mcp_servers.github]\ncommand = "gh-mcp"\n')
+        self.ok('--restore', first)
+        self.assertIn('[mcp_servers.github]', read(config))
+
+    def test_the_first_backup_holds_config_toml_when_the_pin_is_on(self):
+        self.pin()
+        self.ok()
+        self.assertEqual(read(os.path.join(self.local, 'backups', self.backups()[0], 'codex', 'config.toml')),
+                         'model = "my-model"\n')
+
+    def test_uninstall_does_not_suggest_restoring_the_earlier_backups(self):
+        self.ok()
+        out = self.ok('--uninstall')
+        self.assertIn('Earlier backups', out.stdout)
+        self.assertNotIn('Put one back', out.stdout)
+
+    def archive_through_a_link(self, text):
+        """~/.claude/skills becomes a symlink to ~/dotfiles/skills holding the user's skill. text is the link text."""
+        link = os.path.join(self.claude, 'skills')
+        target = os.path.join(self.home, 'dotfiles', 'skills')
+        os.makedirs(os.path.dirname(target))
+        shutil.move(link, target)
+        os.symlink(text(target), link)
+        return link, target
+
+    def test_clean_slate_and_uninstall_put_a_symlinked_skills_folder_back_as_the_same_link(self):
+        for text in (lambda target: '../dotfiles/skills', lambda target: target):
+            self.fresh_sandbox()
+            link, target = self.archive_through_a_link(text)
+            was = os.readlink(link)
+            self.ok('--clean-slate')
+            self.assertFalse(os.path.islink(link), 'the kit installs a folder of its own')
+            self.assertEqual(os.listdir(target), ['my-skill'], 'nothing was written through the link')
+            self.ok('--uninstall')
+            self.assertTrue(os.path.islink(link), was)
+            self.assertEqual(os.readlink(link), was)
+            self.assertTrue(os.path.isfile(os.path.join(link, 'my-skill', 'SKILL.md')))
+            self.assertEqual(os.listdir(target), ['my-skill'])
+
+    def test_restoring_a_clean_slate_backup_recreates_the_link_and_does_not_crash(self):
+        for text in (lambda target: '../dotfiles/skills', lambda target: target):
+            self.fresh_sandbox()
+            link, target = self.archive_through_a_link(text)
+            was = os.readlink(link)
+            self.ok('--clean-slate')
+            out = self.ok('--restore', self.backups()[0])
+            self.assertEqual(os.readlink(link), was, out.stdout)
+            self.assertEqual(os.listdir(target), ['my-skill'])
+
+    def fresh_sandbox(self):
+        shutil.rmtree(self.tmp, True)
+        self.setUp()
+
+    def test_restoring_an_uninstall_backup_does_not_write_the_kits_files_through_the_users_symlink(self):
+        link, target = self.archive_through_a_link(lambda target: '../dotfiles/skills')
+        self.ok('--clean-slate')
+        self.ok('--uninstall')
+        self.assertEqual(os.readlink(link), '../dotfiles/skills')
+        (name,) = [b for b in self.backups() if b.endswith('-uninstall')]
+        out = self.ok('--restore', name)
+        self.assertEqual(os.listdir(target), ['my-skill'], out.stdout)
+        self.assertFalse(os.path.islink(link))
+        self.assertTrue(os.path.isfile(os.path.join(link, 'handoff', 'SKILL.md')), 'the kit is back in a folder of its own')
+        (before,) = [b for b in self.backups() if b.endswith('-before-restore')]
+        self.assertIn('claude/skills', read(os.path.join(self.local, 'backups', before, 'ARCHIVED')))
+        self.ok('--restore', before)  # the link can come back
+        self.assertEqual(os.readlink(link), '../dotfiles/skills')
+        self.assertEqual(os.listdir(target), ['my-skill'])
+
+    def test_restores_in_a_chain_never_write_through_the_users_symlink_and_the_link_comes_back(self):
+        link, target = self.archive_through_a_link(lambda target: '../dotfiles/skills')
+        dotfiles = snapshot(os.path.dirname(target))
+        self.ok('--clean-slate')
+        first = self.backups()[0]
+        self.assertEqual(snapshot(os.path.dirname(target)), dotfiles)
+        seen = set([first])
+        for step in range(3):  # restore the first backup, then the before-restore backup each one leaves, twice more
+            self.ok('--restore', first)
+            self.assertEqual(snapshot(os.path.dirname(target)), dotfiles, 'step %d' % step)
+            expect_link = step % 2 == 0
+            self.assertEqual(os.path.islink(link), expect_link, 'step %d' % step)
+            new = [b for b in self.backups() if '-before-restore' in b and b not in seen]
+            seen.update(new)
+            first = new[-1]
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.readlink(link), '../dotfiles/skills')
+
+    def test_the_edits_note_names_the_path_where_a_symlinked_claude_md_really_landed(self):
+        link = os.path.join(self.claude, 'CLAUDE.md')
+        target = os.path.join(self.home, 'dotfiles', 'CLAUDE.md')
+        os.remove(link)
+        os.makedirs(os.path.dirname(target))
+        os.symlink(target, link)  # nothing of the users behind it yet
+        self.ok()
+        write(link, read(link) + '\nmy own extra rule\n')
+        out = self.ok('--uninstall')
+        (line,) = [l for l in out.stdout.splitlines() if 'your edits are kept in' in l]
+        kept = line.split('your edits are kept in ', 1)[1]
+        self.assertTrue(os.path.isfile(kept), line)
+        self.assertIn('my own extra rule', read(kept))
+
+    def test_clean_slate_is_refused_when_the_kit_is_already_installed(self):
+        self.ok()
+        write(os.path.join(self.claude, 'skills', 'made-later', 'SKILL.md'), '---\nname: made-later\n---\nmine\n')
+        state = read(os.path.join(self.local, 'install-state.json'))
+        out = self.install('--clean-slate')
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn('already installed', out.stderr)
+        self.assertIn('--uninstall', out.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self.claude, 'skills', 'made-later', 'SKILL.md')))
+        self.assertTrue(os.path.isfile(os.path.join(self.claude, 'skills', 'my-skill', 'SKILL.md')))
+        self.assertEqual(read(os.path.join(self.local, 'install-state.json')), state)
+        self.ok('--uninstall')
+        self.ok('--clean-slate')  # after an uninstall it is a first install again
+        self.assertFalse(os.path.exists(os.path.join(self.claude, 'skills', 'made-later')))
+
+    def test_the_users_own_auto_mode_environment_lines_survive_install_sync_and_uninstall(self):
+        mine = ['Source control: my own org is trusted.']
+        s = self.settings()
+        s['autoMode'] = {'environment': list(mine), 'allow': ['x']}
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+        self.configure(auto_mode_environment=['Source control: GitHub org example-org is trusted.'])
+        self.ok()
+        env = self.settings()['autoMode']['environment']
+        self.assertEqual(env, mine + ['$defaults', 'Source control: GitHub org example-org is trusted.'])
+        self.ok('--sync')
+        self.assertEqual(self.settings()['autoMode']['environment'], env)
+        self.assertIn('in sync', self.ok('--check').stdout)
+        self.configure(auto_mode_environment=['A different line.'])
+        self.ok('--sync')
+        self.assertEqual(self.settings()['autoMode']['environment'], mine + ['$defaults', 'A different line.'])
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': mine, 'allow': ['x']})
+
+    def test_uninstall_says_where_the_users_edits_of_the_generated_claude_md_went(self):
+        self.ok()
+        path = os.path.join(self.claude, 'CLAUDE.md')
+        write(path, read(path) + '\nmy own extra rule\n')
+        out = self.ok('--uninstall')
+        (name,) = [b for b in self.backups() if b.endswith('-uninstall')]
+        kept = os.path.join(self.local, 'backups', name, 'claude', 'CLAUDE.md')
+        self.assertIn('my own extra rule', read(kept))
+        self.assertIn('your edits are kept in', out.stdout)
+        self.assertIn(name, out.stdout)
+        self.assertEqual(read(path), 'my own global rules\n')
+
+    def test_an_untouched_generated_claude_md_gets_no_edits_note(self):
+        self.ok()
+        self.assertNotIn('your edits', self.ok('--uninstall').stdout)
+
+
+class AutoModeRecordMigration(Sandbox):
+    """State files written by the first release recorded autoMode.environment as one {had, previous, set} change."""
+    OLD, NEW = 'Source control: the old org is trusted.', 'Source control: the new org is trusted.'
+
+    def as_first_release_left_it(self, had, previous):
+        path = os.path.join(self.local, 'install-state.json')
+        st = json.loads(read(path))
+        st['settings'].pop('autoModeEnvironment')
+        st['changes']['autoMode.environment'] = {'had': had, 'previous': previous, 'set': ['$defaults', self.OLD]}
+        st['created'] = [c for c in st['created'] if c != 'autoMode.environment']
+        write(path, json.dumps(st))
+        if had:
+            s = self.settings()
+            s['autoMode']['environment'] = ['$defaults', self.OLD]  # that release replaced the list
+            write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+
+    def test_a_swapped_line_replaces_the_old_one_and_uninstall_leaves_nothing_of_the_kit(self):
+        self.configure(auto_mode_environment=[self.OLD])
+        self.ok()
+        self.as_first_release_left_it(False, None)
+        self.configure(auto_mode_environment=[self.NEW])
+        self.ok('--sync')
+        self.assertEqual(self.settings()['autoMode']['environment'], ['$defaults', self.NEW])
+        self.assertIn('in sync', self.ok('--check').stdout)
+        self.ok('--uninstall')
+        self.assertNotIn('autoMode', self.settings())
+
+    def test_the_users_lines_that_release_replaced_come_back_beside_the_kits(self):
+        s = self.settings()
+        s['autoMode'] = {'environment': ['mine']}
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+        self.configure(auto_mode_environment=[self.OLD])
+        self.ok()
+        self.as_first_release_left_it(True, ['mine'])
+        self.configure(auto_mode_environment=[self.NEW])
+        self.ok('--sync')
+        self.assertEqual(self.settings()['autoMode']['environment'], ['mine', '$defaults', self.NEW])
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['mine']})
+
+    def test_uninstall_after_the_upgrade_without_a_sync_takes_the_kits_lines_out(self):
+        self.configure(auto_mode_environment=[self.OLD])
+        self.ok()
+        self.as_first_release_left_it(False, None)
+        s = self.settings()
+        s['autoMode']['environment'].append('added by hand')
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['added by hand']})
+
+    def first_release_install_over_the_users_line(self):
+        s = self.settings()
+        s['autoMode'] = {'environment': ['mine']}
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+        self.configure(auto_mode_environment=[self.OLD])
+        self.ok()
+        self.as_first_release_left_it(True, ['mine'])
+
+    def edit_the_list(self, *lines):
+        s = self.settings()
+        s['autoMode']['environment'] += list(lines)
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+
+    def test_uninstall_after_the_upgrade_without_a_sync_puts_the_users_replaced_line_back(self):
+        self.first_release_install_over_the_users_line()
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['mine']})
+
+    def test_a_list_the_user_edited_since_does_not_get_the_replaced_line_back_on_sync(self):
+        self.first_release_install_over_the_users_line()
+        self.edit_the_list('added by hand')
+        self.configure(auto_mode_environment=[self.NEW])
+        self.ok('--sync')
+        env = self.settings()['autoMode']['environment']
+        self.assertNotIn('mine', env)
+        self.assertIn('added by hand', env)
+        self.assertIn(self.NEW, env)
+        self.assertNotIn(self.OLD, env)
+
+    def test_a_list_the_user_edited_since_does_not_get_the_replaced_line_back_on_uninstall(self):
+        self.first_release_install_over_the_users_line()
+        self.edit_the_list('added by hand')
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['added by hand']})
+
+    def test_emptying_the_config_after_the_upgrade_still_brings_the_replaced_line_back(self):
+        self.first_release_install_over_the_users_line()
+        self.configure(auto_mode_environment=[])
+        self.ok('--sync')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['mine']})
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['mine']})
+
+    def test_an_environment_that_is_not_a_list_is_left_alone_with_a_warning(self):
+        s = self.settings()
+        s['autoMode'] = {'environment': 'one line as a string'}
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+        self.configure(auto_mode_environment=[self.OLD])
+        out = self.ok()
+        self.assertIn('not a list', out.stdout)
+        self.assertEqual(self.settings()['autoMode'], {'environment': 'one line as a string'})
+        self.ok('--sync')
+        self.assertEqual(self.settings()['autoMode'], {'environment': 'one line as a string'})
+        self.assertIn('differs', self.install('--check').stdout)
+        self.ok('--uninstall')
+        self.assertEqual(self.settings()['autoMode'], {'environment': 'one line as a string'})
+
+    def test_emptying_the_config_takes_the_kits_lines_out_on_the_next_sync(self):
+        self.configure(auto_mode_environment=[self.OLD])
+        self.ok()
+        self.configure(auto_mode_environment=[])
+        self.ok('--sync')
+        self.assertNotIn('autoMode', self.settings(), 'the kit made it and nothing of the users is in it')
+        self.assertIn('in sync', self.ok('--check').stdout)
+
+    def test_emptying_the_config_keeps_the_users_own_lines(self):
+        s = self.settings()
+        s['autoMode'] = {'environment': ['mine']}
+        write(os.path.join(self.claude, 'settings.json'), json.dumps(s))
+        self.configure(auto_mode_environment=[self.OLD])
+        self.ok()
+        self.configure(auto_mode_environment=[])
+        self.ok('--sync')
+        self.assertEqual(self.settings()['autoMode'], {'environment': ['mine']})
 
 
 class SettingsTemplate(unittest.TestCase):

@@ -280,6 +280,28 @@ class CodexInstall(unittest.TestCase):
         self.assertFalse(os.path.exists(self.codex))
 
 
+class CleanSlate(Isolated):
+    def test_the_record_of_folders_already_moved_survives_a_failure_on_a_later_one(self):
+        claude = os.path.join(self.tmp, '.claude')
+        for d in ('agents', 'skills'):
+            os.makedirs(os.path.join(claude, d))
+        real, calls = build.Backup.archive, []
+
+        def archive(this, path):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError('cross-device move failed')
+            return real(this, path)
+
+        with mock.patch.object(build, 'CLAUDE_DIR', claude), \
+                mock.patch.object(build, 'BACKUP', build.Backup(os.path.join(self.tmp, 'backup'))), \
+                mock.patch.object(build.Backup, 'archive', archive), mock.patch.object(build, '_STATE', None):
+            with self.assertRaises(OSError), contextlib.redirect_stdout(io.StringIO()):
+                build.clean_slate()
+        with open(os.path.join(self.local, 'install-state.json')) as fh:
+            self.assertEqual(list(json.load(fh)['archived']), ['agents'])
+
+
 class MemoriesPin(unittest.TestCase):
     def check_both(self, fn):
         fn()
