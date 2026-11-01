@@ -24,6 +24,7 @@ Prints a decision as JSON, or nothing to let the call through.
 Its own errors never block a call; they go to learning/hook-errors.log.
 """
 import fnmatch
+import glob
 import json
 import os
 import re
@@ -49,16 +50,24 @@ READERS = {'cat', 'less', 'more', 'head', 'tail', 'bat', 'nl', 'open', 'strings'
            'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'awk', 'gawk', 'mawk', 'sed', 'source', '.',
            'cut', 'sort', 'uniq', 'paste', 'column', 'fold', 'rev', 'base64', 'diff', 'cmp', 'comm', 'hexdump', 'jq', 'yq'}
 PATTERN_FIRST = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'awk', 'gawk', 'mawk', 'sed'}  # first operand is the pattern
+# short options that take a value, per search program (grep -T and ag -t take none: a wrong table drops nothing safe)
+SEARCH_LETTERS = {'grep': 'efmABCdD', 'egrep': 'efmABCdD', 'fgrep': 'efmABCdD', 'rg': 'efmABCdgjrtTEM'}
+SEARCH_VALUE = {'--include', '--exclude', '--exclude-dir', '--exclude-from', '--glob', '--iglob', '--type', '--type-not',
+                '--max-count', '--max-depth', '--after-context', '--before-context', '--context', '--label', '--replace',
+                '--directories', '--devices', '--binary-files', '--threads', '--max-columns', '--sort', '--sortr'}
 PATTERN_OPTS = {'-e', '-f', '--regexp', '--file', '--expression'}
 FILE_FLAGS = {'-g', '--glob', '--iglob', '--include', '-f', '--file'}  # options whose value is a file or a file glob
 LAKE_WRITERS = {'tee', 'truncate', 'chmod', 'chown', 'touch', 'shred', 'unlink', 'rmdir'}
 REGENERABLE = {'node_modules', 'dist', 'build', 'out', '.next', '.turbo', '.cache', 'coverage', '.pytest_cache',
                '.mypy_cache', '.ruff_cache', '__pycache__', '.parcel-cache', '.svelte-kit', 'target', '.vite', '.nuxt',
                '.output', '.venv', 'venv', '.vercel', '.wrangler', 'test-results', 'playwright-report', '.eggs', 'tmp'}
+# a script whose first command is rm and that has nothing running before or beside it: no heredoc, substitution, redirect,
+# pipe, background job, group or eval (&& and || are fine)
+PLAIN_RM = re.compile(r'^\s*rm\s(?!.*(?:[<>`({]|\$\(|(?<!&)&(?!&)|(?<!\|)\|(?!\|)|\b(?:eval|exec|source)\b))', re.S)
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/folders', '/private/var/folders')
 MAIN_REFS = {'main', 'master', 'refs/heads/main', 'refs/heads/master'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';'}  # cwd None = unknown
+STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False}  # cwd None = unknown
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
 SQL_CLIENTS = {'psql', 'sqlite3', 'mysql', 'mariadb', 'duckdb', 'turso', 'pgcli', 'litecli', 'mycli'}
@@ -743,7 +752,12 @@ def git_decision(args):
             return 'deny', MSG['lane']
     if sub in ('add', 'stage'):
         s, l, p = flag_parts(rest, value_opts={'--chmod', '--pathspec-from-file'})
-        if s & {'A', 'u'} or l & {'--all', '--update', '--no-ignore-removal'} or stage_sweeps(p, where):
+        if s & {'A', 'u'} or l & {'--all', '--update', '--no-ignore-removal'}:
+            # -A and -u stage only the named paths; a bare one, a pathspec file, a pathspec the shell may expand to nothing
+            # ($VAR, $(...), a glob) or a tree-wide pathspec is the sweep
+            if not p or '--pathspec-from-file' in l or any(re.search(r'[$`*?\[{]', x) for x in p) or stage_sweeps(p, where):
+                return 'deny', MSG['stage']
+        elif stage_sweeps(p, where):
             return 'deny', MSG['stage']
     elif sub == 'commit':
         s, l, p = flag_parts(rest, value_opts={'--message', '--file', '--author', '--date', '--template', '--reuse-message',
@@ -840,9 +854,9 @@ def disposable(target):
         return False
     if target.startswith(('/', '~')):
         norm = os.path.normpath(target)
-    elif STATE['cwd'] is None:
-        return False  # a relative target with the folder unknown could be anywhere
     else:
+        if STATE['cwd'] is None and (PROTECTED.name_re or PROTECTED.paths):
+            return False  # a relative target with the folder unknown could sit in a protected folder
         norm = os.path.normpath(os.path.join(STATE['cwd'], target) if STATE['cwd'] else target)
     if _temp_path(norm):
         return True
@@ -850,6 +864,16 @@ def disposable(target):
     if GLOB.search(base):
         base = os.path.basename(os.path.dirname(norm))
     return base in REGENERABLE or base.endswith('.egg-info') or base.startswith(('dist-', 'build-'))
+
+
+def plain_files(target):
+    """True when target is a literal path to an existing regular file and this rm is the very first command of a script
+    that has nothing running before or beside it (PLAIN_RM): the file is still a file when rm reaches it, so rm -r is
+    rm -f. A glob or variable never counts (the shell may expand it to more than the guard saw)."""
+    if STATE['cwd'] is None or not STATE['plain'] or re.search(r'[$`*?\[{~\\]', target):
+        return False
+    path = os.path.join(STATE['cwd'], target)
+    return os.path.isfile(path) and not PROTECTED.hit(os.path.realpath(path), ancestor=True)
 
 
 def rm_parts(args):
@@ -872,7 +896,7 @@ def rm_decision(args):
     recursive, _, targets = rm_parts(args)
     if any(PROTECTED.hit(t, ancestor=recursive) for t in targets):
         return 'deny', MSG['lake']
-    if recursive and (not targets or not all(disposable(t) for t in targets)):
+    if recursive and (not targets or not all(disposable(t) or plain_files(t) for t in targets)):
         return 'deny', MSG['rm']
     return None
 
@@ -1010,6 +1034,49 @@ def env_hit(token):
 def env_hint(token):
     """True when a token of an upstream pipeline command points at env files: .env, .env.*, a glob for them, or env."""
     return env_hit(token) or token == 'env' or bool(re.search(r'\.env', token) and not ENV_SAFE.search(token))
+
+
+def listed_names(cmd):
+    """(tokens, patterns) of an upstream pipeline command. A content search that only lists matching files (grep -l,
+    rg -l, git grep -l) prints names it found, never its pattern, so the pattern moves to the second list, where only a
+    pattern that looks like an env file name still counts. Anything unclear drops nothing."""
+    prog, args = os.path.basename(cmd[0]), cmd[1:]
+    if prog == 'git':
+        k = 0
+        while k < len(args) and args[k].startswith('-'):
+            k += 2 if args[k] in GIT_VALUE else 1
+        if k >= len(args) or args[k] != 'grep':
+            return cmd[1:], []
+        prog, args = 'grep', args[k + 1:]
+    if prog not in SEARCH_LETTERS:
+        return cmd[1:], []
+    s, l, p = flag_parts(args, value_opts=SEARCH_VALUE | PATTERN_OPTS, value_letters=SEARCH_LETTERS[prog])
+    if not (s & {'l'} or l & {'--files-with-matches', '--name-only'}) or '--files' in l:
+        return cmd[1:], []  # prints matching lines, filters its input by the pattern, or lists files without searching
+    patterns = [a.split('=', 1)[1] for a in args if a.startswith('--regexp=')]
+    patterns += [args[k + 1] for k, a in enumerate(args[:-1]) if a in ('-e', '--regexp')]
+    given = s & {'e', 'f'} or any(a in PATTERN_OPTS or a.startswith(('--file=', '--expression=')) for a in args)
+    if not given and not patterns and p:
+        patterns = p[:1]  # no -e/-f: the first operand is the pattern
+    names = list(args)
+    for pat in patterns:
+        for tok in ('--regexp=' + pat, pat):
+            if tok in names:
+                names.remove(tok)
+                break
+    return names, patterns
+
+
+def pattern_env(pattern):
+    """True when a search pattern reads as an env file name: .env, ^\\.env, env (process.env and import.meta.env do not)."""
+    plain = re.sub(r'[\\^$]', '', pattern)
+    return env_hit(pattern) or env_hit(plain) or plain == 'env' or bool(re.search(r'(?<![A-Za-z0-9_])\.env', plain))
+
+
+def feeds_env(cmd):
+    """True when an upstream pipeline command names env files for the reader after it."""
+    names, patterns = listed_names(cmd)
+    return any(env_hint(t) for t in names) or any(pattern_env(q) for q in patterns)
 
 
 def reads_env(prog, args):
@@ -1226,7 +1293,7 @@ def analyze(toks, depth):
             return 'deny', MSG['pattern_move']
         if inner in ('rm', 'unlink') and rm_parts(args[k + 1:])[0]:
             return 'deny', MSG['find_delete']
-        if inner in READERS and any(env_hint(t) for c in STATE['pipe'] for t in c[1:]):
+        if inner in READERS and any(feeds_env(c) for c in STATE['pipe'] if c):
             return 'deny', MSG['env']  # something that names an env file feeds the reader through the pipe
         return analyze(args[k:], depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])
     if prog == 'git':
@@ -1417,6 +1484,7 @@ def check_tokens(tokens, depth):
                 try:
                     decision = analyze(cmd, depth)
                 finally:
+                    STATE['plain'] = False  # only the first command of the script may rely on PLAIN_RM
                     if saved:
                         STATE['cwd'], STATE['vars'] = saved
                 if decision:
@@ -1433,6 +1501,8 @@ def check_script(text, depth=0):
         return 'deny', MSG['deep']
     try:
         norm = normalize(text)
+        if depth == 0:
+            STATE['plain'] = bool(PLAIN_RM.match(text))
         decision = check_tokens(tokens_of(norm), depth)
         if decision:
             return decision
