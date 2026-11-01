@@ -363,9 +363,14 @@ class FollowUpToTheReviews(Cases):
         self.denied(['git checkout -qB main origin/main && git push --force-with-lease', 'git switch -qC main && git push -f',
                      'git checkout -qb main && git push -f', 'git switch -qc main && git push --force-with-lease', 'git checkout -qbmain && git push -f',
                      'git switch -qCmain origin/main && git push --force-with-lease', 'git checkout -b main -q && git push -f',
-                     'git switch -sc main && git push -f', 'git checkout -qB master origin/master && git push --force-with-lease'],
+                     'git switch -sc main && git push -f', 'git checkout -qB master origin/master && git push --force-with-lease',
+                     'git checkout -B main -tdirect origin/main && git push --force-with-lease', 'git checkout -tinherit -b main && git push -f',
+                     'git checkout -b main --track=direct origin/main && git push --force-with-lease', 'git switch -C main -tdirect origin/main && git push -f',
+                     'git checkout --orphan x -B main && git push -f', 'git switch -c main --conflict merge && git push -f'],
                     message='force_main', cwd=repo)
-        self.passes(['git checkout -qb feat && git push -u origin feat', 'git switch -qc feat && git push -u origin HEAD',
+        self.passes(['git checkout -tdirect -b feat origin/main && git push --force-with-lease origin HEAD',
+                     'git checkout -b feat -tinherit origin/main && git push --force-with-lease origin HEAD',
+                     'git checkout -qb feat && git push -u origin feat', 'git switch -qc feat && git push -u origin HEAD',
                      'git checkout -qbfeat origin/main && git push --force-with-lease origin HEAD',
                      'git switch -qC feat origin/main && git push --force-with-lease origin HEAD'], cwd=repo)
         self.denied(['git switch --create=main && git push --force-with-lease origin HEAD', 'git switch -cmain && git push -f',
@@ -406,6 +411,12 @@ class FollowUpToTheReviews(Cases):
                      'GIT_CONFIG_COUNT=$UNSET GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main git push origin',  # count unreadable
                      'GIT_CONFIG_COUNT=x GIT_CONFIG_KEY_1=remote.origin.mirror GIT_CONFIG_VALUE_1=true git push origin',
                      'git config --comment note remote.origin.push +HEAD:main', 'git config --comment x --global remote.origin.mirror true',
+                     "GIT_CONFIG_COUNT=1 sh -c 'GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main git push origin'",
+                     "GIT_CONFIG_COUNT=1 xargs env GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main git push <<< origin",
+                     "GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main sh -c 'GIT_CONFIG_COUNT=1 git push origin'",
+                     'GIT_CONFIG_COUNT=$((100+1)) GIT_CONFIG_KEY_100=remote.origin.push GIT_CONFIG_VALUE_100=+HEAD:main git push origin',
+                     'GIT_CONFIG_COUNT=$N GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=vi git push -u origin HEAD',  # count unreadable, key set
+                     'git config --value x --comment y remote.origin.push +HEAD:main',
                      # a prefix's settings reach the shell, eval and xargs it starts
                      "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main sh -c 'git push origin'",
                      "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main bash -c 'git push origin'",
@@ -418,7 +429,9 @@ class FollowUpToTheReviews(Cases):
                      "GIT_CONFIG_PARAMETERS=\"'push.default=matching'\" git push --force-with-lease",
                      'git config --local remote.origin.push "+refs/heads/*:refs/heads/*"'], message='force_main', cwd=repo)
         self.denied(['git remote add --mirror up git@example.com:a/b.git', 'git remote add --mirror=push up git@example.com:a/b.git',
-                     'git remote add -f --mirror=push up git@example.com:a/b.git'], message='mirror', cwd=repo)
+                     'git remote add -f --mirror=push up git@example.com:a/b.git',
+                     'git remote -v add --mirror up git@example.com:a/b.git', 'git remote -v add -f --mirror=push up git@example.com:a/b.git'],
+                    message='mirror', cwd=repo)
         self.passes(['git config --get-urlmatch push.default https://example.com', 'git config --get-urlmatch remote.origin.mirror https://example.com',
                      'git config --get-regexp remote.origin.push', 'git config --get-color push.default', 'git config --get-all remote.origin.push',
                      'N=1; GIT_CONFIG_COUNT=$N GIT_CONFIG_KEY_0=core.editor GIT_CONFIG_VALUE_0=vi git push -u origin HEAD',
@@ -464,6 +477,11 @@ class FollowUpToTheReviews(Cases):
         repo = self.repo('feature/y')
         self.passes(["git push --force-with-lease origin 'fix/$state'", 'git push --force-with-lease origin fix/\\$state',
                      "git push --force-with-lease origin 'HEAD:fix/${state}'"], cwd=repo)
+        self.denied(['R=refs/heads; for b in main; do git push --force-with-lease origin "HEAD:$R/$b"; done',
+                     'R=refs/heads; git push --force-with-lease origin "HEAD:$R/$b"', 'R=refs; git push -f origin "HEAD:$R/heads/$X"'],
+                    message='force_main', cwd=repo)
+        self.passes(['R=refs/heads; git push --force-with-lease origin "HEAD:$R/feat"', "R=refs/heads; git push --force-with-lease origin 'HEAD:$R/x'",
+                     'git -C "$REPO" push --force-with-lease origin feat', 'git -C "$REPO" push -u origin HEAD'], cwd=repo)
         self.denied(['git push --force-with-lease origin "fix/$state"', 'git push --force-with-lease origin fix/$state',
                      "git push --force-with-lease origin 'fix/$state' $B", "git push --force-with-lease origin 'a'\"$B\""],
                     message='force_main', cwd=repo)

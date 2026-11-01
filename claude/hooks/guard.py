@@ -921,18 +921,21 @@ def prefix_env(toks):
 
 def env_config(toks):
     """The settings GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n / GIT_CONFIG_PARAMETERS give a git command,
-    from assignments in front of it (expanded) and from variables set earlier, as key=value strings. When the count cannot
-    be read every key that is set is taken."""
-    env = dict(STATE['vars'], **prefix_env(toks))
+    as key=value strings. They are read from the hook's own environment, the variables set earlier, the prefix of the
+    shells around the command and the assignments in front of it (expanded), the later ones winning. A count that cannot
+    be read, or is above what is read, with a key set cannot be vouched for."""
+    env = {k: v for k, v in os.environ.items() if k.startswith('GIT_CONFIG')}
+    env.update(STATE['vars'])
+    env.update(STATE['pinherit'])
+    env.update(prefix_env(toks))
+    keys = [k for k in env if k.startswith('GIT_CONFIG_KEY_')]
     try:
         count = int(env.get('GIT_CONFIG_COUNT') or 0)
-        slots = range(min(count, 64))
     except ValueError:
-        slots = sorted({int(m.group(1)) for k in env for m in [re.match(r'GIT_CONFIG_KEY_(\d{1,2})$', k)] if m})
-        count = 0
-    out = ['remote.too-many-settings.push='] if count > 64 else []  # more than are read: nothing can be vouched for
-    out += ['%s=%s' % (env['GIT_CONFIG_KEY_%d' % n], env.get('GIT_CONFIG_VALUE_%d' % n, '')) for n in slots
-           if env.get('GIT_CONFIG_KEY_%d' % n)]
+        count = 65 if keys else 0
+    out = ['remote.unreadable-settings.push='] if count > 64 else []
+    out += ['%s=%s' % (env['GIT_CONFIG_KEY_%d' % n], env.get('GIT_CONFIG_VALUE_%d' % n, '')) for n in range(min(count, 64))
+            if env.get('GIT_CONFIG_KEY_%d' % n)]
     # 'key=value' before git 2.31, 'key'='value' after it
     return out + [m.group(1) + ('' if m.group(2) is None else '=' + m.group(2))
                   for m in re.finditer(r"'([^']*)'(?:='([^']*)')?", env.get('GIT_CONFIG_PARAMETERS', ''))]
@@ -951,7 +954,8 @@ def branch_class(name, track=False):
 def create_name(rest):
     """The new branch name of git checkout / switch: -b NAME, -cNAME, -qBNAME, -qB NAME (the create letter can sit in a
     bundle of short flags; what follows it is the name, or the next argument when nothing does), --create NAME,
-    --force-create=NAME. The last one wins."""
+    --force-create=NAME. The last one wins. A letter that takes a value (-t's optional mode, -U) ends the bundle: what
+    follows it is that value (-tdirect), not more flags. Options with a separate value are skipped over."""
     name, k = None, 0
     while k < len(rest) and rest[k] != '--':
         a = rest[k]
@@ -959,9 +963,11 @@ def create_name(rest):
             name, k = (rest[k + 1] if k + 1 < len(rest) else None), k + 1
         elif a.startswith(('--create=', '--force-create=')):
             name = a.split('=', 1)[1]
+        elif a in ('--orphan', '--conflict', '--pathspec-from-file', '--source', '--unified'):
+            k += 1
         elif a.startswith('-') and not a.startswith('--'):
-            at = next((i for i, ch in enumerate(a) if i and ch in 'bBcC'), None)
-            if at is not None:
+            at = next((i for i, ch in enumerate(a) if i and ch in 'bBcCtU'), None)
+            if at is not None and a[at] in 'bBcC':
                 name = a[at + 1:] or (rest[k + 1] if k + 1 < len(rest) else None)
                 k += 0 if a[at + 1:] else 1
         k += 1
@@ -1035,6 +1041,18 @@ def forced_rm(rest, where):
     return not p or '--pathspec-from-file' in l or stage_sweeps(p, where)
 
 
+VAR_USE = re.compile(r'\$[A-Za-z_{0-9@*]')
+
+
+def raw_words(args, rest, ref):
+    """The words of the command as typed (before $VAR expansion) that became the argument ref of git's subcommand; the
+    argument itself when the raw words do not line up with the arguments."""
+    raw = STATE['raw']
+    if len(raw) != len(args) + 1:
+        return [ref]
+    return [w for w, a in zip(raw[1 + len(args) - len(rest):], rest) if a == ref]
+
+
 def git_decision(args):
     head = git_head(args)
     if not head:
@@ -1079,7 +1097,8 @@ def git_decision(args):
             colon_delete = colon_delete or (bool(sep) and not src)
             main_hit = main_hit or (dst if sep else src) in MAIN_REFS or bool(MAIN_DST.search(dst if sep else src))
             wild = wild or '*' in ref
-            unresolved = unresolved or (bool(re.search(r'\$[A-Za-z_{0-9@*]', ref)) and ref in STATE['marks']['active'])  # a variable (not '$x'): it may well hold main
+            unresolved = unresolved or (bool(VAR_USE.search(ref)) and any(VAR_USE.search(w) and w in STATE['marks']['active']
+                                                                          for w in raw_words(args, rest, ref)))  # a variable (not '$x'): it may hold main
         # a refspec or mirror in the command line config (remote.<name>.push / .mirror, push.default) is a push nobody can read
         configured = any(risky_config(c, force or plus) for c in config)
         if configured or ((force or plus or deleting or colon_delete) and main_hit):
@@ -1138,10 +1157,10 @@ def git_decision(args):
             if not (len(p) == 1 and current_branch(where) == p[0]) and branch_exists(where, p[-1]):
                 return 'deny', MSG['move_main']
     elif sub == 'remote':
-        if rest[:1] == ['add'] and any(a in ('--mirror', '--mirror=push') for a in rest):
+        if next((a for a in rest if not a.startswith('-')), None) == 'add' and any(a in ('--mirror', '--mirror=push') for a in rest):
             return 'deny', MSG['mirror']  # a mirror remote makes every plain push overwrite every ref there
     elif sub == 'config':
-        s, l, p = flag_parts(rest, value_opts={'-f', '--file', '--blob', '--type', '-t', '--default', '--comment'}, value_letters='ft')
+        s, l, p = flag_parts(rest, value_opts={'-f', '--file', '--blob', '--type', '-t', '--default', '--comment', '--value'}, value_letters='ft')
         p = p[1:] if p[:1] == ['set'] else p
         reading = s & {'l', 'e'} or l & {'--list', '--unset', '--unset-all', '--edit'} or any(x.startswith('--get') for x in l)
         if len(p) >= 2 and not reading and risky_config(p[0] + '=' + p[1]):
@@ -1664,8 +1683,7 @@ def analyze(toks, depth, raw=None):
             STATE['vars'][k] = expand(v)
         return None
     STATE['penv'] = dict(STATE['pinherit'], **prefix_env(toks))
-    STATE['envcfg'] = STATE['inherit'] + (env_config(toks) if any('GIT_CONFIG' in t for t in toks) or any(
-        k.startswith('GIT_CONFIG') for k in STATE['vars']) else [])
+    STATE['envcfg'] = STATE['inherit'] + env_config(toks)
     stripped = strip_prefix(toks)
     STATE['raw'] = (toks if raw is None else raw)[len(toks) - len(stripped):]  # index-aligned with toks, before expansion
     toks = [expand(t) for t in stripped]
