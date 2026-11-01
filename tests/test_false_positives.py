@@ -28,7 +28,8 @@ REF = next(iter(TEST_CONFIG['protected_supabase']))
 NOTE = TEST_CONFIG['protected_supabase'][REF]
 # keys that cannot be triggered by a bare command: they have tests of their own
 ELSEWHERE = {'review_wait': 'test_merge_gate', 'review_block': 'test_merge_gate', 'review_unread': 'test_merge_gate',
-             'lane': 'test_lane', 'gated': 'GatedModels below'}
+             'lane': 'test_lane', 'gated': 'GatedModels below',
+             'branch_unknown': 'test_guard_bypass'}
 REPO = '/work/project'  # a working folder that does not exist: relative paths are neither temp nor inside a repo
 
 

@@ -134,8 +134,9 @@ class HiddenRecursiveDeletes(Cases):
                            'rm -rf "$OTHER/x"', 'rm -rf "$TMPDIR"', 'rm -rf "$TMPDIR/$X"', 'rm -rf "$TMPDIR/`id`"', 'rm -rf "$(mktemp -d)/../.."',
                            'rm -rf node_modules/..', 'rm -rf ../dist', 'rm -rf "$HOME/proj"', 'rm -rf "${TMPDIR}x/y"', 'rm -rf "$(mktemp -d; id)"'])
         # inside a compound command nothing is rewritten, so the same targets are plain denials
-        self.denied([c + ' && true' for c in ('rm -rf "$TMPDIR/../.."', 'rm -rf /tmp/x/..', 'rm -rf node_modules/..', 'rm -rf ../dist',
+        self.denied([c + ' && true' for c in ('rm -rf "$TMPDIR/../.."', 'rm -rf /tmp/x/..', 'rm -rf ../dist',
                                               'rm -rf "$OTHER/x"', 'rm -rf "$TMPDIR"', 'rm -rf "$(mktemp -d)/../.."')])
+        self.denied(['rm -rf node_modules/.. && true', 'rm -rf ../project && true', 'rm -rf ~+ && true'], message='rm_cwd')  # the working folder
         self.passes(['rm -rf "$TMPDIR/x"', 'rm -rf ${TMPDIR}/x/y', 'rm -rf "${TMPDIR:-/tmp}/x"', 'rm -rf "$(mktemp -d)"',
                      'rm -rf "$(mktemp -d)/sub"', 'D="$(mktemp -d)"; rm -rf "$D/x"', 'rm -rf /tmp/a/b', 'rm -rf node_modules'])
 
@@ -259,36 +260,79 @@ class ForcePushOfTheCurrentBranch(Cases):
         self.denied(['git push --force-with-lease', 'git push -f origin HEAD'], message='force_main', cwd=WORK)  # not a repo at all
         self.denied(['git push --force-with-lease --all', 'git push -f --branches'], message='force_main', cwd=self.repo('feature/z'))
 
-    def test_a_switch_earlier_in_the_command_makes_the_branch_unknown(self):
+    def test_a_switch_to_main_earlier_in_the_command_counts_as_main(self):
         repo = self.repo('feature/x')
         self.denied(['git checkout main && git push --force-with-lease', 'git switch main; git push --force-with-lease origin HEAD',
                      'git checkout -q main && git push -f', '(git checkout main); git push --force-with-lease',
                      'git -C . checkout main && git push --force-with-lease', 'git branch -M main && git push --force-with-lease',
-                     'gh pr checkout 5 && git push --force-with-lease', 'git rebase main feature/x && git push --force-with-lease'],
+                     'git rebase feature/x main && git push --force-with-lease', 'git switch --track origin/main && git push -f',
+                     'git checkout -B main HEAD~1 && git push --force-with-lease', 'git symbolic-ref HEAD refs/heads/main && git push -f'],
                     message='force_main', cwd=repo)
 
-    def test_a_folder_that_cannot_be_followed_makes_the_branch_unknown(self):
+    def test_a_switch_to_a_branch_that_cannot_be_named_is_unknown(self):
+        repo = self.repo('feature/x')
+        self.denied(['git switch - && git push --force-with-lease', 'git checkout - && git push -f', 'git checkout @{-1} && git push -f',
+                     'git checkout "$B" && git push --force-with-lease', 'gh pr checkout 5 && git push --force-with-lease',
+                     'git co feat && git push --force-with-lease', 'git -c alias.go=checkout go main && git push -f',
+                     'git bisect reset && git push --force-with-lease'], message='branch_unknown', cwd=repo)
+
+    def test_a_folder_that_cannot_be_followed_is_unknown(self):
         self.denied(['cd "$DIR" && git push --force-with-lease', 'cd - && git push --force-with-lease origin HEAD'],
-                    message='force_main', cwd=self.repo('feature/x'))
+                    message='branch_unknown', cwd=self.repo('feature/x'))
+
+    def test_a_substitution_runs_before_the_command_around_it(self):
+        repo = self.repo('feature/x')
+        self.denied(['git push --force-with-lease $(git checkout -q main)', 'git push --force-with-lease `git checkout -q main`',
+                     'git push --force-with-lease "$(git checkout -q main)"', 'git push -f "$(echo $(git switch main))"',
+                     'echo "$(git checkout main)" && git push -f'], message='force_main', cwd=repo)
+        self.passes(['git push --force-with-lease $(git rev-parse HEAD)', 'git push --force-with-lease "$(git checkout -q feature/x)"'], cwd=repo)
+
+    def test_refspecs_that_land_on_main(self):
+        self.denied(['git push --force-with-lease origin feat:heads/main', "git push --force-with-lease origin 'refs/heads/*:refs/heads/*'",
+                     'git push origin +feat:heads/master', 'git push -f origin feat:refs/heads/main', 'git push --force origin "refs/heads/*:refs/remotes/*"',
+                     'git -c remote.origin.push=+HEAD:main push origin', 'git -c remote.origin.push=HEAD:main push origin',
+                     'git -c push.default=matching push --force-with-lease'], message='force_main', cwd=self.repo('feature/x'))
+        self.passes(['git push --force-with-lease origin feat:feat', 'git push origin feat:heads/feat', 'git push -u origin HEAD',
+                     'git -c push.autoSetupRemote=true push -u origin HEAD', 'git push origin "refs/heads/*:refs/heads/*"'], cwd=self.repo('feature/y'))
 
     def test_everyday_pushes_stay_allowed(self):
         repo = self.repo('feature/x')
         self.passes(['git push -u origin HEAD', 'git checkout -b feat && git push -u origin feat', 'git switch -c feat && git push -u origin HEAD',
                      'git checkout feat && git push --force-with-lease origin feat', 'git checkout main && git push origin main',
-                     'git push --force-with-lease && git checkout main', 'git branch -d merged'], cwd=repo)
+                     'git push --force-with-lease && git checkout main', 'git branch -d merged',
+                     'git rebase origin/main && git push --force-with-lease', 'git rebase --continue && git push --force-with-lease',
+                     'git rebase -i origin/main && git push --force-with-lease', 'git rebase --abort; git push --force-with-lease',
+                     'git checkout -- a.txt && git push --force-with-lease', 'git checkout origin/main -- a.txt && git push --force-with-lease',
+                     'git checkout a.txt && git push --force-with-lease', 'git switch feature/x && git push --force-with-lease',
+                     'git checkout -b feat2 && git push --force-with-lease origin HEAD', 'git rebase main feature/x && git push --force-with-lease',
+                     'git branch -m renamed && git push --force-with-lease', 'git status && git log -1 && git push --force-with-lease',
+                     'git fetch && git commit -m x && git push --force-with-lease', 'git stash && git pull --rebase && git push --force-with-lease'],
+                    cwd=repo)
+        os.makedirs(os.path.join(repo, 'sub'))
+        self.passes(['cd sub && git push --force-with-lease', 'cd sub && git push --force-with-lease origin HEAD'], cwd=repo)
 
 
 class HolesFromTheSecondReview(Cases):
     def test_forced_git_rm_of_the_whole_tree_is_blocked(self):
         self.denied(['git rm -rf .', 'git rm -r -f :/', 'git rm -rf *', 'git rm -fr ./', 'git rm -rf -- .', 'git rm --force -r .',
                      'git -C ../repo rm -rf .', "git rm -rf ':(top)'"], message='discard')
-        self.passes(['git rm file.txt', 'git rm -r --cached build', 'git rm -rf --cached .', 'git rm -rf src/old', 'git rm -f old.txt',
+        self.denied(['git rm -rf --pathspec-from-file=list.txt', 'git ls-files | git rm -rf --pathspec-from-file=-', 'git ls-files | xargs git rm -rf',
+                     'git ls-files -z | xargs -0 git rm -f', 'git rm -f', 'git rm -rf --pathspec-from-file list.txt'], message='discard')
+        self.passes(['git rm --cached -r --pathspec-from-file=list.txt', 'git ls-files | xargs git rm --cached', 'git ls-files | xargs git rm -r --cached',
+                     'git rm --pathspec-from-file=list.txt', 'git rm old.txt other.txt', 'git rm file.txt', 'git rm -r --cached build', 'git rm -rf --cached .', 'git rm -rf src/old', 'git rm -f old.txt',
                      'git rm -r --cached node_modules'])
 
     def test_deleting_a_repo_is_blocked(self):
         self.denied(['gh repo delete acme/shop --yes', 'gh repo delete acme/shop', 'gh repo delete', 'gh -R acme/shop repo delete --yes',
                      'gh api -X DELETE repos/acme/shop', 'gh api --method DELETE /repos/acme/shop', 'gh api repos/acme/shop -XDELETE',
-                     'gh api --method=delete repos/acme/shop', 'gh api -X DELETE repos/{owner}/{repo}'], message='repo_delete')
+                     'gh api --method=delete repos/acme/shop', 'gh api -X DELETE repos/{owner}/{repo}', 'gh api -X=DELETE repos/acme/shop',
+                     'gh api -iX DELETE repos/acme/shop', 'gh api -iXDELETE repos/acme/shop', 'gh api repos/acme/shop --method=DELETE',
+                     'gh api -X delete https://api.github.com/repos/acme/shop'], message='repo_delete')
+        self.denied(['gh api -X DELETE repos/acme/shop/git/refs/heads/main', 'gh api --method=DELETE repos/acme/shop/git/refs/heads/master',
+                     'gh api -X PATCH repos/acme/shop/git/refs/heads/main -F force=true -f sha=abc', 'gh api -XPATCH repos/acme/shop/git/refs/heads/main --input body.json'],
+                    message='force_main')
+        self.passes(['gh api -X DELETE repos/acme/shop/git/refs/heads/old-branch', 'gh api repos/acme/shop/git/refs/heads/main',
+                     'gh api -X PATCH repos/acme/shop/git/refs/heads/feat -F force=true', 'gh api -X POST repos/acme/shop/git/refs -f ref=refs/heads/x'])
         self.passes(['gh repo view acme/shop', 'gh repo create acme/new --private', 'gh repo clone acme/shop', 'gh pr create --fill',
                      'gh api repos/acme/shop', 'gh api -X DELETE repos/acme/shop/issues/comments/5', 'gh api -X PATCH repos/acme/shop'])
 
@@ -297,6 +341,7 @@ class HolesFromTheSecondReview(Cases):
                      'git branch main HEAD~5 -f', 'git update-ref refs/heads/main abc1234', 'git update-ref -m reset refs/heads/master HEAD~1',
                      'git -C ../repo branch -f main HEAD~5', 'git branch -M x main', 'git branch -C x master', 'git branch -m -f x main'],
                     message='move_main')
+        self.denied(['git update-ref --stdin', 'git update-ref -z --stdin'], message='move_main')
         self.passes(['git branch -d merged', 'git branch -f feature main', 'git branch -m old new', 'git branch feat', 'git branch -c a b',
                      'git update-ref refs/heads/scratch HEAD', 'git branch -m master main'])
 
@@ -310,6 +355,21 @@ class HolesFromTheSecondReview(Cases):
         self.denied(['git branch -M main', 'git branch -M scratch main'], message='move_main', cwd=fresh)
         git('checkout', '-q', 'main', cwd=fresh)
         self.passes(['git branch -M main'], cwd=fresh)  # already main: nothing moves
+
+    def test_update_ref_of_head_depends_on_the_current_branch(self):
+        for branch, ok in (('main', False), ('feature/x', True)):
+            repo = os.path.realpath(tempfile.mkdtemp(prefix='akit-ref-'))
+            self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+            git('init', '-q', '-b', branch, repo, cwd=repo)
+            git('commit', '-q', '--allow-empty', '-m', 'init', cwd=repo)
+            (self.passes if ok else (lambda c, cwd: self.denied(c, message='move_main', cwd=cwd)))(['git update-ref HEAD HEAD~0'], cwd=repo)
+
+    def test_rm_of_the_working_folder_is_denied_whatever_it_is_called(self):
+        for cwd in ('/work/acme/dist-web', '/work/acme/node_modules', '/work/acme/build', '/work/acme/.next'):
+            self.denied(['rm -rf .', 'rm -rf ./', 'rm -rf *', 'rm -rf ./*', 'rm -rf %s' % cwd, 'rm -rf ../%s' % os.path.basename(cwd),
+                         'rm -rf ~+', 'rm -rf ../../acme/%s' % os.path.basename(cwd)], message='rm_cwd', cwd=cwd)
+        self.passes(['rm -rf .', 'rm -rf *'], cwd='/tmp/akit-not-real/dist-web')  # a temp folder is still fine
+        self.passes(['rm -rf dist', 'rm -rf node_modules'], cwd='/work/acme/dist-web')
 
     def test_rm_of_the_working_folder_is_denied_not_trashed(self):
         self.denied(['rm -rf .', 'rm -rf ./', 'rm -rf *', 'rm -rf ./*', 'rm -rf ..', 'rm -rf %s' % WORK, 'rm -rf %s/' % WORK,
@@ -361,6 +421,20 @@ class GenericFolderNames(unittest.TestCase):
         with mock.patch.object(common, 'config', return_value={'projects_root': self.base}):
             self.assertFalse(self.at(self.project, os.path.join(self.base, 'build')))
             self.assertTrue(self.at(self.project, os.path.join(self.project, 'build')))
+
+    def test_a_projects_root_given_as_a_symlink_still_counts(self):
+        link = os.path.join(self.bare, 'link-to-base')
+        os.symlink(self.base, link)
+        with mock.patch.object(common, 'config', return_value={'projects_root': link}):
+            self.assertFalse(self.at(self.project, os.path.join(self.base, 'build')))
+
+    def test_a_generic_folder_that_is_a_symlink_to_a_non_project_place_is_not_disposable(self):
+        os.symlink(self.bare, os.path.join(self.project, 'tmp'))
+        self.assertFalse(self.at(self.project, 'tmp'))
+        with mock.patch.object(common, 'HOME', self.base):  # a project's target that points at ~/tmp
+            os.makedirs(os.path.join(self.base, 'tmp'))
+            os.symlink(os.path.join(self.base, 'tmp'), os.path.join(self.project, 'target'))
+            self.assertFalse(self.at(self.project, 'target'))
 
 
 class LearningProposals(Cases):
