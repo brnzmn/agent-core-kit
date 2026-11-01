@@ -41,7 +41,9 @@ def env_for(local=None, **extra):
 
 
 def run_hook(name, payload, env=None, local=None):
-    out = subprocess.run([sys.executable, os.path.join(HOOKS, name)], input=json.dumps(payload),
+    # Claude Code starts a hook in the session's folder, so the hook's own cwd follows the payload, not the test runner
+    where = payload.get('cwd') if os.path.isdir(str(payload.get('cwd'))) else None
+    out = subprocess.run([sys.executable, os.path.join(HOOKS, name)], input=json.dumps(payload), cwd=where,
                          capture_output=True, text=True, env=env_for(local, **(env or {})), timeout=20)
     return json.loads(out.stdout) if out.stdout.strip() else None
 
