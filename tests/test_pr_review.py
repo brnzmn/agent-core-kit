@@ -24,7 +24,7 @@ case "$1 $2" in
     cat "$FAKE/pr.json" ;;
   "pr comment")
     [ -f "$FAKE/comment-fail" ] && { echo "HTTP 403: resource not accessible" >&2; exit 1; }
-    cp "$5" "$FAKE/comment-$3.md" ;;
+    number="${3##*/}"; cp "$5" "$FAKE/comment-$number.md" ;;
   *) echo "unexpected gh call: $*" >&2; exit 2 ;;
 esac
 '''
@@ -127,7 +127,7 @@ class PrReview(unittest.TestCase):
             fh.write(text)
 
     def codex_says(self, stdout='', result=None):
-        data = {'codex': {'stdout': stdout}}
+        data = {'codex': {'status': 0, 'stdout': stdout}}
         if result is not None:
             data['result'] = result
         with open(os.path.join(self.fake, 'codex.json'), 'w') as fh:
@@ -191,7 +191,7 @@ class PrReview(unittest.TestCase):
         self.claude_says('I looked at it and it seems fine.\n')
         out = self.review('7', 'claude')
         self.assertEqual(out.returncode, 3)
-        self.assertIn('nothing posted', out.stdout)
+        self.assertIn('no verdict posted', out.stdout)
         self.assertIsNone(self.comment())
 
     def test_claude_review_loads_no_settings_files(self):
@@ -287,7 +287,7 @@ class PrReview(unittest.TestCase):
             fh.write('Error: not signed in\n')
         out = self.review('7', 'codex')
         self.assertEqual(out.returncode, 3)
-        self.assertIn('did not finish', out.stdout)
+        self.assertIn('review incomplete', out.stdout)
         self.assertIsNone(self.comment())
 
     def test_codex_empty_review_posts_nothing(self):
@@ -384,7 +384,7 @@ class PrReview(unittest.TestCase):
         self.pr('b' * 40)
         out = self.review('7', 'claude')
         self.assertEqual(out.returncode, 3)
-        self.assertIn('Check out the PR head first', out.stdout)
+        self.assertIn('clean and at the unchanged PR head', out.stdout)
         self.assertIsNone(self.comment())
         self.assertEqual(self.calls('claude-args'), '')
 
@@ -392,14 +392,14 @@ class PrReview(unittest.TestCase):
         os.unlink(os.path.join(self.fake, 'pr.json'))
         out = self.review('7', 'claude')
         self.assertEqual(out.returncode, 3)
-        self.assertIn('gh pr view 7 failed: no pull requests found', out.stdout)
+        self.assertIn('gh pr view failed: no pull requests found', out.stdout)
 
-    def test_a_failed_comment_is_reported_but_the_review_is_printed(self):
+    def test_a_failed_comment_is_reported_without_claiming_a_published_verdict(self):
         open(os.path.join(self.fake, 'comment-fail'), 'w').close()
         out = self.review('7', 'claude')
         self.assertEqual(out.returncode, 3)
         self.assertIn('posting the comment failed', out.stdout)
-        self.assertIn('VERDICT: PASS', out.stdout)
+        self.assertNotIn('VERDICT: PASS', out.stdout)
 
     def test_missing_claude_cli_posts_nothing(self):
         os.unlink(os.path.join(self.bin, 'claude'))
@@ -413,7 +413,7 @@ class PrReview(unittest.TestCase):
         os.unlink(os.path.join(self.bin, 'node'))
         out = self.review('7', 'codex', path=self.narrow_path('git', 'bash', 'cat', 'cp'))
         self.assertEqual(out.returncode, 3)
-        self.assertIn('node not found', out.stdout)
+        self.assertIn('node CLI not found', out.stdout)
         self.assertIsNone(self.comment())
 
     # --- arguments

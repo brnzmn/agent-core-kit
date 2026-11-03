@@ -25,8 +25,8 @@ HEAD = 'a' * 40
 REPO = 'acme/shop'
 
 
-def comment(who, verdict, head=HEAD):
-    return {'author': {'login': 'alex'}, 'body': '## %s review\nhead: %s\n\nfindings\n\nVERDICT: %s\n' % (who, head, verdict)}
+def comment(who, verdict, head=HEAD, login='alex'):
+    return {'author': {'login': login}, 'body': '## %s review\nhead: %s\n\nfindings\n\nVERDICT: %s\n' % (who, head, verdict)}
 
 
 def gate(**over):
@@ -118,7 +118,7 @@ class MergeGate(Fixture, unittest.TestCase):
     def test_the_message_gives_the_kit_review_command(self):
         self.pr(comments=[comment('Claude', 'PASS')])
         why = self.decide()['permissionDecisionReason']
-        self.assertIn('%s 7 codex' % common.kit_cmd('bin/pr_review.py'), why)
+        self.assertIn('%s 7 auto' % common.kit_cmd('bin/pr_review.py'), why)
         self.assertIn('main', why)
         self.assertIn(REPO, why)
 
@@ -218,7 +218,7 @@ class GlobalFlagsAndApi(Fixture, unittest.TestCase):
     def test_gh_api_merge_endpoint_is_denied_with_the_gh_pr_merge_hint(self):
         self.pr(comments=self.both_pass())
         for cmd in ('gh api -X PUT repos/%s/pulls/7/merge' % REPO, 'gh api repos/%s/pulls/7/merge --method PUT -f merge_method=squash' % REPO,
-                    'gh api /repos/{owner}/{repo}/pulls/12/merge', 'gh api repos/%s/pulls/7/merge -X POST' % REPO,
+                    'gh api /repos/{owner}/{repo}/pulls/12/merge -X PUT', 'gh api repos/%s/pulls/7/merge -X POST' % REPO,
                     'gh api repos/%s/pulls/7/merge?x=1 -X PUT' % REPO,
                     "gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"X\"}) { clientMutationId } }'"):
             with self.subTest(cmd=cmd):
@@ -229,7 +229,7 @@ class GlobalFlagsAndApi(Fixture, unittest.TestCase):
 
     def test_other_gh_api_calls_pass_and_a_gate_that_is_off_lets_the_endpoint_through(self):
         for cmd in ('gh api user', 'gh api repos/%s/pulls/7' % REPO, 'gh api repos/%s/pulls/7/comments' % REPO,
-                    'gh api repos/%s/issues/7/merge' % REPO):
+                    'gh api repos/%s/issues/7/merge' % REPO, 'gh api /repos/{owner}/{repo}/pulls/12/merge'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(self.decide(cmd))
         self.assertIsNone(self.decide('gh api -X PUT repos/%s/pulls/7/merge' % REPO, config=gate(enabled=False)))
@@ -333,6 +333,94 @@ class Timeouts(Fixture, unittest.TestCase):
                 guard.gh_run(['true'])
         finally:
             guard.START, guard.STATE['cwd'] = saved
+
+
+class ProviderFallback(Fixture, unittest.TestCase):
+    def setUp(self):
+        Fixture.setUp(self)
+        self.command = ['python3', '-m', 'unittest', 'discover', '-s', 'tests']
+        self.write_config()
+
+    def write_config(self, enabled=True, command=None):
+        self.config = gate(allow_single_on_unavailable=enabled, trust_codex_bot=True,
+                           test_commands={REPO: self.command if command is None else command})
+
+    def decide(self, command='gh pr merge 7 --squash'):
+        return Fixture.decide(self, command, config=self.config)
+
+    def evidence(self, provider='Claude', head=HEAD, base='main', login='alex', **test_changes):
+        checks = dict(status='PASS', count=308, command=self.command, exit_code=0)
+        checks.update(test_changes)
+        data = dict(head=head, base=base, provider=provider, status='UNAVAILABLE', reason='quota', tests=checks)
+        return {'author': {'login': login}, 'body': '## Agent-core review availability\n'
+                'AGENT_CORE_REVIEW_EVIDENCE_V1: ' + json.dumps(data) + '\n'}
+
+    def test_one_actual_pass_plus_outage_and_tests_passes_for_either_provider(self):
+        for absent, present in (('Claude', 'Codex'), ('Codex', 'Claude')):
+            with self.subTest(absent=absent):
+                self.pr(comments=[comment(present, 'PASS'), self.evidence(provider=absent)])
+                self.assertIsNone(self.decide())
+
+    def test_outage_does_not_hide_a_block_or_replace_both_reviews(self):
+        for comments in ([comment('Codex', 'BLOCK'), self.evidence()],
+                         [comment('Codex', 'PASS'), comment('Claude', 'BLOCK'), self.evidence()],
+                         [self.evidence(), self.evidence(provider='Codex')]):
+            self.pr(comments=comments)
+            self.assertEqual(self.decide()['permissionDecision'], 'deny')
+
+    def test_stale_stranger_and_wrong_base_evidence_do_not_count(self):
+        for kwargs in ({'head': 'b' * 40}, {'login': 'someone'}, {'base': 'feature'}):
+            self.pr(comments=[comment('Codex', 'PASS'), self.evidence(**kwargs)])
+            self.assertEqual(self.decide()['permissionDecision'], 'deny')
+
+    def test_failed_missing_zero_and_wrong_command_tests_hold(self):
+        for changes in ({'status': 'FAIL'}, {'count': 0}, {'count': True}, {'exit_code': 1}, {'exit_code': False},
+                        {'command': ['true']}, {'command': None}):
+            self.pr(comments=[comment('Codex', 'PASS'), self.evidence(**changes)])
+            self.assertEqual(self.decide()['permissionDecision'], 'deny')
+
+    def test_new_failed_tests_invalidate_old_pass(self):
+        self.pr(comments=[comment('Codex', 'PASS'), self.evidence(), self.evidence(status='FAIL', exit_code=1)])
+        self.assertEqual(self.decide()['permissionDecision'], 'deny')
+
+    def test_bot_review_cannot_supply_the_fallback_pass(self):
+        bot = {'author': {'login': 'chatgpt-codex-connector'}, 'commit': {'oid': HEAD}, 'state': 'COMMENTED'}
+        self.pr(comments=[self.evidence()], reviews=[bot])
+        self.assertEqual(self.decide()['permissionDecision'], 'deny')
+
+    def test_disabled_fallback_or_unconfigured_tests_hold(self):
+        self.pr(comments=[comment('Codex', 'PASS'), self.evidence()])
+        for enabled, command in ((False, self.command), ('true', self.command), (1, self.command), (True, []), (True, 'true')):
+            self.write_config(enabled, command)
+            self.assertEqual(self.decide()['permissionDecision'], 'deny')
+
+    def test_malformed_gate_switch_cannot_disable_reviews(self):
+        self.pr()
+        for enabled in (None, 0, '', [], {}):
+            with self.subTest(enabled=enabled):
+                self.config = gate(enabled=enabled)
+                self.assertEqual(self.decide()['permissionDecision'], 'deny')
+        self.config = gate(enabled=False)
+        self.assertIsNone(self.decide())
+
+    def test_malformed_evidence_fails_closed(self):
+        for text in ('not json', '[]', 'null', '{"head": "%s"}' % HEAD):
+            evidence = self.evidence()
+            evidence['body'] = '## Agent-core review availability\nAGENT_CORE_REVIEW_EVIDENCE_V1: ' + text
+            self.pr(comments=[comment('Codex', 'PASS'), evidence])
+            self.assertEqual(self.decide()['permissionDecision'], 'deny')
+
+    def test_manual_evidence_posts_are_denied_but_queries_pass(self):
+        marker = 'AGENT_CORE_REVIEW_EVIDENCE_V1: {}'
+        path = os.path.join(self.dir, 'evidence.txt')
+        with open(path, 'w') as fh:
+            fh.write(marker)
+        for command in ('gh pr comment 7 -b "%s"' % marker,
+                        'gh api repos/o/r/issues/7/comments -f body="%s"' % marker,
+                        'gh pr comment 7 --body-file %s' % path,
+                        'echo "%s" | gh pr comment 7 --body-file -' % marker):
+            self.assertEqual(self.decide(command)['permissionDecision'], 'deny')
+        self.assertIsNone(self.decide('gh api repos/o/r/issues/7/comments --jq \'contains("%s")\'' % marker))
 
 
 if __name__ == '__main__':

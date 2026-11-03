@@ -394,9 +394,10 @@ class FollowUpToTheReviews(Cases):
                     message='force_main', cwd=repo)  # named main by its start point as well
         self.denied(['git switch --create=feat --no-create main && git push -f', 'git switch --create=feat --no-force-create && git push -f',
                      'git checkout --crea=main && git push -f', 'git checkout -b feat --no-track origin/x && git push --force-with-lease',
-                     'git switch --made-up -c feat && git push --force-with-lease', 'git checkout --no-guess feat && git push -f',
-                     'git checkout --forc -- a.txt && git push --force-with-lease'],
+                     'git switch --made-up -c feat && git push --force-with-lease', 'git checkout --no-guess feat && git push -f'],
                     message='branch_unknown', cwd=repo)
+        # --forc is git's abbreviation of --force: a forced checkout, denied before the push is looked at
+        self.denied(['git checkout --forc -- a.txt && git push --force-with-lease'], message='discard', cwd=repo)
         self.denied(['git switch --orphan main && git push -f', 'git switch --orphan main && git push --force-with-lease origin HEAD', 'git checkout --orphan=main && git push -f',
                      'git checkout --orphan main origin/main && git push --force-with-lease'], message='force_main', cwd=repo)
         self.passes(['git checkout -qb feat && git push -u origin feat', 'git checkout -b feat origin/main && git push -u origin feat',

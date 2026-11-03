@@ -69,7 +69,7 @@ DEFAULTS = {
     'permission_mode': '',
     'auto_mode_environment': [],
     'pr_gate': {'enabled': True, 'branches': ['main', 'master', 'production'], 'repos': '*', 'reviewers': [],
-                'trust_codex_bot': False},
+                'trust_codex_bot': False, 'allow_single_on_unavailable': False, 'test_commands': {}},
     'routing': {'claude_week_limit_pct': 80},
     'codex': {'models': {}, 'pin_memories_off': False},
 }
@@ -106,6 +106,12 @@ def config(reload=False):
     for key, value in (mine.items() if isinstance(mine, dict) else []):
         if key.startswith('_'):
             continue
+        if key in DEFAULTS and not _fits(key, value):
+            continue  # a malformed setting keeps its default instead of crashing or switching off a guard
+        if key == 'pr_gate':
+            value = {k: v for k, v in value.items()
+                     if k not in DEFAULTS[key] or (k == 'repos' and isinstance(v, (str, list)))
+                     or _fits_default(DEFAULTS[key][k], v)}
         if isinstance(out.get(key), dict) and isinstance(value, dict):
             out[key] = dict(out[key], **value)
         else:
@@ -114,8 +120,36 @@ def config(reload=False):
     return out
 
 
+def _fits(key, value):
+    """Known config keys keep their default on a type error; list-valued guard settings also accept one string."""
+    if key == 'protected_supabase':
+        return isinstance(value, (dict, list, str))
+    return _fits_default(DEFAULTS[key], value)
+
+
+def _fits_default(default, value):
+    """Only a boolean false disables a policy switch; malformed nested values retain safe defaults."""
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(default, list):
+        return isinstance(value, (list, str))
+    return isinstance(value, type(default))
+
+
 def user():
-    return (config().get('user_name') or '').strip() or 'the user'
+    return str(config().get('user_name') or '').strip() or 'the user'
+
+
+def review_test_command(slug):
+    """Configured full-suite argv for a repo. Missing or malformed configuration cannot supply test evidence."""
+    gate = config().get('pr_gate') or {}
+    commands = gate.get('test_commands')
+    command = commands.get(slug.lower()) if isinstance(commands, dict) else None
+    if isinstance(command, list) and command and all(isinstance(a, str) and a.strip() and '\x00' not in a for a in command):
+        return command[:]
+    return None
 
 
 def protected_re():

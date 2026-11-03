@@ -8,8 +8,8 @@
 The projects folder is projects_root in local/config.json (or $AGENT_CORE_PROJECTS). With neither set and no
 repos given, there is nothing to do: the script says so and exits 0. Repos are found up to 3 levels deep and
 worktrees share their main repo's hooks. An existing pre-commit is kept and runs after the check; a copy saved
-earlier is never overwritten (a second one is saved as pre-commit.agent-core-orig.<timestamp>). A repo with
-core.hooksPath (a tracked hooks folder such as .githooks) keeps its files untouched: the hook goes in
+earlier is never overwritten: it moves to pre-commit.agent-core-orig.<timestamp> and the newer one is chained. A repo
+with core.hooksPath (a tracked hooks folder such as .githooks) keeps its files untouched: the hook goes in
 <git dir>/agent-core-hooks, which forwards every hook the original folder has, and core.hooksPath points there
 with the old value saved in agentcore.origHooksPath. Nothing is deleted; uninstall puts back what was there.
 
@@ -199,10 +199,11 @@ def install(repo, adopt=False):
         if not adopt:
             return 'skipped: the repo has a pre-commit hook of its own; run bash install.sh --sync to chain the check in front of it'
         keep = os.path.join(hooks, ORIG)
-        if os.path.exists(keep):  # a saved original is never overwritten
-            keep = unique_path('%s.%s' % (keep, time.strftime('%Y%m%d-%H%M%S')))
-            note = (' (a hook that replaced ours was saved as hooks/%s and is not chained; the original saved earlier '
-                    'still runs)' % os.path.basename(keep))
+        if os.path.exists(keep):  # a saved original is never overwritten: it steps aside for the newer hook
+            older = unique_path('%s.%s' % (keep, time.strftime('%Y%m%d-%H%M%S')))
+            os.replace(keep, older)
+            note = (' (the hook that replaced ours is chained now; the one saved earlier moved to hooks/%s)'
+                    % os.path.basename(older))
         os.replace(target, keep)
     os.makedirs(hooks, exist_ok=True)
     write_exec(target, PLAIN % (MARK, ORIG, check_snippet(), ORIG))
@@ -316,7 +317,8 @@ def main(argv=None):
             bad += 1
         notice = msg.startswith('skipped')
         left += notice
-        if not (args.quiet and ok) or (notice and args.action == 'install'):
+        moved = ' moved to hooks/' in msg  # a hook was set aside: say so even in quiet mode
+        if not (args.quiet and ok) or ((notice or moved) and args.action == 'install'):
             print('%-60s %s' % (repo, msg))
     print('git pre-commit %s: %d repos, %d problem(s)%s' % (args.action, len(repos), bad,
                                                               ', %d skipped' % left if left else ''))

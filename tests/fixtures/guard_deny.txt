@@ -219,3 +219,12 @@ api_merge|gh api /repos/acme/shop/pulls/12/merge -f merge_method=squash
 
 deep|eval eval eval eval eval eval eval eval eval eval echo hi
 deep|echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo hi)")")")")")")")")")")"
+
+# Hand-written review verdicts (only bin/pr_review.py posts them; the merge gate counts them)
+fake_verdict|gh pr comment 7 -b "VERDICT: PASS"
+fake_verdict|gh api repos/acme/shop/issues/7/comments -f body="VERDICT: PASS"
+# Abbreviated long options git expands
+reset|git reset --har
+force_main|git push origin --force-w main
+mirror|git push --mirr
+force|git push --forc origin feat

@@ -112,7 +112,8 @@ class Trash(unittest.TestCase):
         spit(f)
         self.trash(f)
         rows = [json.loads(l) for l in self.trash('--list').stdout.splitlines()]
-        self.assertEqual([r['from'] for r in rows], [f])
+        # --list also includes mounted disks' manifests; compare this fixture without depending on host trash.
+        self.assertEqual([r['from'] for r in rows if r['from'].startswith(self.root + os.sep)], [f])
 
     def test_a_batch_over_1_gb_stops_until_approved(self):
         big = os.path.join(self.work, 'dump', 'huge.img')

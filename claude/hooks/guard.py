@@ -17,7 +17,8 @@ rewrites, recursive deletes outside build folders and temp inside compound comma
 reading env files, writing into the protected folders listed in config protected_dirs, schema changes to the
 Supabase projects listed in config protected_supabase outside the repo's scripts/deploy, applying learning-loop
 proposals directly, a shell that runs a script it cannot be shown (a pipe from anything but echo/printf/cat), and
-merging a PR into a gated branch (config pr_gate) before it has a Claude and a Codex review by an allowed author.
+merging a PR into a gated branch before its review gate passes. A documented provider outage can use
+one real passing review plus passing tests on the same head when config pr_gate enables that fallback.
 The one decision that is not a deny: spawning a subagent on a model listed in config gated_models (and the advisor
 agent) returns "ask", so Claude Code prompts the user; that prompt also appears in bypass mode.
 Prints a decision as JSON, or nothing to let the call through.
@@ -44,6 +45,7 @@ WRAPPER_VALUE = {'sudo': {'-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', 
                  'env': {'-u', '-C', '-S'}, 'nice': {'-n'}, 'timeout': {'-s', '-k'}, 'caffeinate': {'-t', '-w'},
                  'exec': {'-a'}}
 KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until'}  # a command can follow these on the same line
+SHELL_WHITESPACE = ' \t\r\n'  # shlex's shell whitespace, not Python's wider Unicode whitespace category
 SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
 READERS = {'cat', 'less', 'more', 'head', 'tail', 'bat', 'nl', 'open', 'strings', 'xxd', 'od', 'tac',
            'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'awk', 'gawk', 'mawk', 'sed', 'source', '.',
@@ -82,7 +84,7 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
 STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False,
-         'raw': [], 'moved': False, 'envcfg': [], 'inherit': [], 'penv': {}, 'pinherit': {},
+         'raw': [], 'moved': False, 'envcfg': [], 'inherit': [], 'penv': {}, 'pinherit': {}, 'xargs': False,
          'marks': {'active': set(), 'unquoted': set(), 'braced': set()}}  # cwd None = unknown; raw = the command's tokens before $VAR expansion
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
@@ -122,7 +124,7 @@ WORKTREE = re.compile(r'(^|/)([^/]*-wt(/[^/]+)?|\.claude/worktrees(/[^/]+)?|[^/]
 PLAIN_WORD = (r"(?:[A-Za-z0-9._\-/~+@:,]|'[A-Za-z0-9._\-/~+@:, ]*'|\"[A-Za-z0-9._\-/~+@:, ]*\")+")
 PLAIN_TAIL = re.compile(r'^(?:\s+' + PLAIN_WORD + r')+\s*$')  # what may follow `rm -rf` when it is rewritten
 GH_TIMEOUT = 8  # seconds per gh call; the hook is killed at 10 and a killed hook lets the merge through
-GH_BUDGET = 9.0  # seconds from start for all gh calls together
+GH_BUDGET = 7.0  # seconds from start for all gh calls together; leaves room for startup and the kill below
 
 
 def _esc(text):
@@ -267,15 +269,17 @@ MSG = {
     'stash': 'Dropping stashes is blocked. Leave them; list them in your final message.',
     'worktree': 'Removing or pruning worktrees is blocked. Use the worktree skill: git worktree move into _archive/.',
     'rewrite': 'History rewrites are blocked. Add a new commit instead.',
+    'fake_verdict': ('Review verdicts and availability/test evidence count toward the merge gate, so only bin/pr_review.py '
+                     'posts them. Run: ' + PR_REVIEW + ' <pr> auto.'),
     'repo_delete': 'Deleting a GitHub repo is blocked; ' + USER + ' deletes repos. Name the repo in your final message.',
-    'review_wait': ('PR #%s goes into %s, a gated branch of %s (pr_gate in config), so the merge waits for both '
-                    'reviews of its head %s. Missing: %s. Run ' + _esc(PR_REVIEW) + ' %s codex (or claude) from a '
-                    'checkout of the head, read the comment it posts, then merge.'),
+    'review_wait': ('PR #%s goes into %s, a gated branch of %s. The review gate is incomplete for head %s. Missing: %s. '
+                    'Run ' + _esc(PR_REVIEW) + ' %s auto from a checkout of the head. A configured provider-outage '
+                    'fallback needs one real PASS and passing tests; a BLOCK still holds the merge.'),
     'review_block': ('PR #%s: the %s review of head %s says VERDICT: BLOCK. Fix the findings, push, and review the new '
                      'head before merging.'),
     'review_unread': 'gh pr merge is held: the PR\'s reviews could not be read (%s). Retry once gh works.',
     'api_merge': ('gh api cannot merge a PR around the review gate (pr_gate in config). Merge with gh pr merge <number>, '
-                  'which waits for both reviews.'),
+                  'which checks the review and provider-outage evidence.'),
     'lane': ('This worktree\'s .agent-lane names the other tool, which owns its commits. Leave your change '
              'uncommitted and write a handoff note (handoff skill), or work in a worktree of your own.'),
     'rm': ('Recursive delete goes to the trash. Run it as its own command: ' + TRASH + ' <paths> '
@@ -286,8 +290,8 @@ MSG = {
                     ' --approved <paths>.'),
     'pipe_shell': ('A shell that runs a script from a pipe, here-string or process substitution hides what it does. '
                    'Run the commands directly instead.'),
-    'deep': ('This command nests shells, eval or substitutions too deeply for the guard to read. Split it into separate, '
-             'plain commands.'),
+    'deep': ('The guard cannot reliably read this shell script, its syntax or its nested commands. '
+             'Split it into separate, plain commands.'),
     'sql': ('DROP and TRUNCATE destroy data. Rename instead: ALTER TABLE <t> RENAME TO _to_delete_<yyyymmdd>_<t> '
             '(columns: RENAME COLUMN). If the table or database holds rows, stop and show ' + USER + ' the names and '
             'row counts first; only drop after a yes. Disposable databases under /tmp are exempt.'),
@@ -316,8 +320,9 @@ MSG = {
 # alternatives for that position. tests/test_codex_guard.py checks that the hook denies every expansion.
 MAINS = ['main', 'master']
 CODEX_RULES = [
-    (['git', 'add', ['-A', '--all', '.', './', ':/', '-u', '--update']], 'stage'),
-    (['git', 'stage', ['-A', '--all', '.', './', ':/', '-u', '--update']], 'stage'),
+    # not -A/-u: the hook allows them with named paths (git add -A src/a.py), and a prefix rule can't see the paths
+    (['git', 'add', ['.', './', ':/']], 'stage'),
+    (['git', 'stage', ['.', './', ':/']], 'stage'),
     (['git', 'commit', ['-a', '-am', '--all']], 'stage'),
     (['git', 'push', ['--force', '-f', '--force-with-lease'], 'origin', MAINS], 'force_main'),
     (['git', 'push', 'origin', ['--force', '-f', '--force-with-lease'], MAINS], 'force_main'),
@@ -397,7 +402,7 @@ def normalize(cmd):
                 j += 2 if text[j] == '\\' else 1
             if j < len(text):
                 out.pop()
-                out.append(shlex.quote(_ansi_c(text[i + 1:j])))
+                out.append("'" + _ansi_c(text[i + 1:j]).replace("'", "'\"'\"'") + "'")
                 word_start = False
                 i = j + 1
                 continue
@@ -420,41 +425,66 @@ def normalize(cmd):
     return ''.join(out)
 
 
+class ShellToken(str):
+    """A decoded word with the quoting of this occurrence; equal text can have different shell syntax."""
+    quoted = None
+    assignment = None
+
+
+def shell_keyword(word, choices=KEYWORDS):
+    return word in choices and getattr(word, 'quoted', None) is False
+
+
+def shell_assignment(word):
+    return ASSIGN.match(word) and getattr(word, 'assignment', None) is True
+
+
 def tokens_of(text):
     try:
         lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace = SHELL_WHITESPACE
         lex.whitespace_split = True
         lex.commenters = ''
-        return list(lex)
+        tokens = [ShellToken(word) for word in lex]
+        note_quoting(text, tokens, record_marks=False)
+        return tokens
     except ValueError:
         return []  # unbalanced quotes: bash refuses to run it, so there is nothing to judge
 
 
-def note_quoting(text, tokens):
+def note_quoting(text, tokens, record_marks=True):
     """Record in STATE['marks'] which words of the script (as shlex decodes them) hold a $ or backtick that is not
     single-quoted or escaped ('active'), one that is not quoted at all ('unquoted'), or an unquoted brace expansion
-    ('braced'). The tokenizer drops the quotes; this reads them again. When its words do not match the tokenizer's, every
-    word counts as all three."""
+    ('braced'). Keep quoting per token occurrence as well, so quoted reserved words never open or close shell scopes.
+    When its words do not match the tokenizer's, every word counts as all three and keyword identity stays unknown."""
     words, cur, i, n = [], None, 0, len(text)
     while i < n:
         c = text[i]
         i += 1
-        if c.isspace() or c in ';&|()<>':
+        if c in SHELL_WHITESPACE or c in ';&|()<>':
             if cur is not None:
                 words.append(cur)
             cur = None
+            if c not in SHELL_WHITESPACE:
+                start = i - 1
+                while i < n and text[i] in ';&|()<>':
+                    i += 1
+                words.append([text[start:i], False, False, '', False, False])
             continue
         if cur is None:
-            cur = ['', False, False, '']  # decoded word, active, unquoted, unquoted text
+            cur = ['', False, False, '', False, False]  # decoded, active, unquoted, bare, quoted, unquoted NAME=
         if c == '\\' and i < n:
+            cur[4] = True
             cur[0] += text[i]
             i += 1
         elif c == "'":
+            cur[4] = True
             j = text.find("'", i)
             j = n if j < 0 else j
             cur[0] += text[i:j]
             i = j + 1
         elif c == '"':
+            cur[4] = True
             while i < n and text[i] != '"':
                 if text[i] == '\\' and i + 1 < n:  # shlex drops the backslash only before " and \; bash also lets it escape $ and `
                     cur[0] += text[i + 1] if text[i + 1] in '"\\' else text[i:i + 2]
@@ -465,6 +495,8 @@ def note_quoting(text, tokens):
                 i += 1
             i += 1
         else:
+            if c == '=' and not cur[4] and ASSIGN.match(cur[0] + '='):
+                cur[5] = True
             if c in '$`':
                 cur[1] = cur[2] = True
             cur[0] += c
@@ -472,11 +504,16 @@ def note_quoting(text, tokens):
     if cur is not None:
         words.append(cur)
     marks = STATE['marks']
-    if [w[0] for w in words] != [t for t in tokens if not all(c in ';&|()<>' for c in t)]:
-        for k in marks:
-            marks[k].update(tokens)
+    if [w[0] for w in words] != tokens:
+        if record_marks:
+            for k in marks:
+                marks[k].update(tokens)
         return
-    for word, active, unquoted, bare in words:
+    for token, (word, active, unquoted, bare, quoted, assignment) in zip(tokens, words):
+        token.quoted = quoted
+        token.assignment = assignment
+        if not record_marks:
+            continue
         if active:
             marks['active'].add(word)
         if unquoted:
@@ -488,7 +525,7 @@ def note_quoting(text, tokens):
 def simple_commands(tokens):
     cmd = []
     for t in tokens:
-        if t in SEPARATORS or (t and all(c in ';&|()' for c in t)):
+        if getattr(t, 'quoted', False) is not True and (t in SEPARATORS or (t and all(c in ';&|()' for c in t))):
             if cmd:
                 yield cmd
             cmd = []
@@ -509,8 +546,9 @@ def split_commands(tokens):
         cmd, prev = [], nxt
 
     for t in tokens:
-        run = bool(t) and all(c in ';&|()' for c in t)
-        if t in SEPARATORS and not run:  # { } !
+        quoted = getattr(t, 'quoted', False) is True
+        run = not quoted and bool(t) and all(c in ';&|()' for c in t)
+        if not quoted and t in SEPARATORS and not run:  # { } !
             flush(t)
         elif run:
             for s in SEP_PART.findall(t):
@@ -531,11 +569,13 @@ def split_commands(tokens):
 def strip_prefix(toks):
     """Drop VAR=value assignments, shell keywords (then, do, ...) and wrappers such as env, sudo, time, nohup, timeout."""
     toks = list(toks)
+    env_assignments = False
     while toks:
         head = os.path.basename(toks[0])
-        if ASSIGN.match(toks[0]) or toks[0] in KEYWORDS:
+        if shell_assignment(toks[0]) or (env_assignments and ASSIGN.match(toks[0])) or shell_keyword(toks[0]):
             toks.pop(0)
         elif head in WRAPPERS:
+            env_assignments = head in ('env', 'sudo')  # these commands parse quoted NAME=value arguments themselves
             toks.pop(0)
             values = WRAPPER_VALUE.get(head, ())
             while toks and toks[0].startswith('-'):
@@ -549,6 +589,51 @@ def strip_prefix(toks):
         else:
             break
     return toks
+
+
+def env_split_script(toks):
+    """env -S / --split-string runs its value as a command line. Return that line plus the words after it, so it can be
+    judged like a bash -c script, or None when the prefixes hold no env -S."""
+    toks = list(toks)
+    while toks:
+        head = os.path.basename(toks[0])
+        if shell_assignment(toks[0]) or shell_keyword(toks[0]):
+            toks.pop(0)
+            continue
+        if head not in WRAPPERS:
+            return None
+        toks.pop(0)
+        values = WRAPPER_VALUE.get(head, ())
+        while toks and toks[0].startswith('-'):
+            flag = toks.pop(0)
+            if flag == '--':
+                break
+            value = None
+            if head == 'env':
+                if flag == '--split-string':
+                    value = toks.pop(0) if toks else ''
+                elif flag.startswith('--split-string='):
+                    value = flag.split('=', 1)[1]
+                elif not flag.startswith('--') and 'S' in flag[1:]:
+                    value = flag[flag.index('S', 1) + 1:] or (toks.pop(0) if toks else '')
+            if value is not None:
+                return ' '.join([value] + [shlex.quote(t) for t in toks])
+            if flag in values and toks:
+                toks.pop(0)
+        if head == 'timeout' and toks and re.match(r'^[0-9.]+[smhd]?$', toks[0]):
+            toks.pop(0)
+    return None
+
+
+def widen(longs, risky):
+    """The long flags plus each risky option one of them abbreviates. Git takes any unambiguous prefix of a long option
+    (--har for --hard, --force-w for --force-with-lease, --mirr for --mirror), so a prefix counts as every risky option
+    it could stand for. An exact risky option stays itself: --force is not also --force-with-lease."""
+    out = set(longs)
+    for f in longs:
+        if len(f) > 2 and f not in risky:
+            out.update(r for r in risky if r.startswith(f))
+    return out
 
 
 def flag_parts(args, value_opts=(), value_letters=''):
@@ -655,7 +740,7 @@ def gh_run(argv):
         except OSError:
             proc.kill()
         try:
-            proc.wait(timeout=2)
+            proc.wait(timeout=1)
         except subprocess.SubprocessError:
             pass
         for pipe in (proc.stdout, proc.stderr):
@@ -694,9 +779,40 @@ def review_verdict(pr, who, head, authors, trust_bot=False):
     return found
 
 
+REVIEW_EVIDENCE = 'AGENT_CORE_REVIEW_EVIDENCE_V1: '
+
+
+def outage_tests_pass(pr, provider, head, authors, command):
+    """The latest trusted outage receipt must name this head/base and pass the configured full test command."""
+    if not command:
+        return False
+    found = None
+    for c in pr.get('comments') or []:
+        if str((c.get('author') or {}).get('login') or '').lower() not in authors:
+            continue
+        lines = str(c.get('body') or '').splitlines()
+        if not lines or lines[0] != '## Agent-core review availability':
+            continue
+        records = [line[len(REVIEW_EVIDENCE):] for line in lines if line.startswith(REVIEW_EVIDENCE)]
+        try:
+            data = json.loads(records[0]) if len(records) == 1 else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            found = None
+        elif data.get('head') == head and data.get('base') == pr.get('baseRefName') and data.get('provider') == provider:
+            found = data
+    if not found or found.get('status') != 'UNAVAILABLE' or found.get('reason') not in ('quota', 'auth', 'service', 'missing_cli'):
+        return False
+    checks = found.get('tests')
+    return (isinstance(checks, dict) and checks.get('status') == 'PASS' and type(checks.get('count')) is int
+            and checks['count'] > 0 and type(checks.get('exit_code')) is int and checks['exit_code'] == 0
+            and checks.get('command') == command)
+
+
 def merge_decision(args, repo=()):
-    """The PR gate (config pr_gate): a PR into a gated branch merges only after a Claude and a Codex verdict on its
-    head commit, by an allowed author, neither BLOCK. The gate off, other branches and repos not listed pass."""
+    """Both providers pass, or one real provider passes with verified outage/test evidence. A BLOCK always holds.
+    The gate off, other branches and repos not listed pass."""
     if not gate_branches():
         return None
     gate = common.config().get('pr_gate') or {}
@@ -738,6 +854,12 @@ def merge_decision(args, repo=()):
             return 'deny', MSG['review_block'] % (pr.get('number'), who, head[:12])
     missing = [who for who, v in verdicts.items() if not v]
     if missing:
+        if len(missing) == 1 and gate.get('allow_single_on_unavailable') is True:
+            present = 'Codex' if missing[0] == 'Claude' else 'Claude'
+            # A bot comment counted by the legacy two-provider policy is not a real fallback review.
+            if (review_verdict(pr, present, head, authors) == 'PASS'
+                    and outage_tests_pass(pr, missing[0], head, authors, common.review_test_command(slug))):
+                return None
         return 'deny', MSG['review_wait'] % (pr.get('number'), branch, slug, head[:12], ' and '.join(missing),
                                              pr.get('number'))
     return None
@@ -777,6 +899,43 @@ def api_method(args):
     return method.upper()
 
 
+BODY_FLAGS = {'gh': ('-f', '-F', '--field', '--raw-field', '--input'),
+              'curl': ('-d', '--data', '--data-raw', '--data-binary', '--data-urlencode', '--data-ascii', '-F', '--form',
+                       '--form-string', '-T', '--upload-file', '--json'),
+              'wget': ('--post-data', '--post-file', '--body-data', '--body-file')}
+HTTP_WORDS = {'GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'}
+
+
+def reads_only(prog, args):
+    """True when a gh api or HTTP client call only reads: GET or HEAD, with no request body (gh api and httpie switch to
+    POST when fields are given). A method the guard cannot read counts as a write."""
+    flags = BODY_FLAGS.get('gh' if prog == 'gh' else prog, ())
+    body = any(a in flags or a.startswith(tuple(f + '=' for f in flags if f.startswith('--'))) for a in args)
+    if prog == 'gh':
+        method = api_method(args)
+        body = body or any(re.match(r'^-[A-Za-z]*[fF]', a) and not a.startswith('--') and 'X' not in a for a in args)
+    elif prog == 'curl':
+        method = ''
+        for k, a in enumerate(args):
+            if a in ('-X', '--request') and k + 1 < len(args):
+                method = args[k + 1]
+            elif a.startswith('--request='):
+                method = a.split('=', 1)[1]
+            elif re.match(r'^-X.', a):
+                method = a[2:]
+        if not method and body and ('-G' in args or '--get' in args):
+            body = False  # -G sends the data as a query string
+    elif prog == 'wget':
+        method = next((a.split('=', 1)[1] for a in args if a.startswith('--method=')), '')
+    else:  # httpie and xh: an optional method word, then items; key=value, key:=json and key@file make a body
+        method = next((a for a in args if a in HTTP_WORDS), '')
+        body = any(re.match(r'^[^-][^=:@]*(=(?!=)|:=|@)', a) for a in args if '://' not in a)
+    method = method.upper()
+    if method:
+        return method in ('GET', 'HEAD') and not re.search(r'[$`]', method)
+    return not body
+
+
 def api_destroys(args):
     """The message key for a gh api call that deletes a repos/<owner>/<repo>, or deletes / force-updates the heads/main or
     heads/master ref; None otherwise."""
@@ -791,12 +950,63 @@ def api_destroys(args):
     return None
 
 
+VERDICT_TEXT = re.compile(r'VERDICT:\s*(PASS|BLOCK)')
+COMMENT_CMDS = (['pr', 'comment'], ['issue', 'comment'], ['pr', 'review'])
+
+
+def posts_verdict(words, args):
+    """True when a gh comment, review or api call carries text the merge gate would read as a review verdict, in its
+    arguments, a body or input file, a heredoc, a here-string or the pipe into it. Only bin/pr_review.py posts verdicts,
+    from its own process, so the gate cannot be satisfied by the agent writing one by hand."""
+    if words[:2] not in COMMENT_CMDS and words[:1] != ['api']:
+        return False
+    if words[:1] == ['api'] and reads_only('gh', args):
+        return False
+    plain, redirs = split_redirects(args)
+    filtered, skip, value = [], False, False
+    for a in plain:
+        if skip:
+            skip = False
+        elif value:
+            filtered.append(a)
+            value = False
+        elif a in ('--jq', '-q', '--template'):
+            skip = True
+        elif not a.startswith(('--jq=', '--template=', '-q')):
+            filtered.append(a)
+            value = a in ('-b', '--body', '-f', '-F', '--field', '--raw-field', '--body-file', '--input')
+    plain = filtered  # local output filters never publish text
+    texts, files = list(plain), []
+    for k, a in enumerate(plain):
+        if a in ('-F', '--body-file', '--input') and k + 1 < len(plain):
+            files.append(plain[k + 1])
+        elif a.startswith(('--body-file=', '--input=')):
+            files.append(a.split('=', 1)[1])
+        if '=@' in a:
+            files.append(a.split('=@', 1)[1])  # gh api -F body=@file
+    stdin = '-' in files
+    texts += [read_text(f) or '' for f in files if f != '-']
+    for op, target in redirs:
+        if op == '<<' and target.startswith(HEREDOC_MARK):
+            texts.append(heredoc_body(target) or '')
+        elif op == '<<<':
+            texts.append(target)
+        elif op == '<':
+            texts.append(read_text(target) or '')
+    if stdin and STATE['pipe']:
+        texts.append(piped_text(STATE['pipe'][-1]) or '')
+    return any(VERDICT_TEXT.search(t) or REVIEW_EVIDENCE.strip() in t for t in texts if t)
+
+
 def gh_decision(args):
     words, repo, rest = gh_split(args)
+    if posts_verdict(words, args):
+        return 'deny', MSG['fake_verdict']
     if words[:2] == ['pr', 'merge']:
         return merge_decision(rest, repo)
-    if words[:1] == ['api'] and gate_branches() and any(API_MERGE.search(a) or GRAPHQL_MERGE.search(a) for a in args):
-        return 'deny', MSG['api_merge']
+    if words[:1] == ['api'] and gate_branches() and (any(GRAPHQL_MERGE.search(a) for a in args) or (
+            any(API_MERGE.search(a) for a in args) and not reads_only('gh', args))):
+        return 'deny', MSG['api_merge']  # a GET of pulls/N/merge only asks whether it merged
     if words[:2] == ['repo', 'delete']:
         return 'deny', MSG['repo_delete']
     key = api_destroys(args) if words[:1] == ['api'] else None
@@ -827,10 +1037,13 @@ def branch_exists(where, name):
     return out.returncode != 1
 
 
-def stage_sweeps(specs, where):
+def stage_sweeps(specs, where, tree=None):
     """True when a git add pathspec list stages a whole tree: ., .., :/, :(top), a folder that is the repo root, only
-    exclusions, or a command substitution whose result cannot be known."""
-    root = common.repo_root(where)
+    exclusions, or a command substitution whose result cannot be known. tree is the work tree a --git-dir/--work-tree
+    override names (see git_tree): '' when it cannot be told, which counts as a sweep."""
+    if tree == '':
+        return True
+    root = tree or common.repo_root(where)
     root = os.path.realpath(root) if root else None
     excluded = 0
     for spec in specs:
@@ -877,6 +1090,32 @@ def expands(token):
     left = STRICT_REF.sub('', token)
     return bool(re.search(r'[$`]', left)) or any(n not in STATE['vars'] for n in names) or bool(
         re.search(r'[$`]', expand(token)))
+
+
+def git_tree(pre, where):
+    """The work tree git uses when --git-dir / --work-tree (before the subcommand) or GIT_DIR / GIT_WORK_TREE move it off
+    the repo around `where`: that folder, '' when it cannot be told, or None when nothing moves it. With only a git dir
+    named, git takes the current folder as the top of the work tree."""
+    named = {}
+    for k, a in enumerate(pre):
+        for opt in ('--work-tree', '--git-dir'):
+            if a == opt and k + 1 < len(pre):
+                named[opt] = pre[k + 1]
+            elif a.startswith(opt + '='):
+                named[opt] = a.split('=', 1)[1]
+    for opt, var in (('--work-tree', 'GIT_WORK_TREE'), ('--git-dir', 'GIT_DIR')):
+        if opt not in named:
+            value = STATE['penv'].get(var, STATE['vars'].get(var))
+            if value is not None:
+                named[opt] = value
+    if not named:
+        return None
+    tree = named.get('--work-tree')
+    if tree is None:
+        return where
+    if not tree or re.search(r'[$`]', tree):
+        return ''
+    return os.path.normpath(os.path.join(where, os.path.expanduser(tree)))
 
 
 def git_head(args):
@@ -1043,7 +1282,7 @@ RM_LONG = {'--force', '--cached', '--dry-run', '--ignore-unmatch', '--quiet', '-
            '--pathspec-file-nul'}
 
 
-def forced_rm(rest, where):
+def forced_rm(rest, where, tree=None):
     """git rm that is forced, keeps the files in the tree out of the index only with --cached, and names the whole tree,
     a pathspec file, or nothing at all (xargs and pipes feed the paths). -n does not excuse it. A --no-<option> or an
     abbreviated long option (--fo, --no-dry) may undo or stand for anything, so it counts as forcing and voids --cached."""
@@ -1051,7 +1290,7 @@ def forced_rm(rest, where):
     odd = bool(l - RM_LONG)
     if not ('f' in s or '--force' in l or odd) or ('--cached' in l and not odd):
         return False
-    return not p or '--pathspec-from-file' in l or stage_sweeps(p, where)
+    return not p or '--pathspec-from-file' in l or stage_sweeps(p, where, tree)
 
 
 VAR_USE = re.compile(r'\$[A-Za-z_{0-9@*]')
@@ -1071,6 +1310,7 @@ def git_decision(args):
     if not head:
         return None
     where, sub, rest, config = head
+    tree = git_tree(args[:len(args) - len(rest) - 1], where)
     note_move(sub, rest, config, where)
     if sub not in GIT_KNOWN and any(c.lower().startswith('alias.') for c in config):
         return 'deny', MSG['alias']  # the alias is what runs, and it is not readable here
@@ -1079,6 +1319,8 @@ def git_decision(args):
         if owner and owner != (os.environ.get('AGENT_CORE_TOOL') or 'claude'):
             return 'deny', MSG['lane']
     if sub in ('add', 'stage'):
+        if STATE['xargs']:
+            return 'deny', MSG['stage']  # xargs appends or replaces paths the guard has not seen
         s, l, p = flag_parts(rest, value_opts={'--chmod', '--pathspec-from-file'})
         sweeping = bool(s & {'A', 'u'} or l & {'--all', '--update', '--no-ignore-removal'})
         # An unknown folder (unless -C names one) gives no repo root to compare with, so only a plain relative pathspec
@@ -1088,12 +1330,14 @@ def git_decision(args):
         if (any(expands(t) for t in STATE['raw']) or any(x in STATE['marks']['braced'] for x in p) or (not known and (
                 sweeping or any(x.startswith(('/', '~', ':')) or '..' in x.split('/') for x in p)))):
             return 'deny', MSG['stage']
+        if tree is not None and sweeping:
+            return 'deny', MSG['stage']  # -A/-u against a work tree named on the command line or in GIT_DIR/GIT_WORK_TREE
         if sweeping:
             # -A and -u stage only the named paths; a bare one, a pathspec file, a pathspec the shell may expand to nothing
             # (a glob) or a tree-wide pathspec is the sweep
-            if not p or '--pathspec-from-file' in l or any(re.search(r'[*?\[{]', x) for x in p) or stage_sweeps(p, where):
+            if not p or '--pathspec-from-file' in l or any(re.search(r'[*?\[{]', x) for x in p) or stage_sweeps(p, where, tree):
                 return 'deny', MSG['stage']
-        elif stage_sweeps(p, where):
+        elif stage_sweeps(p, where, tree):
             return 'deny', MSG['stage']
     elif sub == 'commit':
         s, l, p = flag_parts(rest, value_opts={'--message', '--file', '--author', '--date', '--template', '--reuse-message',
@@ -1103,6 +1347,11 @@ def git_decision(args):
             return 'deny', MSG['stage']
     elif sub == 'push':
         s, l, p = flag_parts(rest, value_opts={'--repo', '--receive-pack', '--exec', '--push-option', '-o'}, value_letters='o')
+        # a lease needs a flag past --force- (--force-w, --force-with-lease); --forc may be plain --force, so it is, and
+        # -f or --force anywhere turns git's lease check off
+        plain = 'f' in s or any(len(f) > 2 and '--force'.startswith(f) for f in l)
+        lease = not plain and any(f.startswith('--force-') for f in l)
+        l = widen(l, {'--force', '--force-with-lease', '--force-if-includes', '--delete', '--mirror', '--all', '--branches'})
         force = 'f' in s or bool(l & {'--force', '--force-with-lease', '--force-if-includes'})
         deleting = 'd' in s or '--delete' in l
         plus = colon_delete = main_hit = wild = unresolved = False
@@ -1127,14 +1376,14 @@ def git_decision(args):
                 return 'deny', MSG['force_main']
             if STATE['moved'] or STATE['cwd'] is None:  # switched to a branch we cannot name, or a folder we cannot follow
                 return 'deny', MSG['branch_unknown']
-        if plus or (force and not (l & {'--force-with-lease', '--force-if-includes'})):
+        if plus or (force and not lease):
             return 'deny', MSG['force']
         if deleting or colon_delete:
             return 'deny', MSG['delete_remote']
         if '--mirror' in l:
             return 'deny', MSG['mirror']
     elif sub == 'reset':
-        if '--hard' in flag_parts(rest)[1]:
+        if '--hard' in widen(flag_parts(rest)[1], {'--hard'}):
             return 'deny', MSG['reset']
     elif sub == 'clean':
         s, l, p = flag_parts(rest, value_opts={'-e', '--exclude'}, value_letters='e')
@@ -1143,6 +1392,7 @@ def git_decision(args):
     elif sub in ('checkout', 'restore'):
         s, l, p = flag_parts(rest, value_opts={'-b', '-B', '--orphan', '--source', '-s', '--conflict', '--pathspec-from-file'},
                              value_letters='bBs')
+        l = widen(l, {'--force'})  # never widened into a flag that allows more (--staged)
         if sub == 'restore' and ('S' in s or '--staged' in l) and not ('W' in s or '--worktree' in l):
             return None
         if set(p) & {'.', './', ':/', '*'} or (sub == 'checkout' and ('f' in s or '--force' in l)):
@@ -1150,10 +1400,11 @@ def git_decision(args):
     elif sub == 'switch':
         s, l, p = flag_parts(rest, value_opts={'-c', '-C', '--create', '--force-create', '--orphan', '--conflict'},
                              value_letters='cC')
-        if 'f' in s or l & {'--force', '--discard-changes'}:
+        if 'f' in s or widen(l, {'--force', '--discard-changes'}) & {'--force', '--discard-changes'}:
             return 'deny', MSG['discard']
     elif sub == 'update-ref':
         s, l, p = flag_parts(rest, value_opts={'-m'}, value_letters='m')
+        l = widen(l, {'--delete', '--stdin'})
         if 'd' in s or '--delete' in l:
             return 'deny', MSG['branch']
         if '--stdin' in l or (p and p[0] in MAIN_REFS):
@@ -1162,6 +1413,7 @@ def git_decision(args):
             return 'deny', MSG['move_main']
     elif sub == 'branch':
         s, l, p = flag_parts(rest)
+        l = widen(l, {'--delete', '--force', '--move', '--copy'})
         force = 'f' in s or '--force' in l
         if 'D' in s or (('d' in s or '--delete' in l) and force):
             return 'deny', MSG['branch']
@@ -1181,7 +1433,7 @@ def git_decision(args):
         if len(p) >= 2 and not reading and risky_config(p[0] + '=' + p[1]):
             return 'deny', MSG['force_main']  # a saved refspec or mirror makes every later `git push` a push nobody can read
     elif sub == 'rm':
-        if forced_rm(rest, where):
+        if forced_rm(rest, where, tree):
             return 'deny', MSG['discard']  # forced, so it throws away uncommitted edits of every tracked file
     elif sub == 'stash':
         if rest[:1] and rest[0] in ('drop', 'clear'):
@@ -1690,8 +1942,43 @@ def nested(run, *args):
         STATE['inherit'], STATE['pinherit'] = saved
 
 
+def builtin_assignments(toks):
+    """Variables assigned from builtin output are unknown, even when their preceding values were literal paths."""
+    head = strip_prefix(toks)
+    if not head:
+        return set()
+    prog, args = os.path.basename(head[0]), head[1:]
+    names = []
+    if prog == 'printf' and args:
+        if args[0] == '-v':
+            names = args[1:2]
+        elif args[0].startswith('-v'):
+            names = [args[0][2:]]
+    elif prog == 'read':
+        _, _, names = flag_parts(args, value_opts={'-a', '-A', '-d', '-i', '-k', '-n', '-N', '-p', '-t', '-u'},
+                                 value_letters='aAdiknNptu')
+        for k, arg in enumerate(args):
+            if arg == '--':
+                break
+            if not arg.startswith('-') or arg.startswith('--'):
+                continue
+            for n, letter in enumerate(arg[1:]):
+                if letter in 'aAdiknNptu':
+                    if letter in 'aA':
+                        names += [arg[n + 2:]] if arg[n + 2:] else args[k + 1:k + 2]
+                    break
+        names = names or ['REPLY']
+    out = set()
+    for name in names:
+        name = expand(name).split('[', 1)[0].split('?', 1)[0]
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+            return set(STATE['vars'])  # an indirect or unreadable destination can replace any known variable
+        out.add(name)
+    return out
+
+
 def analyze(toks, depth, raw=None):
-    assigns = [t for t in toks if ASSIGN.match(t)]
+    assigns = [t for t in toks if shell_assignment(t)]
     if assigns and len(assigns) == len(toks):
         for t in assigns:
             k, v = t.split('=', 1)
@@ -1699,11 +1986,19 @@ def analyze(toks, depth, raw=None):
         return None
     STATE['penv'] = dict(STATE['pinherit'], **prefix_env(toks))
     STATE['envcfg'] = STATE['inherit'] + env_config(toks)
+    split = env_split_script(toks)
+    if split is not None:
+        return nested(sub_script, split, depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])
     stripped = strip_prefix(toks)
     STATE['raw'] = (toks if raw is None else raw)[len(toks) - len(stripped):]  # index-aligned with toks, before expansion
     toks = [expand(t) for t in stripped]
+    for name in builtin_assignments(stripped):
+        STATE['vars'].pop(name, None)
     if not toks:
         return None
+    for k, t in enumerate(toks[:-1]):  # before the early returns below: export -p > file still writes the file
+        if t in REDIRECTS and PROTECTED.hit(toks[k + 1]):
+            return 'deny', MSG['lake']
     if toks[0] in ('export', 'declare', 'typeset', 'local', 'readonly'):
         for t in toks[1:]:
             if ASSIGN.match(t):
@@ -1716,9 +2011,6 @@ def analyze(toks, depth, raw=None):
     if toks[0] == 'popd':
         STATE['cwd'] = None
         return None
-    for k, t in enumerate(toks[:-1]):
-        if t in REDIRECTS and PROTECTED.hit(toks[k + 1]):
-            return 'deny', MSG['lake']
     prog, args = os.path.basename(toks[0]), toks[1:]
     if prog in SHELLS:
         return nested(shell_decision, args, depth)
@@ -1731,7 +2023,7 @@ def analyze(toks, depth, raw=None):
                 files.append(args[k + 1])
             elif args[k].startswith('--arg-file='):
                 files.append(args[k].split('=', 1)[1])
-            k += 2 if args[k] in XARGS_VALUE or args[k] == '--arg-file' else 1
+            k += 2 if args[k] in (XARGS_VALUE - {'-i'}) or args[k] == '--arg-file' else 1
         if any(env_hit(f) for f in files):
             return 'deny', MSG['env']
         inner = os.path.basename(args[k]) if k < len(args) else ''
@@ -1743,12 +2035,16 @@ def analyze(toks, depth, raw=None):
             return 'deny', MSG['env']  # something that names an env file feeds the reader through the pipe
         if k < len(args) and re.search(r'[$`]', args[k]):
             return 'deny', MSG['deep']  # the program xargs runs is not known
-        return nested(analyze, args[k:], depth + 1, STATE['raw'][1 + k:]) if depth < MAX_DEPTH else ('deny', MSG['deep'])
+        saved, STATE['xargs'] = STATE['xargs'], True
+        try:
+            return nested(analyze, args[k:], depth + 1, STATE['raw'][1 + k:]) if depth < MAX_DEPTH else ('deny', MSG['deep'])
+        finally:
+            STATE['xargs'] = saved
     if prog == 'git':
         return git_decision(args)
     if prog == 'gh':
         return gh_decision(args)
-    if prog in HTTP_CLIENTS and gate_branches() and any(API_MERGE.search(a) for a in args):
+    if prog in HTTP_CLIENTS and gate_branches() and any(API_MERGE.search(a) for a in args) and not reads_only(prog, args):
         return 'deny', MSG['api_merge']
     if prog == 'supabase' or (prog in ('npx', 'pnpx', 'bunx') and args[:1] and args[0].startswith('supabase')):
         return supabase_decision(args if prog == 'supabase' else args[1:])
@@ -1913,15 +2209,28 @@ def heredoc_substitutions(norm):
 def check_tokens(tokens, depth):
     """Judge each simple command in order, first decision wins. ( ) groups, pipeline stages and background jobs run in a
     child shell, so a cd or assignment there is undone afterwards."""
-    stack, pipe = [], []
+    stack, pipe, scopes = [], [], []
+    control = KEYWORDS | {'for', 'select', 'case', 'fi', 'done', 'esac'}
+    uncertain_scope = any((t in control and getattr(t, 'quoted', None) is None)
+                          or (ASSIGN.match(t) and getattr(t, 'assignment', None) is None) for t in tokens)
+    if uncertain_scope:
+        return 'deny', MSG['deep']
+    cond_cd = False  # a cd that ran only if an earlier command succeeded or failed, still inside its && chain
+    cond_vars = set()  # assignments are known only while the same successful && chain continues
     try:
         for kind, cmd, before, after in split_commands(tokens):
+            if cond_cd and before != '&&':
+                STATE['cwd'], cond_cd = None, False  # invalidate before a group can snapshot a conditional value
+            if cond_vars and before != '&&':
+                for name in cond_vars:
+                    STATE['vars'].pop(name, None)
+                cond_vars.clear()
             if kind == 'open':
-                stack.append((STATE['cwd'], dict(STATE['vars'])))
+                stack.append((STATE['cwd'], dict(STATE['vars']), list(scopes)))
                 pipe = []
             elif kind == 'close':
                 if stack:
-                    STATE['cwd'], STATE['vars'] = stack.pop()
+                    STATE['cwd'], STATE['vars'], scopes = stack.pop()
                 pipe = [['<group>']]
             else:
                 if before not in PIPES:
@@ -1929,19 +2238,68 @@ def check_tokens(tokens, depth):
                 forked = before in PIPES or after in PIPES or after == '&'
                 saved = (STATE['cwd'], dict(STATE['vars'])) if forked else None
                 STATE['pipe'], STATE['sep'] = [list(c) for c in pipe], after
+                scoped, loop_names = bool(scopes), set()
+                scope_cmd = cmd
+                while scope_cmd and shell_keyword(scope_cmd[0], {'time'}):
+                    scope_cmd = scope_cmd[2:] if scope_cmd[1:2] == ['-p'] else scope_cmd[1:]
+                for k, word in enumerate(scope_cmd):
+                    if not shell_keyword(word, control):
+                        break
+                    if word in ('if', 'while', 'until', 'for', 'select', 'case'):
+                        scopes.append('fi' if word == 'if' else ('esac' if word == 'case' else 'done'))
+                        scoped = True
+                        if word in ('for', 'select') and k + 1 < len(scope_cmd):
+                            loop_names.add(scope_cmd[k + 1])
+                    elif word in ('fi', 'done', 'esac'):
+                        scoped = True
+                        if scopes and scopes[-1] == word:
+                            scopes.pop()
+                    elif word not in ('then', 'do', 'else', 'elif'):
+                        break
+                head = strip_prefix(cmd)
+                moves = bool(head) and os.path.basename(head[0]) in ('cd', 'pushd', 'popd')
+                assigned = cmd[:]
+                while assigned and shell_keyword(assigned[0]):
+                    assigned.pop(0)
+                if head and head[0] in ('export', 'declare', 'typeset', 'local', 'readonly'):
+                    assigned = head[1:]
+                elif not all(shell_assignment(t) for t in assigned):
+                    assigned = []  # command-prefix variables do not persist in the shell
+                names = {t.split('=', 1)[0] for t in assigned if ASSIGN.match(t)} | builtin_assignments(cmd) | loop_names
+                old_vars, old_cwd = dict(STATE['vars']), STATE['cwd']
                 try:
                     decision = analyze(cmd, depth)
+                    names.update(k for k in set(old_vars) | set(STATE['vars'])
+                                 if k not in old_vars or k not in STATE['vars'] or old_vars[k] != STATE['vars'][k])
+                    moved = moves or STATE['cwd'] != old_cwd
                 finally:
                     STATE['plain'] = False  # only the first command of the script may rely on PLAIN_RM
                     if saved:
                         STATE['cwd'], STATE['vars'] = saved
                 if decision:
                     return decision
+                if moved and before in PIPES and after not in PIPES:
+                    STATE['cwd'] = None  # zsh (and bash with lastpipe) run the last stage in this shell: its cd may stick
+                elif moved and not saved and (scoped or before in ('&&', '||') or (cmd and shell_keyword(cmd[0]))):
+                    # if/then/else/do or && / ||: the cd may not run. Within a && chain after it, it did
+                    if after == '&&' and before != '||' and not shell_keyword(cmd[0]) and not scoped:
+                        cond_cd = True
+                    else:
+                        STATE['cwd'] = None
+                if names and before in PIPES and after not in PIPES:
+                    for name in names:
+                        STATE['vars'].pop(name, None)  # zsh and bash lastpipe can retain the last stage's assignments
+                elif names and not saved and (scoped or before in ('&&', '||') or (cmd and shell_keyword(cmd[0]))):
+                    if after == '&&' and before != '||' and not shell_keyword(cmd[0]) and not scoped:
+                        cond_vars.update(names)
+                    else:
+                        for name in names:
+                            STATE['vars'].pop(name, None)
                 pipe.append(cmd)
     finally:
         STATE['envcfg'] = []
         if stack:
-            STATE['cwd'], STATE['vars'] = stack[0]
+            STATE['cwd'], STATE['vars'] = stack[0][:2]
     return None
 
 

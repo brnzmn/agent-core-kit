@@ -28,7 +28,7 @@ Round 1, about them:
 
 Round 2, autonomy:
 - How far agents go without asking. Options:
-  - Act first (recommended for people who review outcomes, not steps): commit, push, merge own PRs once checks and both reviews pass, deploy previews and production, migrate dev databases.
+  - Act first (recommended for people who review outcomes, not steps): commit, push, merge own PRs once checks and the review gate pass, deploy previews and production, migrate dev databases.
   - Balanced (the template's default): as above, but production deploys need a yes.
   - Careful: commit and push branches and open PRs; merging and deploying need a yes.
 - Spend per action without asking: $0, $1, $5 (default), $20.
@@ -40,7 +40,7 @@ Round 3, machine and safety:
 - Folders that hold data agents must never write to, delete or move (protected_dirs): data lakes, exports, client files. A bare name matches that folder name anywhere; a path (`~/clients/acme/data`) protects that path only. Prefer paths unless the name is unusual.
 - Supabase projects whose schema must only change through a deploy script (protected_supabase), if any: ref and a one-line note.
 - GitHub user or org and deploy targets (Vercel team, Cloudflare account, VPS host, Supabase org), for Claude's auto mode: these become auto_mode_environment lines, so routine pushes and deploys to them aren't blocked as unknown.
-- The PR double-review gate: on for every repo (default), only listed repos, or off; which base branches count as deploy branches (default main, master, production); whose verdict comments count (default: their signed-in gh user; add teammates' logins to pr_gate.reviewers); whether a review by Codex's GitHub app counts as the Codex verdict (default no).
+- The PR double-review gate: on for every repo (default), only listed repos, or off; which base branches count as deploy branches (default main, master, production); whose verdict comments count (default: their signed-in gh user; add teammates' logins to pr_gate.reviewers); whether a review by Codex's GitHub app counts as the Codex verdict (default no). Whether one real passing review plus passing tests may satisfy the gate when the other provider is confirmed unavailable (default no); if yes, record each repo's full test command as an argument array in pr_gate.test_commands.
 
 ## 3. Write
 - `local/config.json`: set the keys from the answers. Keep keys you weren't told to change. Valid JSON; check with `python3 -m json.tool`.

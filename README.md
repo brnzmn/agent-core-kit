@@ -8,7 +8,7 @@ One rulebook, one set of guards, one learning loop, shared by Claude Code and Co
 - Subagents with model routing: Opus orchestrates, Sonnet carries the volume, Opus reviews, a gated top-tier advisor for hard calls.
 - Hooks in both tools that deny destructive commands and name the safe alternative.
 - A learning loop: corrections are captured, a curator proposes rules, you approve, a script applies them.
-- A PR gate: `gh pr merge` into your deploy branches waits for a Claude review and a Codex review of the exact head commit.
+- A PR gate: independent Claude and Codex reviews of the exact head, with an optional provider-outage fallback requiring one passing review and passing full tests.
 - Skills for handoffs, fan-out, worktrees, lean instruction files and verification.
 
 Install:
@@ -77,7 +77,7 @@ The pre-commit hook is skipped, with a message, in repos whose hooks come from t
 | Split work across subagents | `/fanout` |
 | Create, list or retire a worktree safely | `/worktree` |
 | Get a read-only Claude review of a Codex diff | the `claude-review` skill, in Codex |
-| Post a Claude or Codex verdict on a PR | `python3 ~/agent-core-kit/bin/pr_review.py <pr> claude` or `codex` (`--adversarial` for risky diffs) |
+| Review a PR, including provider outages | `python3 ~/agent-core-kit/bin/pr_review.py <pr> auto` (`claude`, `codex`, and `codex --adversarial` remain available) |
 | See plan usage and where new lanes should go | `python3 ~/agent-core-kit/bin/usage.py` |
 | Redo the first-run interview | `/setup` |
 | Compare what is installed with the kit | `bash ~/agent-core-kit/install.sh --check` |
@@ -119,12 +119,24 @@ Subagents without a pinned model run on Sonnet. When a model refuses or a task k
 
 - **Claude orchestrates.** Planning, delegation, judgment calls and work you steer stay in Claude Code.
 - **Codex is the second opinion and the overflow lane.** New implementation lanes go to Claude until `bin/usage.py` reports Claude's weekly usage past `routing.claude_week_limit_pct` (80 by default). Past that, new lanes go to Codex. If both are past it, running lanes finish and no new ones start.
-- **Both review PRs into deploy branches.** `pr_review.py <pr> claude` and `pr_review.py <pr> codex` each review the PR head and post a comment that starts `## Claude review` or `## Codex review`, names the head commit and ends with `VERDICT: PASS` or `VERDICT: BLOCK`. The guard holds `gh pr merge` into a gated branch until both comments exist for the current head and neither says BLOCK. A new commit needs new reviews. Only comments by you (your signed-in gh user) or the logins in `pr_gate.reviewers` count. Codex's GitHub code-review app counts as the Codex review only when `pr_gate.trust_codex_bot` is true. The gate also covers `gh -R owner/repo pr merge` and denies merging through `gh api`. If gh can't be read within 8 seconds, the merge is held.
-- **Claude reviews Codex's own diffs.** Codex runs the `claude-review` skill, which starts a read-only Claude Opus session. It loads none of your settings, only the kit's own inline deny rules (no credential files, no git writes), so your allow rules cannot widen what a hostile diff can make it do.
+- **The review gate covers deploy branches.** `pr_review.py <pr> auto` attempts both providers on the exact PR head. Both must pass when available. If `pr_gate.allow_single_on_unavailable` is enabled, a confirmed quota, authentication, service or missing-CLI outage may use one real PASS plus a passing configured full test suite. A BLOCK always holds the merge. Both unavailable, malformed results, timeouts, failed tests or stale evidence hold it too. Only your signed-in gh user or `pr_gate.reviewers` may publish counted evidence; only `pr_review.py` posts it. A new commit needs fresh reviews and tests. Codex bot reviews cannot supply the outage fallback.
+- **Claude reviews Codex's own diffs.** Codex runs the `claude-review` skill, which starts a read-only Claude Opus session. It loads none of your settings, only the kit's own inline deny rules (no credential files, no git writes), so your allow rules cannot widen what a hostile diff can make it do. A configured provider outage uses the same review gate fallback.
 - **Lanes.** A lane is a worktree one tool works in. `bin/lane.sh <worktree> <claude|codex>` writes `.agent-lane` there, and the other tool's guard refuses commits in it. Work crosses over through a note from `/handoff`.
 - **The Codex plugin.** OpenAI's plugin adds `/codex:review`, `/codex:adversarial-review`, `/codex:rescue`, `/codex:status`, `/codex:result` and `/codex:cancel` to Claude Code. Rescue is read-only unless you pass `--write`, and the stop-time review gate stays off.
 
 Codex reviews block on any P0 or P1 finding. The adversarial review blocks on a needs-attention verdict.
+
+The automatic runner records the unavailable provider separately from a verdict, runs the configured test command,
+and posts the actual exit code and positive test count. It checks clean source and the local and remote heads before
+publishing. The gate checks the author, exact head, base branch and configured command. Supported test summaries are
+unittest, pytest and Jest/Vitest; no positive test count means no passing evidence. Existing personal configs stay
+unchanged during updates; use `/setup` or edit `local/config.json` to opt in and configure test commands.
+
+```text
+PR head -> Claude + Codex reviews -> both PASS -> merge
+                                -> one unavailable + one PASS -> full tests -> merge, if enabled
+                                -> BLOCK / both unavailable / tests fail -> hold
+```
 
 ## The guard hook
 
@@ -146,7 +158,7 @@ A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs
 | Schema changes to a `protected_supabase` project outside `scripts/deploy` | Use the repo's deploy script. |
 | Applying learning proposals directly | Leave them for the user and say how many wait. |
 | Spawning a subagent on a model in `gated_models` | Not denied: Claude Code asks you first. |
-| `gh pr merge` into a gated branch without both reviews, merging through `gh api` | Run `pr_review.py` for the missing one, then `gh pr merge`. |
+| `gh pr merge` without required reviews or outage/test evidence, merging through `gh api` | Run `pr_review.py <pr> auto`, read its results, then `gh pr merge`. |
 | Committing in a worktree whose `.agent-lane` names the other tool | Leave the change uncommitted and write a handoff note. |
 
 Two more hooks guard the instruction files. The budget hook denies edits that add log entries to an instruction file or push it past its line budget: the rulebook 120 lines, each adapter 60, a repo's AGENTS.md 150, a CLAUDE.md that imports AGENTS.md 40, each `.claude/rules` file 80. The Stop hook pushes back once when a turn ends by handing work to you that the agent could do.
@@ -197,6 +209,8 @@ Hooks capture corrections in both tools without being asked. `/learn review` min
 | `pr_gate.repos` | `"*"` | `"*"` for every repo, or a list of `"owner/repo"`. |
 | `pr_gate.reviewers` | `[]` | GitHub logins whose verdict comments count. Empty means your signed-in gh user. |
 | `pr_gate.trust_codex_bot` | `false` | Count a review by Codex's GitHub app on the head commit as the Codex verdict. |
+| `pr_gate.allow_single_on_unavailable` | `false` | Allow one real PASS plus passing full tests when the other provider is confirmed unavailable. A BLOCK still holds. |
+| `pr_gate.test_commands` | `{}` | GitHub repo name to full test command argument array, for example `{"acme/shop": ["python3", "-m", "unittest", "discover", "-s", "tests"]}`. Required for the outage fallback. |
 | `routing.claude_week_limit_pct` | `80` | Past this share of Claude's weekly limit, new lanes go to Codex. |
 | `codex.models` | `{}` | Role (`explorer`, `worker`, `verifier`, `reviewer`, or the Claude names `Explore`, `worker`, `verifier`, `reviewer`) to Codex model name. Empty means no model line, so Codex uses its default. |
 | `codex.pin_memories_off` | `false` | Write `memories = false` into Codex's config. Only done while no Codex process runs; on Python without tomllib only in simple files, otherwise it says how to set it by hand. Uninstall undoes it. |

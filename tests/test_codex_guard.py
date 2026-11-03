@@ -51,6 +51,16 @@ class Rules(unittest.TestCase):
             self.assertNotIn('%s', guard.MSG[key], key)
         self.assertEqual(len(guard.CODEX_RULES), len(set(json.dumps(p) for p, _ in guard.CODEX_RULES)))
 
+    def test_words_after_a_rule_never_make_the_hook_allow_it(self):
+        # Named-path -A/-u operations belong in the hook, not a prefix rule that cannot see their paths.
+        for pattern, key in guard.CODEX_RULES:
+            options = [p if isinstance(p, list) else [p] for p in pattern]
+            for words in itertools.product(*options):
+                for tail in (' x src/a.py', ' -- src/a.py', ' --quiet x'):
+                    cmd = ' '.join(words) + tail
+                    decision = guard.check_script(cmd)
+                    self.assertEqual(decision and decision[0], 'deny', cmd)
+
 
 class PreBash(unittest.TestCase):
     def test_denial_reaches_codex_with_its_alternative(self):
