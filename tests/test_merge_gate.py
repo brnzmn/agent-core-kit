@@ -65,6 +65,47 @@ class Fixture:
         return [comment('Claude', 'PASS'), comment('Codex', 'PASS')]
 
 
+class MergeRepositoryContext(Fixture, unittest.TestCase):
+
+    def test_unknown_directory_cannot_select_a_repository_relative_pr(self):
+        self.pr(comments=[comment('Claude', 'PASS'), comment('Codex', 'PASS')])
+        for prefix in ('cd -', 'cd "$TARGET"'):
+            for selector in ('7', '', 'feature'):
+                command = prefix + ' && gh pr merge ' + selector + ' --merge'
+                with self.subTest(command=command):
+                    out = self.decide(command)
+                    self.assertIsNotNone(out)
+                    self.assertEqual(out['permissionDecision'], 'deny')
+                    self.assertIn('repository', out['permissionDecisionReason'])
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'calls')))
+
+    def test_explicit_literal_repository_or_pr_url_determines_the_target(self):
+        self.pr(comments=[comment('Claude', 'PASS'), comment('Codex', 'PASS')])
+        for target in ('gh -R acme/shop pr merge 7', 'gh pr merge 7 --repo acme/shop',
+                       'gh pr merge 7 --repo=acme/shop',
+                       'gh pr merge https://github.com/acme/shop/pull/7'):
+            with self.subTest(target=target):
+                self.assertIsNone(self.decide('cd - && ' + target))
+        self.assertIsNone(self.decide('R=acme/shop; cd - && gh -R "$R" pr merge 7'))
+
+    def test_unresolved_repo_or_url_does_not_resolve_an_unknown_directory(self):
+        self.pr(comments=[comment('Claude', 'PASS'), comment('Codex', 'PASS')])
+        for target in ('gh -R "$REPO" pr merge 7', 'gh pr merge 7 --repo "$REPO"',
+                       'gh pr merge https://github.com/$OWNER/$REPO/pull/7',
+                       'gh pr merge https://github.com/acme/shop/pull/$PR'):
+            with self.subTest(target=target):
+                out = self.decide('cd - && ' + target)
+                self.assertIsNotNone(out)
+                self.assertEqual(out['permissionDecision'], 'deny')
+
+    def test_direct_merge_api_writes_still_deny_with_unknown_repository_context(self):
+        for endpoint in ('repos/acme/shop/pulls/7/merge', 'repos/{owner}/{repo}/pulls/7/merge'):
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(self.decide('cd - && gh api -X PUT ' + endpoint)['permissionDecision'], 'deny')
+                self.assertIsNone(self.decide('cd - && gh api ' + endpoint))
+
+
+
 class MergeGate(Fixture, unittest.TestCase):
 
     # verdicts, with the default gate (on, main/master/production, every repo)

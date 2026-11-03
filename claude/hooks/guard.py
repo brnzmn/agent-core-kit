@@ -44,6 +44,11 @@ WRAPPERS = {'sudo', 'doas', 'env', 'time', 'nice', 'nohup', 'command', 'exec', '
 WRAPPER_VALUE = {'sudo': {'-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', '-r', '-t'}, 'doas': {'-u', '-C'},
                  'env': {'-u', '-C', '-S'}, 'nice': {'-n'}, 'timeout': {'-s', '-k'}, 'caffeinate': {'-t', '-w'},
                  'exec': {'-a'}}
+WRAPPER_VALUE['sudo'].update({'--user', '--group', '--host', '--prompt', '--close-from', '--chdir', '--chroot',
+                              '--command-timeout', '--other-user', '--role', '--type'})
+WRAPPER_VALUE['env'].update({'--unset', '--chdir', '--split-string'})
+WRAPPER_VALUE['nice'].add('--adjustment')
+WRAPPER_VALUE['timeout'].update({'--signal', '--kill-after'})
 KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until'}  # a command can follow these on the same line
 SHELL_WHITESPACE = ' \t\n'  # shell word separators: CR and Unicode spaces remain literal word characters
 SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
@@ -83,7 +88,7 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'status', 'stripspace', 'submodule', 'subtree', 'switch', 'symbolic-ref', 'tag', 'update-index', 'update-ref',
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'pipe': [], 'sep': ';', 'plain': False,
+STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(), 'pipe': [], 'sep': ';', 'plain': False,
          'raw': [], 'moved': False, 'envcfg': [], 'inherit': [], 'penv': {}, 'pinherit': {}, 'xargs': False,
          'marks': {'active': set(), 'unquoted': set(), 'braced': set()}}  # cwd None = unknown; raw = the command's tokens before $VAR expansion
 TRASH = common.kit_cmd('bin/trash.py')
@@ -186,12 +191,13 @@ class Protected:
         return [c for c in (re.sub(r'^file:(//)?', '', f).split('?', 1)[0] for f in found) if c]
 
     @staticmethod
-    def _absolute(c):
+    def _absolute(c, literal=False):
         """c as an absolute path, or None when a variable, substitution or unknown folder stops us resolving it."""
-        c = re.sub(r'^\$\{?HOME\}?(?=/|$)', common.HOME, c)
+        if not literal:
+            c = re.sub(r'^\$\{?HOME\}?(?=/|$)', common.HOME, c)
+            if '$' in c or '`' in c:
+                return None
         c = os.path.expanduser(c)
-        if '$' in c or '`' in c:
-            return None
         if c.startswith('/'):
             return c
         base = STATE['cwd']
@@ -206,16 +212,20 @@ class Protected:
 
     def hit(self, token, ancestor=False):
         """True when token is, or sits in, a protected folder. ancestor: a folder that holds one counts too (rm -r, mv)."""
+        if (self.paths or self.name_re) and getattr(token, 'path_uncertain', False):
+            return True
         if self.name_re and self.name_re.search(token):
             return True
-        if not self.paths:
+        if not self.paths and not self.name_re:
             return False
         for c in self._candidates(token):
-            full = self._absolute(c)
+            full = self._absolute(c, literal=isinstance(token, ExpandedOperand) and not token.path_uncertain)
             if full is None:
-                if self._tail_hit(c):
+                if STATE['cwd'] is None or self._tail_hit(c):
                     return True
                 continue
+            if self.name_re and self.name_re.search(full):
+                return True
             if GLOB.search(full):
                 pat = _fold(os.path.normpath(full)).split(os.sep)
                 for q in self.paths:
@@ -236,7 +246,7 @@ class Protected:
         if self.backup_re and self.backup_re.search(token):
             return True
         for c in self._candidates(token):
-            full = self._absolute(c)
+            full = self._absolute(c, literal=isinstance(token, ExpandedOperand) and not token.path_uncertain)
             if full and not GLOB.search(full):
                 norm = _fold(os.path.normpath(full))
                 if any(norm.startswith(q + os.sep + 'backups' + os.sep) for q in self.paths):
@@ -429,6 +439,22 @@ class ShellToken(str):
     """A decoded word with the quoting of this occurrence; equal text can have different shell syntax."""
     quoted = None
     assignment = None
+    expansion_sites = None
+    unquoted_expansion = None
+
+
+
+class ExpandedOperand(str):
+    """An already-expanded argument, retaining the exact source occurrence and path uncertainty."""
+    expansion_sites = frozenset()
+    unquoted_expansion = False
+
+
+def operand_value(value, source):
+    token = ExpandedOperand(value)
+    token.source_operand = getattr(source, 'source_operand', source)
+    token.path_uncertain = unresolved_path(value, source)
+    return token
 
 
 def shell_keyword(word, choices=KEYWORDS):
@@ -469,10 +495,10 @@ def note_quoting(text, tokens, record_marks=True):
                 start = i - 1
                 while i < n and text[i] in ';&|()<>':
                     i += 1
-                words.append([text[start:i], False, False, '', False, False])
+                words.append([text[start:i], False, False, '', False, False, set()])
             continue
         if cur is None:
-            cur = ['', False, False, '', False, False]  # decoded, active, unquoted, bare, quoted, unquoted NAME=
+            cur = ['', False, False, '', False, False, set()]  # decoded, active, unquoted, bare, quoted, NAME=, sites
         if c == '\\' and i < n:
             cur[4] = True
             cur[0] += text[i]
@@ -490,7 +516,9 @@ def note_quoting(text, tokens, record_marks=True):
                     cur[0] += text[i + 1] if text[i + 1] in '"\\' else text[i:i + 2]
                     i += 2
                     continue
-                cur[1] = cur[1] or text[i] in '$`'
+                if text[i] in '$`':
+                    cur[1] = True
+                    cur[6].add(len(cur[0]))
                 cur[0] += text[i]
                 i += 1
             i += 1
@@ -499,6 +527,7 @@ def note_quoting(text, tokens, record_marks=True):
                 cur[5] = True
             if c in '$`':
                 cur[1] = cur[2] = True
+                cur[6].add(len(cur[0]))
             cur[0] += c
             cur[3] += c
     if cur is not None:
@@ -509,9 +538,11 @@ def note_quoting(text, tokens, record_marks=True):
             for k in marks:
                 marks[k].update(tokens)
         return
-    for token, (word, active, unquoted, bare, quoted, assignment) in zip(tokens, words):
+    for token, (word, active, unquoted, bare, quoted, assignment, sites) in zip(tokens, words):
         token.quoted = quoted
         token.assignment = assignment
+        token.expansion_sites = frozenset(sites)
+        token.unquoted_expansion = unquoted
         if not record_marks:
             continue
         if active:
@@ -520,6 +551,7 @@ def note_quoting(text, tokens, record_marks=True):
             marks['unquoted'].add(word)
         if '{' in bare and (',' in bare or '..' in bare):
             marks['braced'].add(word)
+
 
 
 def simple_commands(tokens):
@@ -566,13 +598,26 @@ def split_commands(tokens):
     return events
 
 
-def strip_prefix(toks):
+def wrapper_value_flag(head, flag, values):
+    if flag in values:
+        return True
+    if head == 'env' and flag.startswith('-') and not flag.startswith('--'):
+        at = next((i for i, ch in enumerate(flag[1:], 1) if ch in 'uCS'), None)
+        return at is not None and flag[at] == 'u' and at == len(flag) - 1
+    return False
+
+
+def strip_prefix(toks, assignments=None):
     """Drop VAR=value assignments, shell keywords (then, do, ...) and wrappers such as env, sudo, time, nohup, timeout."""
     toks = list(toks)
     env_assignments = False
     while toks:
         head = os.path.basename(toks[0])
-        if shell_assignment(toks[0]) or (env_assignments and ASSIGN.match(toks[0])) or shell_keyword(toks[0]):
+        if shell_assignment(toks[0]) or (env_assignments and ASSIGN.match(toks[0])):
+            if assignments is not None:
+                assignments.append(toks[0])
+            toks.pop(0)
+        elif shell_keyword(toks[0]):
             toks.pop(0)
         elif head in WRAPPERS:
             env_assignments = head in ('env', 'sudo')  # these commands parse quoted NAME=value arguments themselves
@@ -582,13 +627,14 @@ def strip_prefix(toks):
                 flag = toks.pop(0)
                 if flag == '--':
                     break
-                if flag in values and toks:
+                if wrapper_value_flag(head, flag, values) and toks:
                     toks.pop(0)
             if head == 'timeout' and toks and re.match(r'^[0-9.]+[smhd]?$', toks[0]):
                 toks.pop(0)
         else:
             break
     return toks
+
 
 
 def env_split_script(toks):
@@ -618,7 +664,7 @@ def env_split_script(toks):
                     value = flag[flag.index('S', 1) + 1:] or (toks.pop(0) if toks else '')
             if value is not None:
                 return ' '.join([value] + [shlex.quote(t) for t in toks])
-            if flag in values and toks:
+            if wrapper_value_flag(head, flag, values) and toks:
                 toks.pop(0)
         if head == 'timeout' and toks and re.match(r'^[0-9.]+[smhd]?$', toks[0]):
             toks.pop(0)
@@ -830,6 +876,14 @@ def merge_decision(args, repo=()):
         elif not a.startswith('-'):
             sel.append(a)
         i += 1
+    if STATE['cwd'] is None:
+        name = r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+        host = r'[A-Za-z0-9.-]+(?::[0-9]+)?'
+        explicit_repo = len(repo) == 2 and re.fullmatch(r'(?:https?://)?(?:' + host + r'/)?' + name + r'/?', repo[1])
+        explicit_url = bool(sel) and re.fullmatch(r'https?://' + host + r'/' + name + r'/pull/[0-9]+/?', sel[0])
+        if not explicit_repo and not explicit_url:
+            return 'deny', ('gh pr merge is held: the repository is unknown after a directory change. '
+                            'Use -R owner/repo or a full PR URL.')
     gh = os.environ.get('AGENT_CORE_GH') or 'gh'
     try:
         out = gh_run([gh, 'pr', 'view'] + sel[:1] + repo + ['--json', 'number,url,baseRefName,headRefOid,'
@@ -863,6 +917,7 @@ def merge_decision(args, repo=()):
         return 'deny', MSG['review_wait'] % (pr.get('number'), branch, slug, head[:12], ' and '.join(missing),
                                              pr.get('number'))
     return None
+
 
 
 def gh_split(args):
@@ -910,23 +965,51 @@ def reads_only(prog, args):
     """True when a gh api or HTTP client call only reads: GET or HEAD, with no request body (gh api and httpie switch to
     POST when fields are given). A method the guard cannot read counts as a write."""
     flags = BODY_FLAGS.get('gh' if prog == 'gh' else prog, ())
-    body = any(a in flags or a.startswith(tuple(f + '=' for f in flags if f.startswith('--'))) for a in args)
+    body = any(a in flags or (a.startswith('--') and len(a.split('=', 1)[0]) > 2 and any(
+        f.startswith(a.split('=', 1)[0]) for f in flags if f.startswith('--'))) for a in args)
     if prog == 'gh':
         method = api_method(args)
         body = body or any(re.match(r'^-[A-Za-z]*[fF]', a) and not a.startswith('--') and 'X' not in a for a in args)
     elif prog == 'curl':
+        method, upload = '', False
+        for k, a in enumerate(args):
+            flag = a.split('=', 1)[0]
+            if a == '-:' or (flag.startswith('--') and len(flag) > 2 and
+                              any(name.startswith(flag) for name in ('--config', '--next'))):
+                return False  # config files and separate transfers can change a request the guard cannot see
+            request = None
+            if flag.startswith('--') and len(flag) > 2 and '--request'.startswith(flag):
+                request = a.split('=', 1)[1] if '=' in a else (args[k + 1] if k + 1 < len(args) else '?')
+            elif a.startswith('-') and not a.startswith('--'):
+                for n, letter in enumerate(a[1:]):
+                    if letter == 'X':
+                        request = a[n + 2:] or (args[k + 1] if k + 1 < len(args) else '?')
+                        break
+                    if letter in 'EKCbcDdFPHhmoUQreyYtzTuAw':  # short options that consume the rest or next word
+                        if letter == 'K':
+                            return False
+                        body = body or letter in 'dFT'
+                        upload = upload or letter == 'T'
+                        break
+            upload = upload or (flag.startswith('--') and len(flag) > 2 and '--upload-file'.startswith(flag))
+            if request is not None:
+                if request.upper() not in ('GET', 'HEAD'):
+                    return False
+                method = request.upper()
+        if body and not upload and ('-G' in args or '--get' in args):
+            body = False  # -G sends the data as a query string
+        return not body  # an explicit read method never excuses an unknown request body or upload
+    elif prog == 'wget':
         method = ''
         for k, a in enumerate(args):
-            if a in ('-X', '--request') and k + 1 < len(args):
-                method = args[k + 1]
-            elif a.startswith('--request='):
-                method = a.split('=', 1)[1]
-            elif re.match(r'^-X.', a):
-                method = a[2:]
-        if not method and body and ('-G' in args or '--get' in args):
-            body = False  # -G sends the data as a query string
-    elif prog == 'wget':
-        method = next((a.split('=', 1)[1] for a in args if a.startswith('--method=')), '')
+            flag = a.split('=', 1)[0]
+            if (a.startswith('-e') and not a.startswith('--')) or (flag.startswith('--') and len(flag) > 2 and
+                    any(name.startswith(flag) for name in ('--config', '--execute'))):
+                return False
+            if flag.startswith('--') and len(flag) > 2 and '--method'.startswith(flag):
+                method = a.split('=', 1)[1] if '=' in a else (args[k + 1] if k + 1 < len(args) else '?')
+                if method.upper() not in ('GET', 'HEAD'):
+                    return False
     else:  # httpie and xh: an optional method word, then items; key=value, key:=json and key@file make a body
         method = next((a for a in args if a in HTTP_WORDS), '')
         body = any(re.match(r'^[^-][^=:@]*(=(?!=)|:=|@)', a) for a in args if '://' not in a)
@@ -1078,9 +1161,50 @@ def stage_sweeps(specs, where, tree=None):
     return bool(specs) and excluded == len(specs)
 
 
+def known_variable(name):
+    if name in STATE['vars']:
+        return STATE['vars'][name]
+    if (name == 'HOME' and name not in STATE['unknown'] and '*' not in STATE['restricted']
+            and name not in STATE['pinherit']):
+        return os.environ.get('HOME')  # no passwd fallback when the original shell's HOME was unset
+    return None
+
+
+def unresolved_path(value, source):
+    """Unquoted path references are one field only when their exact expansions cannot split or glob."""
+    if isinstance(source, ExpandedOperand):
+        return source.path_uncertain
+    if not expands(source):
+        return False
+    if (getattr(source, 'unquoted_expansion', False) and not unknown_expansion(source)
+            and '*' not in STATE['restricted'] and 'IFS' not in STATE['vars']
+            and 'IFS' not in STATE['unknown'] and 'IFS' not in STATE['pinherit']):
+        return not value or any(c in SHELL_WHITESPACE for c in value) or bool(GLOB.search(value)) or any(
+            c in value for c in '{}')
+    return True
+
+
+def unknown_expansion(token):
+    """An active expansion with no known value; a literal dollar in a known value is never expanded again."""
+    sites = getattr(token, 'expansion_sites', None)
+    if sites is None:
+        return bool(re.search(r'[$`]', token))
+    refs = [m for m in STRICT_REF.finditer(token) if m.start() in sites]
+    return bool(sites - {m.start() for m in refs}) or any(
+        known_variable(m.group(1) or m.group(2)) is None for m in refs)
+
+
+
 def expands(token):
     """True when a raw token holds a $ or backtick the shell will act on and the guard cannot see the result of: not
     single-quoted or escaped, and, inside double quotes, not just references to variables the guard knows (one word)."""
+    sites = getattr(token, 'expansion_sites', None)
+    if sites is not None:
+        if not sites:
+            return False
+        if token.unquoted_expansion:
+            return True
+        return unknown_expansion(token)
     marks = STATE['marks']
     if not re.search(r'[$`]', token) or token not in marks['active']:
         return False
@@ -1090,6 +1214,7 @@ def expands(token):
     left = STRICT_REF.sub('', token)
     return bool(re.search(r'[$`]', left)) or any(n not in STATE['vars'] for n in names) or bool(
         re.search(r'[$`]', expand(token)))
+
 
 
 def git_tree(pre, where):
@@ -1146,20 +1271,47 @@ def config_env(entry):
     key, eq, name = entry.rpartition('=')
     if not eq:
         key, name = entry, ''
-    value = STATE['penv'].get(name, STATE['vars'].get(name, os.environ.get(name)))
+    value = STATE['penv'].get(name, STATE['vars'].get(name, None if name in STATE['unknown'] else os.environ.get(name)))
     return '%s=%s' % (key, '$' + name if value is None else value)
 
 
+
 def prefix_env(toks):
-    """The VAR=value assignments in front of a command (up to a git), expanded."""
+    """The assignments in validated prefix positions, never script arguments or wrapper option values."""
     env = {}
-    for t in toks:
-        if os.path.basename(t) == 'git':
-            break
-        if ASSIGN.match(t):
-            k, v = t.split('=', 1)
-            env[k] = expand(v)
+    assignments = []
+    strip_prefix(toks, assignments=assignments)
+    for t in assignments:
+        k, v = expand(t).split('=', 1)
+        env[k] = '$' + k if k.startswith('GIT_CONFIG') and unknown_expansion(t) else v
+    prefix = toks[:len(toks) - len(strip_prefix(toks))]
+    for k, token in enumerate(prefix):
+        program = os.path.basename(token)
+        if program in ('sudo', 'doas'):
+            env.setdefault('HOME', '$HOME')  # only a child sees this wrapper's changed environment
+        elif program == 'env':
+            flags = prefix[k + 1:]
+            for i, raw_flag in enumerate(flags):
+                flag = expand(raw_flag)
+                name, eq, value = flag.partition('=')
+                next_value = flags[i + 1] if i + 1 < len(flags) else ''
+                unknown_flag = flag.startswith('-') and unknown_expansion(raw_flag)
+                clearing = flag == '-' or unknown_flag or (len(name) > 2 and '--ignore-environment'.startswith(name)) or (
+                    flag.startswith('-') and not flag.startswith('--') and 'i' in flag[1:])
+                at = flag.find('u', 1) if flag.startswith('-') and not flag.startswith('--') else -1
+                tail = flag[at + 1:] if at >= 0 else ''
+                target = tail or expand(next_value)
+                unknown_target = unknown_expansion(raw_flag) or (not eq and not tail and unknown_expansion(next_value))
+                unsetting = ((len(name) > 2 and '--unset'.startswith(name) and
+                              ((value if eq else expand(next_value)) == 'HOME' or unknown_target)) or
+                             (at >= 0 and (target == 'HOME' or unknown_target)))
+                if clearing or unsetting:
+                    env.setdefault('HOME', '$HOME')
     return env
+
+
+
+
 
 
 def env_config(toks):
@@ -1168,6 +1320,7 @@ def env_config(toks):
     shells around the command and the assignments in front of it (expanded), the later ones winning. A count that cannot
     be read, or is above what is read, with a key set cannot be vouched for."""
     env = {k: v for k, v in os.environ.items() if k.startswith('GIT_CONFIG')}
+    env.update({k: '$' + k for k in STATE['unknown'] if k.startswith('GIT_CONFIG')})
     env.update(STATE['vars'])
     env.update(STATE['pinherit'])
     env.update(prefix_env(toks))
@@ -1176,12 +1329,16 @@ def env_config(toks):
         count = int(env.get('GIT_CONFIG_COUNT') or 0)
     except ValueError:
         count = 65 if keys else 0
-    out = ['remote.unreadable-settings.push='] if count > 64 else []
+    unreadable = env.get('GIT_CONFIG_PARAMETERS') == '$GIT_CONFIG_PARAMETERS'
+    unreadable = unreadable or any(env.get('GIT_CONFIG_%s_%d' % (part, n)) == '$GIT_CONFIG_%s_%d' % (part, n)
+                                  for n in range(min(count, 64)) for part in ('KEY', 'VALUE'))
+    out = ['remote.unreadable-settings.push='] if count > 64 or unreadable else []
     out += ['%s=%s' % (env['GIT_CONFIG_KEY_%d' % n], env.get('GIT_CONFIG_VALUE_%d' % n, '')) for n in range(min(count, 64))
             if env.get('GIT_CONFIG_KEY_%d' % n)]
     # 'key=value' before git 2.31, 'key'='value' after it
     return out + [m.group(1) + ('' if m.group(2) is None else '=' + m.group(2))
                   for m in re.finditer(r"'([^']*)'(?:='([^']*)')?", env.get('GIT_CONFIG_PARAMETERS', ''))]
+
 
 
 def branch_class(name):
@@ -1577,10 +1734,12 @@ def destination(args, value_letters):
     s, l, p = flag_parts(args, value_opts={'-t', '--target-directory', '-e', '--rsh', '--exclude', '--include',
                                            '--filter', '-S', '--suffix'}, value_letters=value_letters)
     for k, a in enumerate(args):
-        if a == '-t' and k + 1 < len(args):
+        if a in ('-t', '--target-directory') and k + 1 < len(args):
             return args[k + 1], p
         if a.startswith('--target-directory='):
-            return a.split('=', 1)[1], p
+            return operand_value(a.split('=', 1)[1], a), p
+        if a.startswith('-t') and not a.startswith('--') and len(a) > 2:
+            return operand_value(a[2:], a), p
     return (p[-1] if len(p) >= 2 else None), p
 
 
@@ -1691,7 +1850,12 @@ def supabase_decision(args):
 
 
 def expand(tok):
-    return VAR_REF.sub(lambda m: STATE['vars'].get(m.group(1), m.group(0)), tok)
+    sites = getattr(tok, 'expansion_sites', None)
+    def value(match):
+        known = known_variable(match.group(1))
+        return match.group(0) if known is None else known
+    return VAR_REF.sub(lambda m: value(m) if sites is None or m.start() in sites else m.group(0), tok)
+
 
 
 def env_hit(token):
@@ -1769,20 +1933,32 @@ def reads_env(prog, args):
         return False  # sed -i edits in place and prints nothing; the protected-folder check covers it
     skip_first = prog in PATTERN_FIRST and not any(a in PATTERN_OPTS or a.startswith(('--regexp=', '--file=',
                                                                                       '--expression=')) for a in args)
+    raw_args = STATE['raw'][-len(args):] if args else []
+
+    def file_operand(index, value):
+        raw = raw_args[index] if index < len(raw_args) else value
+        return env_hit(value) or unresolved_path(value, raw)
+
     k = 0
     while k < len(args):
         a = args[k]
         k += 1
         if a in FILE_FLAGS and k < len(args):  # -g .env*, --include .env, -f patterns: the value names files
-            if env_hit(args[k]):
+            if file_operand(k, args[k]):
                 return True
             k += 1
+        elif a in PATTERN_OPTS | SEARCH_VALUE and k < len(args):
+            k += 1  # a search pattern, script or context count is not a file operand
         elif a.startswith('-') and a != '-':
-            if a.startswith('--') and '=' in a and env_hit(a.split('=', 1)[1]):
-                return True
+            if a.startswith('--') and '=' in a:
+                flag, value = a.split('=', 1)
+                if flag in FILE_FLAGS and file_operand(k - 1, value):
+                    return True
+                if flag not in PATTERN_OPTS and env_hit(value):
+                    return True
         elif skip_first:
             skip_first = False  # grep/rg/awk/sed: the first operand is the pattern or script, not a file
-        elif env_hit(a):
+        elif file_operand(k - 1, a):
             return True
     return False
 
@@ -1847,20 +2023,32 @@ def piped_text(prev):
     return None
 
 
-def sub_script(text, depth):
+def sub_script(text, depth, fresh=False):
     """Judge text as a script run by a child shell: a cd or variable set there does not reach the caller."""
-    saved = (STATE['cwd'], dict(STATE['vars']))
+    saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']))
+    if fresh:
+        # Git config can be inherited before its keys appear in a later command. Other parent locals remain unknown,
+        # and readonly/local attributes do not survive exec. No export-attribute interpreter is needed to fail closed.
+        unknown = STATE['unknown'] | {k for k in STATE['vars'] if not k.startswith('GIT_CONFIG')}
+        if '*' in STATE['restricted']:
+            unknown.update(k for k in os.environ if k.startswith('GIT_CONFIG'))
+            unknown.update(('HOME', 'IFS'))
+        STATE['vars'] = {k: v for k, v in STATE['vars'].items() if k.startswith('GIT_CONFIG') and k not in unknown}
+        STATE['restricted'], STATE['unknown'] = set(), unknown
     try:
         return check_script(text, depth)
     finally:
-        STATE['cwd'], STATE['vars'] = saved
+        STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = saved
+
+
+
 
 
 def shell_decision(args, depth):
     """bash/sh/zsh: -c takes a script; without it the script comes from a heredoc, here-string, file or the pipe."""
     for k, a in enumerate(args[:-1]):
         if a == '-c' or (a.startswith('-') and not a.startswith('--') and 'c' in a[1:]):
-            return sub_script(args[k + 1], depth + 1)
+            return sub_script(args[k + 1], depth + 1, fresh=True)
     plain, redirs = split_redirects(args)
     if any(a.startswith('<(') for a in plain):
         return 'deny', MSG['pipe_shell']
@@ -1883,10 +2071,11 @@ def shell_decision(args, depth):
             return 'deny', MSG['pipe_shell']
         texts.append(text)
     for text in texts:
-        decision = sub_script(text, depth + 1) if text else None
+        decision = sub_script(text, depth + 1, fresh=True) if text else None
         if decision:
             return decision
     return None
+
 
 
 def python_target(args):
@@ -1968,6 +2157,10 @@ def builtin_assignments(toks):
                         names += [arg[n + 2:]] if arg[n + 2:] else args[k + 1:k + 2]
                     break
         names = names or ['REPLY']
+    elif prog == 'unset':
+        short, _, names = flag_parts(args)
+        if 'f' in short and 'v' not in short:
+            names = []  # -f only removes functions, not a cached variable of the same name
     out = set()
     for name in names:
         name = expand(name).split('[', 1)[0].split('?', 1)[0]
@@ -1977,12 +2170,30 @@ def builtin_assignments(toks):
     return out
 
 
+
+def invalidate_variable(name):
+    STATE['vars'].pop(name, None)
+    STATE['unknown'].add(name)  # absence must not make unknown git config look like an unset/default value
+
+
+
+def set_variable(name, value, unknown):
+    if name in STATE['restricted'] or '*' in STATE['restricted'] or unknown:
+        invalidate_variable(name)  # the assignment can fail; it must not establish a new safe path
+    else:
+        STATE['unknown'].discard(name)
+        STATE['vars'][name] = value
+
+
+
+
+
 def analyze(toks, depth, raw=None):
     assigns = [t for t in toks if shell_assignment(t)]
     if assigns and len(assigns) == len(toks):
         for t in assigns:
-            k, v = t.split('=', 1)
-            STATE['vars'][k] = expand(v)
+            k, v = expand(t).split('=', 1)
+            set_variable(k, v, unknown_expansion(t))
         return None
     STATE['penv'] = dict(STATE['pinherit'], **prefix_env(toks))
     STATE['envcfg'] = STATE['inherit'] + env_config(toks)
@@ -1991,19 +2202,33 @@ def analyze(toks, depth, raw=None):
         return nested(sub_script, split, depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])
     stripped = strip_prefix(toks)
     STATE['raw'] = (toks if raw is None else raw)[len(toks) - len(stripped):]  # index-aligned with toks, before expansion
-    toks = [expand(t) for t in stripped]
+    toks = [operand_value(expand(t), t) for t in stripped]
     for name in builtin_assignments(stripped):
-        STATE['vars'].pop(name, None)
+        invalidate_variable(name)
     if not toks:
         return None
     for k, t in enumerate(toks[:-1]):  # before the early returns below: export -p > file still writes the file
         if t in REDIRECTS and PROTECTED.hit(toks[k + 1]):
             return 'deny', MSG['lake']
     if toks[0] in ('export', 'declare', 'typeset', 'local', 'readonly'):
-        for t in toks[1:]:
+        unknown_inputs = [unknown_expansion(t) for t in stripped]  # every argument expanded before this builtin ran
+        short, longs, named = flag_parts(toks[1:])
+        safe_flags = {'export': {'n'}, 'readonly': set(), 'declare': {'r', 'x'}, 'typeset': {'r', 'x'}}
+        scalar = (toks[0] in safe_flags and not longs and short <= safe_flags[toks[0]]
+                  and not any(a.startswith('+') for a in toks[1:]))
+        if not scalar and named:
+            STATE['unknown'].update(STATE['vars'])
+            STATE['vars'].clear()
+            STATE['restricted'].add('*')  # unsupported attributes/selection can invalidate scalar assignment assumptions
+        for i, t in enumerate(toks[1:], 1):
             if ASSIGN.match(t):
                 k, v = t.split('=', 1)
-                STATE['vars'][k] = expand(v)
+                set_variable(k, v, unknown_inputs[i])  # the argument has already undergone its one shell expansion
+        if toks[0] == 'export' and 'n' in short and any(n.split('=', 1)[0] == 'HOME' for n in named):
+            invalidate_variable('HOME')  # a child shell may no longer inherit the tool's HOME
+        if 'f' not in short and (toks[0] == 'readonly' or (toks[0] != 'export' and 'r' in short)):
+            STATE['restricted'].update(n.split('=', 1)[0] for n in named
+                                       if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:=.*)?', n))
         return None
     if toks[0] in ('cd', 'pushd'):
         change_dir(toks[1:])
@@ -2104,6 +2329,8 @@ def analyze(toks, depth, raw=None):
     if prog.startswith('python') and applying(args):
         return 'deny', MSG['apply']
     return None
+
+
 
 
 class TooDeep(Exception):
@@ -2223,20 +2450,20 @@ def check_tokens(tokens, depth):
                 STATE['cwd'], cond_cd = None, False  # invalidate before a group can snapshot a conditional value
             if cond_vars and before != '&&':
                 for name in cond_vars:
-                    STATE['vars'].pop(name, None)
+                    invalidate_variable(name)
                 cond_vars.clear()
             if kind == 'open':
-                stack.append((STATE['cwd'], dict(STATE['vars']), list(scopes)))
+                stack.append((STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), list(scopes)))
                 pipe = []
             elif kind == 'close':
                 if stack:
-                    STATE['cwd'], STATE['vars'], scopes = stack.pop()
+                    STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], scopes = stack.pop()
                 pipe = [['<group>']]
             else:
                 if before not in PIPES:
                     pipe = []
                 forked = before in PIPES or after in PIPES or after == '&'
-                saved = (STATE['cwd'], dict(STATE['vars'])) if forked else None
+                saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown'])) if forked else None
                 STATE['pipe'], STATE['sep'] = [list(c) for c in pipe], after
                 scoped, loop_names = bool(scopes), set()
                 scope_cmd = cmd
@@ -2267,15 +2494,20 @@ def check_tokens(tokens, depth):
                     assigned = []  # command-prefix variables do not persist in the shell
                 names = {t.split('=', 1)[0] for t in assigned if ASSIGN.match(t)} | builtin_assignments(cmd) | loop_names
                 old_vars, old_cwd = dict(STATE['vars']), STATE['cwd']
+                old_restricted = set(STATE['restricted'])
+                old_unknown = set(STATE['unknown'])
                 try:
                     decision = analyze(cmd, depth)
                     names.update(k for k in set(old_vars) | set(STATE['vars'])
                                  if k not in old_vars or k not in STATE['vars'] or old_vars[k] != STATE['vars'][k])
                     moved = moves or STATE['cwd'] != old_cwd
+                    restricted_added = STATE['restricted'] - old_restricted
+                    names.update(restricted_added)
+                    names.update(STATE['unknown'] - old_unknown)
                 finally:
                     STATE['plain'] = False  # only the first command of the script may rely on PLAIN_RM
                     if saved:
-                        STATE['cwd'], STATE['vars'] = saved
+                        STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = saved
                 if decision:
                     return decision
                 if moved and before in PIPES and after not in PIPES:
@@ -2287,20 +2519,23 @@ def check_tokens(tokens, depth):
                     else:
                         STATE['cwd'] = None
                 if names and before in PIPES and after not in PIPES:
+                    STATE['restricted'].update(restricted_added)
                     for name in names:
-                        STATE['vars'].pop(name, None)  # zsh and bash lastpipe can retain the last stage's assignments
+                        invalidate_variable(name)  # zsh and bash lastpipe can retain the last stage's assignments
                 elif names and not saved and (scoped or before in ('&&', '||') or (cmd and shell_keyword(cmd[0]))):
                     if after == '&&' and before != '||' and not shell_keyword(cmd[0]) and not scoped:
                         cond_vars.update(names)
                     else:
                         for name in names:
-                            STATE['vars'].pop(name, None)
+                            invalidate_variable(name)
                 pipe.append(cmd)
     finally:
         STATE['envcfg'] = []
         if stack:
-            STATE['cwd'], STATE['vars'] = stack[0][:2]
+            STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = stack[0][:4]
     return None
+
+
 
 
 def scan_moves(norm, depth=0):

@@ -195,6 +195,31 @@ class TestExecution(unittest.TestCase):
                 self.assertEqual(result['status'], 'FAIL')
                 self.assertEqual(result['exit_code'], code)
 
+    def test_unittest_count_excludes_skips_and_expected_failures(self):
+        for total, completion, passed in ((4, 'OK (skipped=4)', 0),
+                                           (3, 'OK (expected failures=3)', 0),
+                                           (5, 'OK (skipped=3, expected failures=2)', 0),
+                                           (5, 'OK (skipped=2, expected failures=1)', 2),
+                                           (7, 'OK', 7),
+                                           (4, 'FAILED (failures=1)', 0)):
+            text = 'Ran %d tests in 0.001s\n\n%s\n' % (total, completion)
+            with self.subTest(text=text):
+                self.assertEqual(runner.test_count(text), passed)
+        self.assertEqual(runner.test_count('Ran 5 tests in 0.001s\n'), 0)
+
+    def test_all_skipped_success_exit_cannot_supply_passing_evidence(self):
+        script = ('import unittest\n'
+                  'class Skipped(unittest.TestCase):\n'
+                  ' @unittest.skip("offline")\n'
+                  ' def test_case(self): pass\n'
+                  'unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(Skipped))')
+        command = [sys.executable, '-c', script]
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = runner.run_tests(command, 'acme/kit')
+        self.assertEqual(result['exit_code'], 0)
+        self.assertEqual(result['count'], 0)
+        self.assertEqual(result['status'], 'FAIL')
+
     def test_pytest_and_javascript_summaries(self):
         for text in ('=== 17 passed in 1.2s ===', 'Tests: 9 passed, 9 total', ' Tests  13 passed (13)'):
             with self.subTest(text=text):
@@ -347,6 +372,15 @@ class AutomaticRun(unittest.TestCase):
                 patch.object(runner, 'codex_review') as review, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.main(['7', 'auto']), 3)
         review.assert_not_called()
+
+
+class TestCommandConfiguration(unittest.TestCase):
+    def test_configured_repository_keys_match_github_names_case_insensitively(self):
+        with patch.object(runner.common, 'config', return_value={
+                'pr_gate': {'test_commands': {'AcMe/Kit': CMD}}}):
+            for slug in ('acme/kit', 'ACME/KIT', 'Acme/Kit'):
+                with self.subTest(slug=slug):
+                    self.assertEqual(runner.common.review_test_command(slug), CMD)
 
 
 class SnapshotChecks(unittest.TestCase):

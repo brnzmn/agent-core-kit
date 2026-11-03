@@ -124,10 +124,11 @@ class RoutineCommandsPass(unittest.TestCase):
         self.check(['rm -rf node_modules package-lock.json && npm install', 'rm -rf node_modules pnpm-lock.yaml && pnpm install',
                     'rm -rf package-lock.json'], None, cwd=self.cwd)
         self.check(['rm -rf src', 'rm -rf node_modules src', 'rm -rf package-lock.json src', 'rm -rf srclink',
-                    'rm -rf srclink/', 'rm -rf package-lock.json missing-dir', 'rm -rf $X/package-lock.json',
+                    'rm -rf srclink/', 'rm -rf package-lock.json missing-dir',
                     'rm -rf dist *.tsbuildinfo', 'rm -rf *.tsbuildinfo', 'rm -rf [^n]*', 'rm -rf lake-*/x.csv',
                     'rm -rf package-lock.js?n', 'rm -rf package-lock.json{,}', 'rm -rf ~/package-lock.json'],
                    'deny', cwd=self.cwd, key='rm', tail=' && true')
+        self.check(['rm -rf $X/package-lock.json'], 'deny', cwd=self.cwd, key='lake', tail=' && true')
         self.check(['rm -rf *'], 'deny', cwd=self.cwd, key='rm_cwd', tail=' && true')
 
     def test_a_file_check_holds_only_for_a_first_rm_with_nothing_beside_it(self):

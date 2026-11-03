@@ -161,6 +161,8 @@ A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs
 | `gh pr merge` without required reviews or outage/test evidence, merging through `gh api` | Run `pr_review.py <pr> auto`, read its results, then `gh pr merge`. |
 | Committing in a worktree whose `.agent-lane` names the other tool | Leave the change uncommitted and write a handoff note. |
 
+Write paths the guard cannot resolve as one known word are held whenever protected folders are configured. Known unquoted paths pass only when their exact value is one nonempty word without shell whitespace or globs and IFS has not changed. A `$TMPDIR` or `$(mktemp ...)` spelling alone does not prove a delete is outside protected data; use a literal verified temp path instead.
+
 Two more hooks guard the instruction files. The budget hook denies edits that add log entries to an instruction file or push it past its line budget: the rulebook 120 lines, each adapter 60, a repo's AGENTS.md 150, a CLAUDE.md that imports AGENTS.md 40, each `.claude/rules` file 80. The Stop hook pushes back once when a turn ends by handing work to you that the agent could do.
 
 A hook that fails for its own reasons lets the call through and logs to `local/learning/hook-errors.log`. Neither layer covers commands run inside scripts (`bash x.sh`, `python -c`), MCP tools other than SQL ones, or hosted tools. The hooks stop accidents, not a determined agent: an agent with shell access can edit `local/config.json` or `local/AGENTS.md` like any other file, so review what your agents change there.

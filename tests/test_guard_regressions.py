@@ -164,11 +164,116 @@ class PersistentShellAssignments(unittest.TestCase):
                 self.assertEqual(decision(command), 'deny')
         self.assertIsNone(decision('echo word\r; git status --short'))
 
-    def test_shell_whitespace_is_not_unicode_whitespace(self):
+    def test_prefix_environment_only_collects_assignment_positions(self):
+        body = 'GIT_CONFIG_COUNT=0; true; GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main git push origin'
+        for prefix in ('export GIT_CONFIG_COUNT=$X;', 'export GIT_CONFIG_COUNT=1;'):
+            command = prefix + " bash -c '" + body + "'"
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+        for option in ('-p', '--prompt'):
+            for count, prompt, expected in ((0, 1, None), (1, 0, 'deny')):
+                command = ('GIT_CONFIG_COUNT=%s GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main '
+                           'sudo -E %s \'GIT_CONFIG_COUNT=%s\' git push origin HEAD') % (count, option, prompt)
+                with self.subTest(command=command):
+                    self.assertEqual(decision(command), expected)
+        for wrapper in ('env', 'sudo -u root', 'timeout -s TERM 5 env'):
+            command = (wrapper + ' "GIT_CONFIG_COUNT=1" "GIT_CONFIG_KEY_0=remote.origin.push" '
+                       '"GIT_CONFIG_VALUE_0=+HEAD:main" git push origin')
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+
+    def test_fresh_shells_retain_git_config_inheritance_without_trusting_locals(self):
+        body = 'true; GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=+HEAD:main git push origin'
+        for prefix in ('export GIT_CONFIG_COUNT=$X;', 'export GIT_CONFIG_COUNT=1;', 'GIT_CONFIG_COUNT=1;'):
+            command = prefix + " bash -c '" + body + "'"
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for command in ('export GIT_CONFIG_COUNT=0; bash -c \'%s\'' % body,
+                        'export GIT_CONFIG_COUNT=$X; bash -c \'true; GIT_CONFIG_COUNT=0; %s\'' % body,
+                        'readonly GIT_CONFIG_COUNT=1; bash -c \'true; GIT_CONFIG_COUNT=0; %s\'' % body):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+        self.assertEqual(decision('P=README.md; bash -c \'true; git add -A "$P"\''), 'deny')
+        self.assertIsNone(decision('readonly P=.; bash -c \'P=README.md; git add -A "$P"\''))
+
+    def test_unknown_git_config_assignments_remain_visible_to_push_checks(self):
+        for command in ('GIT_CONFIG_COUNT=$((100+1)) GIT_CONFIG_KEY_100=remote.origin.push '
+                        'GIT_CONFIG_VALUE_100=+HEAD:main git push origin',
+                        'GIT_CONFIG_COUNT=$X; GIT_CONFIG_KEY_0=remote.origin.push '
+                        'GIT_CONFIG_VALUE_0=+HEAD:main git push origin',
+                        'export GIT_CONFIG_COUNT="$X"; GIT_CONFIG_KEY_0=remote.origin.push '
+                        'GIT_CONFIG_VALUE_0=+HEAD:main git push origin',
+                        'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$K GIT_CONFIG_VALUE_0=true git push origin',
+                        'GIT_CONFIG_PARAMETERS=$P; git push origin'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for prefix in ('GIT_CONFIG_COUNT=$X; GIT_CONFIG_COUNT=0;', '(GIT_CONFIG_COUNT=$X);'):
+            self.assertIsNone(decision(prefix + ' GIT_CONFIG_KEY_0=remote.origin.push '
+                                       'GIT_CONFIG_VALUE_0=+HEAD:main git push origin HEAD'))
+
+    def test_active_unknown_assignment_values_do_not_become_literal_paths(self):
+        for assign in ('F=$X', 'export F="$X"', 'declare F="$X"', 'readonly F="$X"',
+                       'export A=README.md F="$A"'):
+            command = '%s; git add "$F"' % assign
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        self.assertIsNone(decision('P=README.md; F=$P; git add -A "$F"'))
+        self.assertIsNone(decision('F=\'$X\'; git add -A "$F"'))
+
+    def test_nested_shell_scripts_expand_in_their_own_scope(self):
+        for command in ('p=README.md; bash -c \'p=.; git add -A "$p"\'',
+                        'p=README.md; suffix=x; bash -c \'p=.; git add -A "$p"; echo \'"$suffix"',
+                        'P=README.md; bash -c \'git add -A $P\''):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+
+    def test_literal_and_outer_expansions_stay_distinct(self):
+        for command in ('p=README.md; bash -c "p=.; git add -A \\"$p\\""',
+                        'p=.; echo "$p"; git add -A \'$p\'',
+                        'p=\'$q\'; q=.; git add -A "$p"',
+                        'bash -c \'p=README.md; git add -A "$p"\''):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_failed_readonly_assignments_cannot_establish_safe_paths(self):
+        for declaration in ('readonly p=.', 'declare -r p=.', 'typeset -r p=.', 'p=.; readonly p'):
+            for assign in ('export p=README.md', 'p=README.md', 'declare p=README.md'):
+                command = '%s; %s; git add -A "$p"' % (declaration, assign)
+                with self.subTest(command=command):
+                    self.assertEqual(decision(command), 'deny')
+        for command in ('p=README.md; printf x | readonly p=.; export p=README.md; git add -A "$p"',
+                        'p=.; printf x | readonly p; export p=README.md; git add -A "$p"'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for command in ('readonly p=README.md; git add -A "$p"',
+                        '(readonly p=.); p=README.md; git add -A "$p"',
+                        'readonly p=.; bash -c \'p=README.md; git add -A "$p"\''):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_unproven_declaration_forms_cannot_establish_safe_paths(self):
+        for declaration in ('readonly -f p=README.md', 'declare -fr p=README.md', 'export -f p=README.md',
+                            'declare -p p=README.md', 'local p=README.md', 'export -z p=README.md'):
+            command = 'p=.; %s; git add -A "$p"' % declaration
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+
+    def test_unset_variable_selection_invalidates_cached_paths(self):
+        for unset in ('unset D', 'unset -v D', 'unset -- D', 'builtin unset D'):
+            command = 'export D=/tmp; %s; rm -rf "$D/data"' % unset
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        self.assertIsNone(decision('D=/tmp; unset -f D; rm -rf "$D/data"'))
+
+    def test_only_shell_whitespace_delimits_keywords(self):
         for cmd in ('echo \u00a0; if true; then rm -rf /srv/lake-data/raw; fi',
-                    'echo \u00a0; X=1 git push --force origin main'):
+                    'echo \u00a0; X=1 git push --force origin main',
+                    'D=/srv/lake-data; if false; then fi\r; D=/tmp; fi; rm -rf "$D/raw"',
+                    'D=/srv/lake-data; if false; then \rfi; D=/tmp; fi; rm -rf "$D/raw"',
+                    'D=/srv/lake-data; while false; do done\r; D=/tmp; done; rm -rf "$D/raw"'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(decision(cmd), 'deny')
+        self.assertIsNone(decision('echo word\r'))
 
     def test_missing_lexical_identity_holds_control_and_assignment_scripts(self):
         script = ('import json,sys;sys.path.insert(0,sys.argv[1]);import guard;'
@@ -248,6 +353,10 @@ class PersistentShellAssignments(unittest.TestCase):
                 self.assertIsNone(decision('p=src/a.py; %s; git add -A "$p"' % assign))
 
 
+
+
+
+
 class VerdictOutputFilters(unittest.TestCase):
     def test_read_only_queries_and_output_filters_pass(self):
         for flag in ('--jq', '-q', '--template'):
@@ -278,6 +387,154 @@ class WrongConfigTypes(unittest.TestCase):
         local = make_local(dict(TEST_CONFIG, pr_gate='off'))
         self.addCleanup(shutil.rmtree, local, True)
         self.assertEqual(decision('gh api -X PUT repos/o/r/pulls/7/merge', local=local), 'deny')
+
+
+class KitReviewGuardRegressions(unittest.TestCase):
+    def test_xargs_readers_keep_unknown_paths_unresolved(self):
+        for command in (r'D=README.md; printf -v D .; xargs git add -A "$D"',
+                        r'D=README.md; printf -v D .env; xargs cat "$D"'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for command in (r'D=README.md; xargs cat "$D"',
+                        r"xargs cat '$D'"):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_invalidated_write_paths_keep_their_expansion_provenance(self):
+        self.assertEqual(decision('TMPDIR=/srv/lake-data; printf -v TMPDIR /srv/lake-data; rm -rf "$TMPDIR/raw"'), 'deny')
+        prefix = 'D=/srv/lake-data; printf -v D /srv/lake-data; '
+        for writer in ('touch "$D/raw"', 'printf x | tee "$D/raw"', 'printf x > "$D/raw"',
+                       'cp input "$D/raw"', 'mv input "$D/raw"',
+                       'cp --target-directory="$D" input', 'mv -t"$D" input'):
+            with self.subTest(writer=writer):
+                self.assertEqual(decision(prefix + writer), 'deny')
+        for command in ('D=/srv/lake-data; printf "%s" "$D"; touch \'$D/raw\'',
+                        'D=/srv/lake-data; printf -v D /srv/lake-data; printf "$D" > \'$D/raw\'',
+                        'D=/srv/lake-data; printf -v D /srv/lake-data; cp input \'$D/raw\'',
+                        'D=/tmp/guard-control; touch "$D"'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_unknown_folder_cannot_hide_relative_protected_writes(self):
+        local = make_local(dict(TEST_CONFIG, protected_dirs=['/etc']))
+        self.addCleanup(shutil.rmtree, local, True)
+        for command in ('if true; then cd /etc; fi; touch raw',
+                        'if true; then cd /etc; fi; printf x > raw',
+                        'if true; then cd /etc; fi; cp input raw',
+                        'false && cd /tmp; touch raw'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command, local=local), 'deny')
+        for command in ('if true; then cd /etc; fi; touch /tmp/guard-control',
+                        'if true; then cd /etc; fi; cp input /tmp/guard-control',
+                        'cd /tmp; touch guard-control'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command, local=local))
+        empty = make_local(dict(TEST_CONFIG, protected_dirs=[]))
+        self.addCleanup(shutil.rmtree, empty, True)
+        self.assertIsNone(decision('if true; then cd /etc; fi; touch raw', local=empty))
+
+    def test_literal_dollar_paths_still_resolve_under_a_protected_folder(self):
+        local = make_local(dict(TEST_CONFIG, protected_dirs=['/etc']))
+        self.addCleanup(shutil.rmtree, local, True)
+        for command in ("cd /etc; touch '$D'", "cd /etc; touch '$HOME/raw'",
+                        "cd /etc; printf x > '$D'", "cd /etc; cp input '$D'"):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command, local=local), 'deny')
+        self.assertIsNone(decision("cd /tmp; touch '$HOME/raw'", local=local))
+
+    def test_unknown_reader_paths_cannot_hide_env_files(self):
+        for reader in ('cat "$D"', 'sed -n 1p "$D"', 'grep value "$D"', 'awk -f "$D" data.txt'):
+            command = 'D=.env; printf -v D .env; ' + reader
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for command in ('D=README.md; cat "$D"', "D=.env; printf -v D .env; cat '$D'",
+                        'D=.env; printf "%s" "$D"; cat \'$D\'',
+                        'P=value; printf -v P value; grep -e "$P" README.md'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_http_method_spellings_cannot_turn_merge_writes_into_reads(self):
+        endpoint = 'https://api.github.com/repos/o/r/pulls/7/merge'
+        for command in ('curl -sX PUT ' + endpoint, 'curl -sXPUT ' + endpoint,
+                        'curl -ivX PATCH ' + endpoint, 'wget --method PUT ' + endpoint,
+                        'wget --method=PUT ' + endpoint, 'curl --data-b example ' + endpoint,
+                        'wget --post-d=example ' + endpoint):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for command in ('curl -sX GET ' + endpoint, 'curl -sXHEAD ' + endpoint,
+                        'curl -H "X-Example: PUT" ' + endpoint,
+                        'wget --method GET ' + endpoint, 'wget --method=HEAD ' + endpoint):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+
+class ProvenPathFields(unittest.TestCase):
+    def test_known_single_field_paths_keep_reads_and_writes_allowed(self):
+        for command in ('D=/tmp/guard-control; cat $D/notes.txt',
+                        'D=/tmp/guard-control; touch $D/raw',
+                        'D=/tmp/guard-control; cp input $D/output',
+                        'D=/tmp/guard-control; chmod 600 $D/output',
+                        'G="$HOME/ordinary"; cp "$G" "$G.bak"',
+                        'cat "$HOME/ordinary"',
+                        'bash -c \'cat "$HOME/ordinary"\''):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_unquoted_paths_require_a_known_nonempty_single_field(self):
+        for command in ('D="/srv/lake-data /tmp"; touch $D/raw',
+                        'D="/tmp/*"; touch $D/raw', 'D=""; touch $D',
+                        'IFS=/; D=/tmp/guard-control; touch $D/raw',
+                        'read IFS; D=/tmp/guard-control; touch $D/raw',
+                        'unset IFS; D=/tmp/guard-control; touch $D/raw',
+                        'declare -z other=x; D=/tmp/guard-control; touch $D/raw',
+                        'D=/srv/lake-data; printf -v D /srv/lake-data; touch $D/raw',
+                        'D=/srv/lake-data; touch $D/raw'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        self.assertIsNone(decision('D=/tmp/control\rword; touch $D/raw'))
+
+    def test_home_fallback_respects_invalidations_and_child_overrides(self):
+        for command in ('printf -v HOME /srv/lake-data; cat "$HOME/notes.txt"',
+                        'unset HOME; cat "$HOME/notes.txt"',
+                        'declare -p HOME; cat "$HOME/notes.txt"',
+                        'HOME=/srv/lake-data; bash -c \'touch "$HOME/raw"\'',
+                        'env HOME=/srv/lake-data bash -c \'touch "$HOME/raw"\'',
+                        'export -n HOME; bash -c \'cat "$HOME/notes.txt"\'',
+                        'export -n HOME=/tmp/control; bash -c \'cat "$HOME/notes.txt"\''):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        self.assertIsNone(decision('HOME=/tmp/guard-control; cat "$HOME/notes.txt"'))
+
+    def test_home_prefix_changes_only_affect_the_child_environment(self):
+        for command in ('env -u HOME bash -c \'cat "$HOME/ordinary"\'',
+                        'env -vuHOME bash -c \'cat "$HOME/ordinary"\'',
+                        'env -vu HOME bash -c \'cat "$HOME/ordinary"\'',
+                        'env --unset=HOME bash -c \'cat "$HOME/ordinary"\'',
+                        'env -i bash -c \'cat "$HOME/ordinary"\'',
+                        'env --ignore-environment bash -c \'cat "$HOME/ordinary"\'',
+                        'sudo bash -c \'cat "$HOME/ordinary"\'',
+                        'doas sh -c \'cat "$HOME/ordinary"\'',
+                        'declare -p HOME; bash -c \'cat "$HOME/ordinary"\''):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for command in ('env -u HOME cat "$HOME/ordinary"',
+                        'sudo cat "$HOME/ordinary"',
+                        'env -u OTHER bash -c \'cat "$HOME/ordinary"\''):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_unknown_env_unset_targets_hold_protected_destinations(self):
+        local = make_local(dict(TEST_CONFIG, protected_dirs=['/srv/lake-data']))
+        self.addCleanup(shutil.rmtree, local, True)
+        for command in ('env --unset "$REMOVE" bash -c \'cp input "$HOME/srv/lake-data/raw"\'',
+                        'env --unset="$REMOVE" bash -c \'cp input "$HOME/srv/lake-data/raw"\'',
+                        'env -u "$REMOVE" bash -c \'cp input "$HOME/srv/lake-data/raw"\''):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command, local=local), 'deny')
+        self.assertIsNone(decision('REMOVE=OTHER; env --unset "$REMOVE" bash -c \'cp input "$HOME/srv/lake-data/raw"\'', local=local))
+
+    def test_staging_still_holds_unquoted_expansions(self):
+        self.assertEqual(decision('p=README.md; git add -A $p'), 'deny')
 
 
 if __name__ == '__main__':

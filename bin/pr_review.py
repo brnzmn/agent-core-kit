@@ -233,9 +233,26 @@ def post_comment(pr, expected, body):
 
 def test_count(text):
     """Recognize completed unittest, pytest and Jest/Vitest summaries; no count means no passing evidence."""
+    summaries = re.findall(r'^Ran (\d+) tests? in [^\n]*\n(?:[ \t]*\n)?'
+                           r'(OK|FAILED)(?: \(([^)\n]*)\))?[ \t]*$', text, re.M)
+    if summaries:
+        counts = []
+        for total, outcome, details in summaries:
+            if outcome != 'OK':
+                return 0
+            excluded = 0
+            for item in details.split(','):
+                key, _, value = item.strip().partition('=')
+                if key in ('skipped', 'expected failures'):
+                    if not value.isdigit():
+                        return 0
+                    excluded += int(value)
+            counts.append(max(0, int(total) - excluded))
+        return sum(counts)
+    if re.search(r'^Ran \d+ tests? in ', text, re.M):
+        return 0  # an interrupted unittest summary does not establish completed tests
     counts = []
-    for pattern in (r'Ran (\d+) tests? in ', r'\b(\d+) passed\b', r'Tests:\s+(\d+) passed',
-                    r'Tests\s+(\d+) passed'):
+    for pattern in (r'\b(\d+) passed\b', r'Tests:\s+(\d+) passed', r'Tests\s+(\d+) passed'):
         counts.extend(int(n) for n in re.findall(pattern, text))
     return max(counts, default=0)
 

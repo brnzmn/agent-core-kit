@@ -146,7 +146,8 @@ def review_test_command(slug):
     """Configured full-suite argv for a repo. Missing or malformed configuration cannot supply test evidence."""
     gate = config().get('pr_gate') or {}
     commands = gate.get('test_commands')
-    command = commands.get(slug.lower()) if isinstance(commands, dict) else None
+    normalized = {key.lower(): value for key, value in commands.items() if isinstance(key, str)} if isinstance(commands, dict) else {}
+    command = normalized.get(slug.lower())
     if isinstance(command, list) and command and all(isinstance(a, str) and a.strip() and '\x00' not in a for a in command):
         return command[:]
     return None
