@@ -157,6 +157,137 @@ class XargsReplacementStaging(unittest.TestCase):
 
 
 class PersistentShellAssignments(unittest.TestCase):
+    def test_all_timed_state_changes_remain_uncertain(self):
+        for timing in ('time', 'time -p', 'time time', 'time time -p'):
+            for assignment in ('D=/tmp', 'export D=/tmp'):
+                command = 'D=/srv/lake-data; %s %s; rm -rf "$D/raw"' % (timing, assignment)
+                with self.subTest(command=command):
+                    self.assertEqual(decision(command), 'deny')
+            command = 'D=/tmp; %s D=/tmp; git add -A "$D"' % timing
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        self.assertIsNone(decision('D=/tmp; time printf example; rm -rf "$D/raw"'))
+        self.assertIsNone(decision('D=/tmp; time export OTHER=/tmp; rm -rf "$D/raw"'))
+
+    def test_deferred_functions_do_not_trust_definition_time_values(self):
+        for body in ('read "$NAME"', 'printf -v "$NAME" /srv/lake-data',
+                     'export "$NAME"', '"$CMD" D=/srv/lake-data',
+                     "eval '\"$CMD\" D=/srv/lake-data'",
+                     'env "$CMD" D=/srv/lake-data',
+                     "bash -c '\"$CMD\" D=/srv/lake-data'"):
+            command = 'NAME=other; CMD=echo; defaults() { %s; }; NAME=D; CMD=export; D=/tmp; defaults; rm -rf "$D/raw"' % body
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        self.assertEqual(decision('defaults() { export "$NAME"; }; D=/tmp; defaults; rm -rf "$D/raw"'), 'deny')
+        for command in ('D=/tmp; defaults() { echo "$D"; }; rm -rf "$D/raw"',
+                        'D=/tmp; defaults() { read other; }; rm -rf "$D/raw"',
+                        'D=/tmp; defaults() { export NAME=$UNKNOWN; }; rm -rf "$D/raw"',
+                        'defaults() { echo example; }; false && N=npx; $N npm run build'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_shell_ambiguous_wrappers_cannot_establish_safe_parent_paths(self):
+        for shell in ('bash', 'zsh'):
+            for timing in ('time -p', 'command', 'time command'):
+                command = ('export D=/srv/lake-data; %s -c '
+                           "' %s export D=/tmp; rm -rf \"$D/raw\"'") % (shell, timing)
+                with self.subTest(command=command):
+                    self.assertEqual(decision(command), 'deny')
+        self.assertIsNone(decision('D=/tmp; command export OTHER=/tmp; rm -rf "$D/raw"'))
+        self.assertIsNone(decision('D=/srv/lake-data; builtin export D=/tmp; rm -rf "$D/raw"'))
+
+    def test_unknown_builtin_write_targets_cannot_miss_future_variables(self):
+        for assign in ('read "$NAME"', 'printf -v "$NAME" value'):
+            for prefix in ('', 'read D; '):
+                command = '%sdefaults() { %s; }; D=/tmp; defaults; rm -rf "$D/raw"' % (prefix, assign)
+                with self.subTest(command=command):
+                    self.assertEqual(decision(command), 'deny')
+            with self.subTest(command=assign):
+                self.assertEqual(decision(assign), 'deny')
+        for command in ('read other', 'NAME=other; read "$NAME"',
+                        'printf -v other value', 'NAME=other; printf -v "$NAME" value',
+                        'defaults() { read other; }; D=/tmp; defaults; rm -rf "$D/raw"',
+                        'env read "$NAME"',
+                        'defaults() { env read "$NAME"; }; D=/tmp; defaults; rm -rf "$D/raw"'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_unknown_function_directories_record_move_intent(self):
+        for body in ('cd /srv/lake-data', "eval 'cd /srv/lake-data'"):
+            for write in ('touch raw', 'rm -rf dist'):
+                command = 'cd "$Q"; defaults() { %s; }; cd /tmp; defaults; %s' % (body, write)
+                with self.subTest(command=command):
+                    self.assertEqual(decision(command), 'deny')
+        for body in ('env cd /srv/lake-data', "bash -c 'cd /srv/lake-data'"):
+            command = 'cd "$Q"; defaults() { %s; }; cd /tmp; defaults; touch raw' % body
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_reserved_time_keeps_parent_scope_only_in_keyword_position(self):
+        for timing in ('time', 'time -p', 'time time -p', 'time command', 'time -p builtin'):
+            for assignment in ('export D=/srv/lake-data', 'D=/srv/lake-data'):
+                if assignment.startswith('D=') and timing.endswith(('command', 'builtin')):
+                    continue  # these execute a named command rather than a shell assignment
+                command = 'D=/tmp; %s %s; rm -rf "$D/raw"' % (timing, assignment)
+                with self.subTest(command=command):
+                    self.assertEqual(decision(command), 'deny')
+        for timing in ('"time"', r't\ime', '/usr/bin/time', 'command time', 'X=1 time', 'time "-p"'):
+            command = 'D=/srv/lake-data; %s export D=/tmp; rm -rf "$D/raw"' % timing
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for timing in ('time', 'time -p', 'time time -p', 'time command', 'time -p builtin'):
+            command = 'D=/srv/lake-data; %s export D=/tmp; rm -rf "$D/raw"' % timing
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+
+    def test_function_bodies_cannot_establish_parent_shell_paths(self):
+        for definition in ('defaults() { export D=/tmp; }',
+                           'function defaults { D=/tmp; }',
+                           'function defaults() { export D=/tmp; }',
+                           'defaults ()\n{ export D=/tmp; }',
+                           'defaults() { nested() { D=/tmp; }; }'):
+            command = 'D=/srv/lake-data; %s; rm -rf "$D/raw"' % definition
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for body in ('D=/srv/lake-data', 'export D=/srv/lake-data',
+                     'printf -v D /srv/lake-data', 'read D'):
+            command = 'D=/tmp; defaults() { %s; }; D=/tmp; defaults; rm -rf "$D/raw"' % body
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        self.assertEqual(decision('read D; defaults() { D=/srv/lake-data; }; D=/tmp; defaults; rm -rf "$D/raw"'), 'deny')
+        self.assertEqual(decision("read D; defaults() { eval 'if true; then D=/srv/lake-data; fi'; }; D=/tmp; defaults; rm -rf \"$D/raw\""), 'deny')
+        self.assertIsNone(decision('D=/tmp; defaults() { printf example; }; rm -rf "$D/raw"'))
+        self.assertIsNone(decision('D=/tmp; defaults() { other=/tmp; }; rm -rf "$D/raw"'))
+
+    def test_function_and_external_wrapper_directories_do_not_create_safe_parent_paths(self):
+        for command in ('cd /etc; defaults() { cd /tmp; }; touch raw',
+                        'cd /tmp; defaults() { cd /etc; }; cd /tmp; defaults; touch raw',
+                        'cd /etc; env cd /tmp; touch raw',
+                        'cd /etc; nice cd /tmp; touch raw',
+                        'cd /etc; env eval "cd /tmp"; touch raw'):
+            with self.subTest(command=command):
+                self.assertEqual(KitReviewGuardRegressions.with_dirs(self, command, ['/etc']), 'deny')
+        for wrapper, expected in (('command', 'deny'), ('builtin', None)):
+            self.assertEqual(KitReviewGuardRegressions.with_dirs(self, 'cd /etc; %s cd /tmp; touch raw' % wrapper, ['/etc']), expected)
+
+    def test_external_wrappers_cannot_mutate_parent_builtin_state(self):
+        for wrapper in ('env', 'nice', 'nohup', 'sudo', 'timeout 5', '/usr/bin/time', 'command env',
+                        'command -v', 'command -V', 'builtin --help'):
+            for declaration in ('export', 'readonly', 'declare'):
+                command = 'D=/srv/lake-data; %s %s D=/tmp; rm -rf "$D/raw"' % (wrapper, declaration)
+                with self.subTest(command=command):
+                    self.assertEqual(decision(command), 'deny')
+        self.assertEqual(decision("D=/srv/lake-data; env eval 'D=/tmp'; rm -rf \"$D/raw\""), 'deny')
+        self.assertEqual(decision('D=/srv/lake-data; printf x | xargs export D=/tmp; rm -rf "$D/raw"'), 'deny')
+        for wrapper, expected in (('command', 'deny'), ('builtin', None)):
+            self.assertEqual(decision('D=/srv/lake-data; %s export D=/tmp; rm -rf "$D/raw"' % wrapper), expected)
+        for wrapper in ('env', 'nice', '/usr/bin/printf' ):
+            command = ('D=/tmp; %s printf -v D /srv/lake-data; rm -rf "$D/raw"' % wrapper
+                       if wrapper != '/usr/bin/printf' else
+                       'D=/tmp; /usr/bin/printf -v D /srv/lake-data; rm -rf "$D/raw"')
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
     def test_carriage_return_does_not_end_a_shell_word(self):
         for body in ('if false; then fi\r; D=/tmp; fi;', 'while false; do done\r; D=/tmp; done;'):
             command = 'D=/srv/lake-data; ' + body + ' rm -rf "$D/raw"'
@@ -390,6 +521,11 @@ class WrongConfigTypes(unittest.TestCase):
 
 
 class KitReviewGuardRegressions(unittest.TestCase):
+    def with_dirs(self, command, dirs):
+        local = make_local(dict(TEST_CONFIG, protected_dirs=dirs))
+        self.addCleanup(shutil.rmtree, local, True)
+        return decision(command, local=local)
+
     def test_xargs_readers_keep_unknown_paths_unresolved(self):
         for command in (r'D=README.md; printf -v D .; xargs git add -A "$D"',
                         r'D=README.md; printf -v D .env; xargs cat "$D"'):
@@ -453,6 +589,28 @@ class KitReviewGuardRegressions(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIsNone(decision(command))
 
+    def test_reader_flags_do_not_consume_env_file_operands(self):
+        for command in ('cat -e .env', 'less -e .env'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for command in ('cat -e README.md', 'less -e README.md',
+                        'grep -e .env README.md', 'grep --label .env pattern README.md',
+                        'rg --replace .env pattern README.md'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_httpie_method_case_cannot_hide_merge_writes(self):
+        endpoint = 'https://api.github.com/repos/o/r/pulls/7/merge'
+        for client in ('http', 'https', 'xh'):
+            for method in ('put', 'post', 'patch', 'delete', 'PuT'):
+                command = '%s %s %s' % (client, method, endpoint)
+                with self.subTest(command=command):
+                    self.assertEqual(decision(command), 'deny')
+            for method in ('get', 'head', 'GeT'):
+                command = '%s %s %s' % (client, method, endpoint)
+                with self.subTest(command=command):
+                    self.assertIsNone(decision(command))
+
     def test_http_method_spellings_cannot_turn_merge_writes_into_reads(self):
         endpoint = 'https://api.github.com/repos/o/r/pulls/7/merge'
         for command in ('curl -sX PUT ' + endpoint, 'curl -sXPUT ' + endpoint,
@@ -466,6 +624,73 @@ class KitReviewGuardRegressions(unittest.TestCase):
                         'wget --method GET ' + endpoint, 'wget --method=HEAD ' + endpoint):
             with self.subTest(command=command):
                 self.assertIsNone(decision(command))
+
+
+class StructuredReaderOperands(unittest.TestCase):
+    def test_expansion_cannot_change_structured_argument_roles(self):
+        for command in ("V='value . .env'; jq --arg label $V .", "V='null . .env'; jq --argjson label $V .",
+                        "V='label value . .env'; jq --arg $V", "F='. .env'; jq $F",
+                        'read F; jq "$F" settings.json', 'jq --arg label .* .', 'jq .* settings.json'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+        for command in ("V='value . .env'; jq --arg label \"$V\" . settings.json",
+                        "F='.env'; jq \"$F\" settings.json", "jq --arg pattern '*' . settings.json",
+                        "jq '.[] | .env' settings.json"):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_expressions_and_literal_option_values_are_not_files(self):
+        for command in ('jq .env claude/settings.json', 'jq -e .env claude/settings.json',
+                        'jq --arg label .env .env settings.json',
+                        'jq --argjson label null .env settings.json',
+                        'jq --args .env .env', 'jq --jsonargs .env null',
+                        'jq -f filter.jq settings.json',
+                        'yq --expression .env settings.yaml',
+                        'yq eval --expression=.env settings.yaml',
+                        'yq eval-all --input-format yaml --expression .env settings.yaml',
+                        'yq .ordinary settings.yaml'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_actual_structured_input_files_remain_guarded(self):
+        for command in ('jq . .env', 'jq -e . .env.local', 'jq -f .env settings.json',
+                        'jq --from-file=.env settings.json', 'jq -rf.env settings.json',
+                        'jq --rawfile label .env .', 'jq --slurpfile label .env.json .',
+                        'jq --arg label .env . .env', 'jq -- . .env',
+                        'yq --expression .env .env', 'yq eval . .env', 'yq .env',
+                        'yq --from-file .env settings.yaml',
+                        'D=settings.json; read D; jq . "$D"'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+
+
+class RedirectAndWildcardOperands(unittest.TestCase):
+    def test_redirections_are_not_staging_pathspecs(self):
+        for sub in ('add', 'stage'):
+            for flag in ('-A', '-u', '--all'):
+                for redir in ('> /dev/null', '2>/dev/null', '&> /dev/null', '>| /dev/null',
+                              '< input.txt', '>> output.txt', '2>&1'):
+                    command = 'git %s %s %s' % (sub, flag, redir)
+                    with self.subTest(command=command):
+                        self.assertEqual(decision(command), 'deny')
+        self.assertEqual(decision('git > /dev/null add -A'), 'deny')
+        for command in ('git add -A named.py > /dev/null', 'git add -u named.py 2>/dev/null',
+                        "git add -A '>'", "git add -A '&>'", 'git > /dev/null add -A named.py'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+
+    def test_filesystem_question_marks_keep_their_wildcard_meaning(self):
+        local = make_local(dict(TEST_CONFIG, protected_dirs=['/srv/production-lake']))
+        self.addCleanup(shutil.rmtree, local, True)
+        for command in ('rm -rf /srv/production-lak?/dist',
+                        'cp input /srv/production-lak?/records.csv',
+                        'cp -t /srv/production-lak? input'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command, local=local), 'deny')
+        for command in ('cp input /srv/ordinary-lak?/records.csv',
+                        'sqlite3 "file:/srv/production-lake/x.db?mode=ro" "select 1"'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command, local=local))
 
 
 class ProvenPathFields(unittest.TestCase):

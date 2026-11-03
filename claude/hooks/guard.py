@@ -88,7 +88,8 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'status', 'stripspace', 'submodule', 'subtree', 'switch', 'symbolic-ref', 'tag', 'update-index', 'update-ref',
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(), 'pipe': [], 'sep': ';', 'plain': False,
+STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(),
+         'pipe': [], 'sep': ';', 'plain': False, 'deferred_body': False,
          'raw': [], 'moved': False, 'envcfg': [], 'inherit': [], 'penv': {}, 'pinherit': {}, 'xargs': False,
          'marks': {'active': set(), 'unquoted': set(), 'braced': set()}}  # cwd None = unknown; raw = the command's tokens before $VAR expansion
 TRASH = common.kit_cmd('bin/trash.py')
@@ -188,7 +189,14 @@ class Protected:
         found = {token}
         if '=' in token:
             found.add(token.split('=', 1)[1])
-        return [c for c in (re.sub(r'^file:(//)?', '', f).split('?', 1)[0] for f in found) if c]
+        candidates = []
+        for value in found:
+            if value.startswith('file:') or re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', value):
+                value = value.split('?', 1)[0]
+            value = re.sub(r'^file:(//)?', '', value)
+            if value:
+                candidates.append(value)
+        return candidates
 
     @staticmethod
     def _absolute(c, literal=False):
@@ -441,6 +449,7 @@ class ShellToken(str):
     assignment = None
     expansion_sites = None
     unquoted_expansion = None
+    unquoted_pattern = False
 
 
 
@@ -543,6 +552,7 @@ def note_quoting(text, tokens, record_marks=True):
         token.assignment = assignment
         token.expansion_sites = frozenset(sites)
         token.unquoted_expansion = unquoted
+        token.unquoted_pattern = bool(GLOB.search(bare) or ('{' in bare and (',' in bare or '..' in bare)))
         if not record_marks:
             continue
         if active:
@@ -567,7 +577,7 @@ def simple_commands(tokens):
         yield cmd
 
 
-def split_commands(tokens):
+def _split_commands(tokens):
     """[(kind, tokens, separator before, separator after)]; kind is 'cmd', or 'open'/'close' for a ( ) group."""
     events, cmd, prev = [], [], ';'
 
@@ -598,6 +608,48 @@ def split_commands(tokens):
     return events
 
 
+def split_commands(tokens):
+    """Keep function bodies deferred instead of flattening their commands into the defining shell."""
+    words = []
+    for token in tokens:
+        if getattr(token, 'quoted', False) is not True and token and all(c in ';&|()' for c in token):
+            words.extend(ShellToken(part) for part in SEP_PART.findall(token))
+        else:
+            words.append(token)
+    events, start, i = [], 0, 0
+    while i < len(words):
+        j = i + 1 if shell_keyword(words[i], {'function'}) else i
+        if j >= len(words) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', words[j]):
+            i += 1
+            continue
+        j += 1
+        parentheses = (words[j:j + 2] == ['(', ')']
+                       and all(getattr(w, 'quoted', False) is not True for w in words[j:j + 2]))
+        if parentheses:
+            j += 2
+        while j < len(words) and words[j] == ';':  # a newline may precede the body
+            j += 1
+        if (j >= len(words) or words[j] not in ('{', '(') or getattr(words[j], 'quoted', False) is True
+                or (not parentheses and not shell_keyword(words[i], {'function'}))):
+            i += 1
+            continue
+        opening, closing, level, end = words[j], '}' if words[j] == '{' else ')', 1, j + 1
+        while end < len(words) and level:
+            if getattr(words[end], 'quoted', False) is not True:
+                if words[end] == opening:
+                    level += 1
+                elif words[end] == closing:
+                    level -= 1
+            end += 1
+        if level:
+            return [('uncertain', [], ';', ';')]
+        events.extend(_split_commands(words[start:i]))
+        events.append(('function', words[j + 1:end - 1], ';', ';'))
+        start, i = end, end
+    events.extend(_split_commands(words[start:]))
+    return events
+
+
 def wrapper_value_flag(head, flag, values):
     if flag in values:
         return True
@@ -607,24 +659,51 @@ def wrapper_value_flag(head, flag, values):
     return False
 
 
-def strip_prefix(toks, assignments=None):
+def strip_reserved_time(toks, uncertain=None):
+    """Only lexical time at the command-keyword position can run a builtin in this shell."""
+    toks = list(toks)
+    while toks and shell_keyword(toks[0], {'time'}):
+        option = toks[1:2]
+        if option and option[0].startswith('-') and not (option == ['-p'] and getattr(option[0], 'quoted', None) is False):
+            break
+        toks.pop(0)
+        if uncertain is not None:
+            uncertain.append(True)  # timed assignments and nested time differ between supported shells
+        if toks and toks[0] == '-p' and getattr(toks[0], 'quoted', None) is False:
+            toks.pop(0)
+    return toks
+
+
+def strip_prefix(toks, assignments=None, wrappers=None, uncertain=None):
     """Drop VAR=value assignments, shell keywords (then, do, ...) and wrappers such as env, sudo, time, nohup, timeout."""
     toks = list(toks)
-    env_assignments = False
+    env_assignments, keyword_position = False, True
     while toks:
+        timed = strip_reserved_time(toks, uncertain) if keyword_position else toks
+        if len(timed) != len(toks):
+            toks = timed
+            continue
         head = os.path.basename(toks[0])
         if shell_assignment(toks[0]) or (env_assignments and ASSIGN.match(toks[0])):
             if assignments is not None:
                 assignments.append(toks[0])
+            keyword_position = False
             toks.pop(0)
         elif shell_keyword(toks[0]):
             toks.pop(0)
         elif head in WRAPPERS:
+            if head == 'command' and uncertain is not None:
+                uncertain.append(True)  # command can suppress builtins in zsh while Bash still executes them
+            keyword_position = False
+            if wrappers is not None:
+                wrappers.append((toks[0], []))
             env_assignments = head in ('env', 'sudo')  # these commands parse quoted NAME=value arguments themselves
             toks.pop(0)
             values = WRAPPER_VALUE.get(head, ())
             while toks and toks[0].startswith('-'):
                 flag = toks.pop(0)
+                if wrappers is not None:
+                    wrappers[-1][1].append(flag)
                 if flag == '--':
                     break
                 if wrapper_value_flag(head, flag, values) and toks:
@@ -714,13 +793,21 @@ def flag_parts(args, value_opts=(), value_letters=''):
 
 def split_redirects(args):
     """(operands, [(operator, target)]) with redirections such as < file, <<EOF markers and <<< string taken out."""
+    operators = {'<', '>', '>>', '>|', '&>', '&>>', '<>', '<<', '<<-', '<<<', '>&', '<&'}
+
+    def syntax(word):
+        return getattr(getattr(word, 'source_operand', word), 'quoted', False) is not True
+
+    def operator(word):
+        return word in operators and syntax(word)
+
     plain, redirs, k = [], [], 0
     while k < len(args):
         a = args[k]
-        if re.match(r'^[<>&]+$', a) and not a.startswith('&'):
+        if operator(a):
             redirs.append((a, args[k + 1] if k + 1 < len(args) else ''))
             k += 2
-        elif a.isdigit() and k + 1 < len(args) and re.match(r'^[<>]+&?$', args[k + 1]):
+        elif a.isdigit() and syntax(a) and k + 1 < len(args) and operator(args[k + 1]):
             k += 1  # the 2 of 2>/dev/null
         else:
             plain.append(a)
@@ -1011,7 +1098,7 @@ def reads_only(prog, args):
                 if method.upper() not in ('GET', 'HEAD'):
                     return False
     else:  # httpie and xh: an optional method word, then items; key=value, key:=json and key@file make a body
-        method = next((a for a in args if a in HTTP_WORDS), '')
+        method = next((a.upper() for a in args if a.upper() in HTTP_WORDS), '')
         body = any(re.match(r'^[^-][^=:@]*(=(?!=)|:=|@)', a) for a in args if '://' not in a)
     method = method.upper()
     if method:
@@ -1463,6 +1550,8 @@ def raw_words(args, rest, ref):
 
 
 def git_decision(args):
+    args, _ = split_redirects(args)
+    STATE['raw'], _ = split_redirects(STATE['raw'])
     head = git_head(args)
     if not head:
         return None
@@ -1926,6 +2015,63 @@ def feeds_env(cmd):
     return any(env_hint(t) for t in names) or any(pattern_env(q) for q in patterns)
 
 
+def structured_reads_env(prog, args, file_operand):
+    """jq filters and option values are not filenames; yq's automatic filename detection stays conservative."""
+    expression, values_only, literal, k = False, False, False, 0
+    value_flags = {'--indent', '--width', '-w', '-I', '-p', '-o', '--input-format', '--output-format',
+                   '--front-matter', '--yaml-output-grammar-version', '--yml-out-ver'}
+    file_flags = {'-f', '--from-file', '-L', '--library-path', '--split-exp-file', '--run-tests'}
+    while k < len(args):
+        a = args[k]
+        flag, eq, attached = a.partition('=')
+        if not literal and a == '--':
+            literal = True
+        elif not literal and flag in ('--arg', '--argjson'):
+            k += 2  # name and literal value
+        elif not literal and flag in ('--rawfile', '--slurpfile', '--argfile'):
+            if k + 2 < len(args) and file_operand(k + 2, args[k + 2]):
+                return True
+            k += 2  # name and filename
+        elif not literal and flag in file_flags:
+            index = k if eq else k + 1
+            value = attached if eq else (args[index] if index < len(args) else '')
+            if value and file_operand(index, value):
+                return True
+            expression = expression or flag in ('-f', '--from-file', '--run-tests')
+            k += not eq
+        elif not literal and flag == '--expression' and prog == 'yq':
+            expression = True
+            k += not eq
+        elif not literal and flag in value_flags:
+            k += not eq
+        elif not literal and a in ('--args', '--jsonargs'):
+            values_only = True
+        elif not literal and a.startswith('-') and a != '-':
+            if not a.startswith('--'):
+                at = next((n for n, ch in enumerate(a[1:], 1) if ch in 'fL'), None)
+                if at is not None:
+                    value = a[at + 1:]
+                    index = k if value else k + 1
+                    value = value or (args[index] if index < len(args) else '')
+                    if value and file_operand(index, value):
+                        return True
+                    expression = expression or a[at] == 'f'
+                    k += index != k
+        elif prog == 'yq' and not expression and a in ('eval', 'e', 'eval-all', 'ea'):
+            pass
+        elif not expression:
+            # Go yq treats an existing first operand as a file, unlike jq/Python yq. Use --expression for an
+            # ambiguous filter such as .env so it cannot become an env-file read when that file exists.
+            if prog == 'yq' and file_operand(k, a):
+                return True
+            expression = True
+        elif not values_only and file_operand(k, a):
+            return True
+        k += 1
+    return False
+
+
+
 def reads_env(prog, args):
     """True when a reader program is given an env file (or a glob matching one) to read."""
     if prog == 'sed' and any(a == '--in-place' or a.startswith('--in-place=') or
@@ -1939,6 +2085,12 @@ def reads_env(prog, args):
         raw = raw_args[index] if index < len(raw_args) else value
         return env_hit(value) or unresolved_path(value, raw)
 
+    if prog in ('jq', 'yq'):
+        if any(unresolved_path(value, raw) or getattr(raw, 'unquoted_pattern', False)
+               for value, raw in zip(args, raw_args)):
+            return True  # skipped filter/option words must not expand into extra flags or filenames
+        return structured_reads_env(prog, args, file_operand)
+
     k = 0
     while k < len(args):
         a = args[k]
@@ -1947,7 +2099,7 @@ def reads_env(prog, args):
             if file_operand(k, args[k]):
                 return True
             k += 1
-        elif a in PATTERN_OPTS | SEARCH_VALUE and k < len(args):
+        elif prog in PATTERN_FIRST and a in PATTERN_OPTS | SEARCH_VALUE and k < len(args):
             k += 1  # a search pattern, script or context count is not a file operand
         elif a.startswith('-') and a != '-':
             if a.startswith('--') and '=' in a:
@@ -2131,10 +2283,21 @@ def nested(run, *args):
         STATE['inherit'], STATE['pinherit'] = saved
 
 
+def external_scope(toks):
+    wrappers = []
+    head = strip_prefix(toks, wrappers=wrappers)
+    transparent = lambda w, flags: (w == 'builtin' and all(f == '--' for f in flags)
+                                    or w == 'command' and all(f == '--' or re.fullmatch(r'-p+', f) for f in flags))
+    return any(not transparent(w, flags) for w, flags in wrappers) or bool(head and '/' in head[0])
+
+
+UNKNOWN_BUILTIN_TARGET = object()
+
+
 def builtin_assignments(toks):
     """Variables assigned from builtin output are unknown, even when their preceding values were literal paths."""
     head = strip_prefix(toks)
-    if not head:
+    if not head or external_scope(toks):
         return set()
     prog, args = os.path.basename(head[0]), head[1:]
     names = []
@@ -2165,7 +2328,7 @@ def builtin_assignments(toks):
     for name in names:
         name = expand(name).split('[', 1)[0].split('?', 1)[0]
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
-            return set(STATE['vars'])  # an indirect or unreadable destination can replace any known variable
+            return {UNKNOWN_BUILTIN_TARGET}  # an unreadable destination can also replace variables created later
         out.add(name)
     return out
 
@@ -2188,7 +2351,18 @@ def set_variable(name, value, unknown):
 
 
 
-def analyze(toks, depth, raw=None):
+def analyze(toks, depth, raw=None, mutations=None):
+    if not external_scope(toks):
+        return analyze_command(toks, depth, raw, mutations)
+    saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']))
+    try:
+        return analyze_command(toks, depth, raw)
+    finally:
+        STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = saved
+
+
+def analyze_command(toks, depth, raw=None, mutations=None):
+    toks = strip_reserved_time(toks)
     assigns = [t for t in toks if shell_assignment(t)]
     if assigns and len(assigns) == len(toks):
         for t in assigns:
@@ -2201,9 +2375,14 @@ def analyze(toks, depth, raw=None):
     if split is not None:
         return nested(sub_script, split, depth + 1) if depth < MAX_DEPTH else ('deny', MSG['deep'])
     stripped = strip_prefix(toks)
+    if STATE['deferred_body'] and stripped and unknown_expansion(stripped[0]):
+        return 'deny', MSG['deep']
     STATE['raw'] = (toks if raw is None else raw)[len(toks) - len(stripped):]  # index-aligned with toks, before expansion
+    assigned = builtin_assignments(toks)  # keep external-wrapper provenance when classifying parent builtin writes
     toks = [operand_value(expand(t), t) for t in stripped]
-    for name in builtin_assignments(stripped):
+    if UNKNOWN_BUILTIN_TARGET in assigned:
+        return 'deny', MSG['deep']
+    for name in assigned:
         invalidate_variable(name)
     if not toks:
         return None
@@ -2212,6 +2391,8 @@ def analyze(toks, depth, raw=None):
             return 'deny', MSG['lake']
     if toks[0] in ('export', 'declare', 'typeset', 'local', 'readonly'):
         unknown_inputs = [unknown_expansion(t) for t in stripped]  # every argument expanded before this builtin ran
+        if any(unknown_inputs[i] and not ASSIGN.match(t) for i, t in enumerate(stripped[1:], 1)):
+            return 'deny', MSG['deep']  # an opaque selector can become any variable name or NAME=value assignment
         short, longs, named = flag_parts(toks[1:])
         safe_flags = {'export': {'n'}, 'readonly': set(), 'declare': {'r', 'x'}, 'typeset': {'r', 'x'}}
         scalar = (toks[0] in safe_flags and not longs and short <= safe_flags[toks[0]]
@@ -2240,7 +2421,7 @@ def analyze(toks, depth, raw=None):
     if prog in SHELLS:
         return nested(shell_decision, args, depth)
     if prog == 'eval':
-        return nested(check_script, ' '.join(args), depth + 1)
+        return nested(check_script, ' '.join(args), depth + 1, mutations)
     if prog == 'xargs':
         k, files = 0, []
         while k < len(args) and args[k].startswith('-'):
@@ -2261,10 +2442,12 @@ def analyze(toks, depth, raw=None):
         if k < len(args) and re.search(r'[$`]', args[k]):
             return 'deny', MSG['deep']  # the program xargs runs is not known
         saved, STATE['xargs'] = STATE['xargs'], True
+        shell_state = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']))
         try:
             return nested(analyze, args[k:], depth + 1, STATE['raw'][1 + k:]) if depth < MAX_DEPTH else ('deny', MSG['deep'])
         finally:
             STATE['xargs'] = saved
+            STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = shell_state
     if prog == 'git':
         return git_decision(args)
     if prog == 'gh':
@@ -2433,10 +2616,10 @@ def heredoc_substitutions(norm):
     return out
 
 
-def check_tokens(tokens, depth):
+def check_tokens(tokens, depth, deferred=False, mutations=None):
     """Judge each simple command in order, first decision wins. ( ) groups, pipeline stages and background jobs run in a
     child shell, so a cd or assignment there is undone afterwards."""
-    stack, pipe, scopes = [], [], []
+    stack, pipe, scopes = [], [], ['function'] if deferred else []
     control = KEYWORDS | {'for', 'select', 'case', 'fi', 'done', 'esac'}
     uncertain_scope = any((t in control and getattr(t, 'quoted', None) is None)
                           or (ASSIGN.match(t) and getattr(t, 'assignment', None) is None) for t in tokens)
@@ -2452,7 +2635,32 @@ def check_tokens(tokens, depth):
                 for name in cond_vars:
                     invalidate_variable(name)
                 cond_vars.clear()
-            if kind == 'open':
+            if kind == 'uncertain':
+                return 'deny', MSG['deep']
+            if kind == 'function':
+                saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']))
+                writes = set()
+                was_deferred, STATE['deferred_body'] = STATE['deferred_body'], True
+                STATE['cwd'], STATE['vars'], STATE['restricted'] = None, {}, set()
+                STATE['unknown'] = set(os.environ) | set(saved[1]) | saved[3]  # caller state can change before a later call
+                try:
+                    decision = check_tokens(cmd, depth + 1, deferred=True, mutations=writes) if depth < MAX_DEPTH else ('deny', MSG['deep'])
+                    names = writes - {None}
+                    moved = None in writes
+                finally:
+                    STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = saved
+                    STATE['deferred_body'] = was_deferred
+                if decision:
+                    return decision
+                for name in names:
+                    invalidate_variable(name)
+                STATE['restricted'].update(names)  # a later call can still mutate these names after another assignment
+                if mutations is not None:
+                    mutations.update(names)
+                if moved:
+                    return 'deny', MSG['deep']  # later calls can move again, even after an intervening explicit cd
+                pipe = []
+            elif kind == 'open':
                 stack.append((STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), list(scopes)))
                 pipe = []
             elif kind == 'close':
@@ -2483,12 +2691,16 @@ def check_tokens(tokens, depth):
                             scopes.pop()
                     elif word not in ('then', 'do', 'else', 'elif'):
                         break
-                head = strip_prefix(cmd)
-                moves = bool(head) and os.path.basename(head[0]) in ('cd', 'pushd', 'popd')
-                assigned = cmd[:]
+                ambiguous = []
+                head = strip_prefix(cmd, uncertain=ambiguous)
+                external = external_scope(cmd)
+                moves = not external and bool(head) and os.path.basename(head[0]) in ('cd', 'pushd', 'popd')
+                assigned = strip_reserved_time(cmd)
                 while assigned and shell_keyword(assigned[0]):
                     assigned.pop(0)
-                if head and head[0] in ('export', 'declare', 'typeset', 'local', 'readonly'):
+                if external:
+                    assigned = []
+                elif head and head[0] in ('export', 'declare', 'typeset', 'local', 'readonly'):
                     assigned = head[1:]
                 elif not all(shell_assignment(t) for t in assigned):
                     assigned = []  # command-prefix variables do not persist in the shell
@@ -2497,7 +2709,7 @@ def check_tokens(tokens, depth):
                 old_restricted = set(STATE['restricted'])
                 old_unknown = set(STATE['unknown'])
                 try:
-                    decision = analyze(cmd, depth)
+                    decision = analyze(cmd, depth, mutations=mutations)
                     names.update(k for k in set(old_vars) | set(STATE['vars'])
                                  if k not in old_vars or k not in STATE['vars'] or old_vars[k] != STATE['vars'][k])
                     moved = moves or STATE['cwd'] != old_cwd
@@ -2510,6 +2722,15 @@ def check_tokens(tokens, depth):
                         STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = saved
                 if decision:
                     return decision
+                if mutations is not None and not saved:
+                    mutations.update(names)
+                    if moved:
+                        mutations.add(None)  # cwd mutation intent matters even when unknown remains unknown
+                if ambiguous and not external and not saved:
+                    for name in names:
+                        invalidate_variable(name)
+                    if moved:
+                        STATE['cwd'] = None
                 if moved and before in PIPES and after not in PIPES:
                     STATE['cwd'] = None  # zsh (and bash with lastpipe) run the last stage in this shell: its cd may stick
                 elif moved and not saved and (scoped or before in ('&&', '||') or (cmd and shell_keyword(cmd[0]))):
@@ -2555,7 +2776,7 @@ def scan_moves(norm, depth=0):
         scan_moves(text, depth + 1)
 
 
-def check_script(text, depth=0):
+def check_script(text, depth=0, mutations=None):
     if depth > MAX_DEPTH:
         return 'deny', MSG['deep']
     if depth == 0:
@@ -2567,7 +2788,7 @@ def check_script(text, depth=0):
         scan_moves(norm)
         tokens = tokens_of(norm)
         note_quoting(norm, tokens)
-        decision = check_tokens(tokens, depth)
+        decision = check_tokens(tokens, depth, mutations=mutations)
         if decision:
             return decision
         for inner in substitutions(norm) + heredoc_substitutions(norm):

@@ -257,9 +257,18 @@ def test_count(text):
     return max(counts, default=0)
 
 
+def checkout_root():
+    root = sh(['git', 'rev-parse', '--show-toplevel'], timeout=60)
+    path = root.stdout.strip()
+    if root.returncode or not os.path.isabs(path) or not os.path.isdir(path):
+        raise ValueError('could not resolve the Git checkout root for the full tests')
+    return path
+
+
 def run_tests(command, slug):
+    root = checkout_root()
     env = dict(os.environ)
-    out = sh(command, timeout=1800, stdin=subprocess.DEVNULL, env=env)
+    out = sh(command, timeout=1800, stdin=subprocess.DEVNULL, env=env, cwd=root)
     text = out.stdout + out.stderr
     print(text)
     count = test_count(text)

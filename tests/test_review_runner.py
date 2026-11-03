@@ -179,6 +179,41 @@ class ClaudeWrapper(unittest.TestCase):
 
 
 class TestExecution(unittest.TestCase):
+    def test_subdirectory_invocation_runs_the_full_checkout_suite(self):
+        for slug in ('acme/kit', 'owner/another-repo'):
+            with self.subTest(slug=slug), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                subprocess.run(['git', 'init', '-q', str(root)], check=True)
+                package = root / 'package'
+                package.mkdir()
+                (package / '__init__.py').write_text('')
+                (package / 'test_package.py').write_text(
+                    'import unittest\nclass Package(unittest.TestCase):\n def test_pass(self): pass\n')
+                (root / 'test_root.py').write_text(
+                    'import unittest\nclass Root(unittest.TestCase):\n'
+                    ' def test_fail(self): self.fail("root failure must prevent fallback")\n')
+                previous = os.getcwd()
+                try:
+                    os.chdir(package)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        result = runner.run_tests([sys.executable, '-m', 'unittest', 'discover'], slug)
+                finally:
+                    os.chdir(previous)
+                self.assertEqual(result['status'], 'FAIL')
+                self.assertEqual(result['exit_code'], 1)
+                self.assertEqual(result['count'], 0)
+
+    def test_tests_without_a_git_checkout_cannot_supply_fallback_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = os.getcwd()
+            try:
+                os.chdir(tmp)
+                with self.assertRaisesRegex(ValueError, 'checkout root'), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    runner.run_tests([sys.executable, '-c', 'print("1 passed")'], 'owner/another-repo')
+            finally:
+                os.chdir(previous)
+
     def test_real_test_command_supplies_positive_count_and_actual_exit(self):
         command = [sys.executable, '-c',
                    'import unittest; suite=unittest.TestSuite([unittest.FunctionTestCase(lambda: None)]); '
@@ -189,7 +224,8 @@ class TestExecution(unittest.TestCase):
 
     def test_failed_and_empty_suites_cannot_supply_passing_evidence(self):
         for code, text in ((1, 'Ran 3 tests in 0.01s\nFAILED'), (0, 'Ran 0 tests in 0.00s\nOK'), (0, 'no tests found')):
-            with self.subTest(text=text), patch.object(runner, 'sh', return_value=completed(code, text)), \
+            with self.subTest(text=text), patch.object(runner, 'checkout_root', return_value=str(CORE)), \
+                    patch.object(runner, 'sh', return_value=completed(code, text)), \
                     contextlib.redirect_stdout(io.StringIO()):
                 result = runner.run_tests(CMD, 'acme/kit')
                 self.assertEqual(result['status'], 'FAIL')
@@ -226,10 +262,12 @@ class TestExecution(unittest.TestCase):
                 self.assertGreater(runner.test_count(text), 0)
 
     def test_tests_keep_the_kit_source_environment(self):
-        with patch.object(runner, 'sh', return_value=completed(0, 'Ran 2 tests in 1s')) as call, \
+        with patch.object(runner, 'checkout_root', return_value='/checkout/root'), \
+                patch.object(runner, 'sh', return_value=completed(0, 'Ran 2 tests in 1s')) as call, \
                 contextlib.redirect_stdout(io.StringIO()):
             runner.run_tests(CMD, 'acme/kit')
         self.assertEqual(call.call_args.kwargs['env'].get('AGENT_CORE_DIR'), os.environ.get('AGENT_CORE_DIR'))
+        self.assertEqual(call.call_args.kwargs['cwd'], '/checkout/root')
         self.assertEqual(call.call_args.args[0], CMD)
         self.assertNotIn('shell', call.call_args.kwargs)
 
