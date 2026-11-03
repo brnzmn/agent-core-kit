@@ -124,10 +124,12 @@ class RoutineCommandsPass(unittest.TestCase):
         self.check(['rm -rf node_modules package-lock.json && npm install', 'rm -rf node_modules pnpm-lock.yaml && pnpm install',
                     'rm -rf package-lock.json'], None, cwd=self.cwd)
         self.check(['rm -rf src', 'rm -rf node_modules src', 'rm -rf package-lock.json src', 'rm -rf srclink',
-                    'rm -rf srclink/', 'rm -rf package-lock.json missing-dir', 'rm -rf $X/package-lock.json',
-                    'rm -rf dist *.tsbuildinfo', 'rm -rf *.tsbuildinfo', 'rm -rf [^n]*', 'rm -rf lake-*/x.csv',
+                    'rm -rf srclink/', 'rm -rf package-lock.json missing-dir',
+                    'rm -rf dist *.tsbuildinfo', 'rm -rf *.tsbuildinfo', 'rm -rf [^n]*',
                     'rm -rf package-lock.js?n', 'rm -rf package-lock.json{,}', 'rm -rf ~/package-lock.json'],
                    'deny', cwd=self.cwd, key='rm', tail=' && true')
+        self.check(['rm -rf lake-*/x.csv'], 'deny', cwd=self.cwd, key='lake', tail=' && true')
+        self.check(['rm -rf $X/package-lock.json'], 'deny', cwd=self.cwd, key='lake', tail=' && true')
         self.check(['rm -rf *'], 'deny', cwd=self.cwd, key='rm_cwd', tail=' && true')
 
     def test_a_file_check_holds_only_for_a_first_rm_with_nothing_beside_it(self):
@@ -179,12 +181,12 @@ class RoutineCommandsPass(unittest.TestCase):
                     'rg -l -g ".env*" KEY | xargs cat', 'ls -a | git grep -l "^.env" | xargs cat',
                     'grep -l --regexp=.env src | xargs cat'], 'deny', key='env')
 
-    def test_build_folders_go_by_name_when_the_folder_is_unknown_and_nothing_is_protected(self):
+    def test_unknown_build_folders_cannot_skip_file_and_database_inspection(self):
         local = make_local(config={'user_name': 'Alex', 'protected_dirs': []})
         for cmd in ('cd "$(git rev-parse --show-toplevel)" && rm -rf dist', 'cd $REPO && rm -rf node_modules',
                     'cd $REPO && rm -rf packages/web/.next', 'cd $REPO && rm -rf dist .turbo'):
             with self.subTest(cmd=cmd):
-                self.assertIsNone(bash(cmd, cwd=REPO, local=local)[0])
+                self.assertEqual(bash(cmd, cwd=REPO, local=local)[0], 'deny')
         for cmd in ('cd $REPO && rm -rf src', 'cd $REPO && rm -rf .', 'cd $REPO && rm -rf ..', 'cd $REPO && rm -rf ../dist',
                     'cd $REPO && rm -rf dist/..', 'cd $REPO && rm -rf *', 'rm -rf $d/dist', 'rm -rf "$d/dist"',
                     'for d in "src docs"; do rm -rf $d/dist; done', 'for d in packages/*; do rm -rf "$d/dist"; done',
@@ -431,7 +433,8 @@ class Supabase(unittest.TestCase):
 class GatedModels(unittest.TestCase):
     def test_gated_model_and_advisor_ask_the_user(self):
         for name in ('Agent', 'Task'):
-            for inp in ({'subagent_type': 'advisor', 'prompt': 'x'}, {'subagent_type': 'worker', 'model': 'fable'},
+            for inp in ({'subagent_type': 'advisor', 'prompt': 'x'}, {'subagent_type': 'fable-advisor', 'prompt': 'x'},
+                        {'subagent_type': 'worker', 'model': 'fable'},
                         {'subagent_type': 'worker', 'model': 'claude-Fable-5-1'}, {'model': 'fable', 'prompt': 'x'}):
                 with self.subTest(tool=name, input=inp):
                     decision, out = tool(name, inp)

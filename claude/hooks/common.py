@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -69,7 +70,7 @@ DEFAULTS = {
     'permission_mode': '',
     'auto_mode_environment': [],
     'pr_gate': {'enabled': True, 'branches': ['main', 'master', 'production'], 'repos': '*', 'reviewers': [],
-                'trust_codex_bot': False},
+                'trust_codex_bot': False, 'allow_single_on_unavailable': False, 'test_commands': {}},
     'routing': {'claude_week_limit_pct': 80},
     'codex': {'models': {}, 'pin_memories_off': False},
 }
@@ -83,10 +84,8 @@ def tilde(path):
 
 
 def kit_cmd(rel, interpreter=None):
-    """A printable command for a kit script, e.g. kit_cmd('bin/trash.py') -> 'python3 ~/agent-core-kit/bin/trash.py'."""
-    path = tilde(os.path.join(CORE, rel))
-    if any(c in path for c in ' \t\'"$`'):
-        path = '"%s"' % os.path.join(CORE, rel).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+    """A shell command whose absolute kit script path is always one literal argument."""
+    path = shlex.quote(os.path.abspath(os.path.expanduser(os.path.join(CORE, rel))))
     if interpreter is None:
         interpreter = 'python3' if rel.endswith('.py') else ('bash' if rel.endswith('.sh') else '')
     return (interpreter + ' ' + path).strip()
@@ -106,6 +105,15 @@ def config(reload=False):
     for key, value in (mine.items() if isinstance(mine, dict) else []):
         if key.startswith('_'):
             continue
+        if key == 'protected_dirs' and isinstance(value, list):
+            # A malformed sibling must not erase paths the user explicitly protected.
+            value = [entry for entry in value if isinstance(entry, str) and entry.strip()]
+        if key in DEFAULTS and not _fits(key, value):
+            continue  # a malformed setting keeps its default instead of crashing or switching off a guard
+        if key == 'pr_gate':
+            value = {k: v for k, v in value.items()
+                     if k not in DEFAULTS[key] or (k == 'repos' and isinstance(v, (str, list)))
+                     or _fits_default(DEFAULTS[key][k], v)}
         if isinstance(out.get(key), dict) and isinstance(value, dict):
             out[key] = dict(out[key], **value)
         else:
@@ -114,8 +122,38 @@ def config(reload=False):
     return out
 
 
+def _fits(key, value):
+    """Known config keys keep their default on a type error; list-valued guard settings also accept one string."""
+    if key == 'protected_supabase':
+        return isinstance(value, dict) or _fits_default([], value)
+    return _fits_default(DEFAULTS[key], value)
+
+
+def _fits_default(default, value):
+    """Only a boolean false disables a policy switch; malformed nested values retain safe defaults."""
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(default, list):
+        return (isinstance(value, str) and bool(value.strip()) or isinstance(value, list)
+                and all(isinstance(member, str) and bool(member.strip()) for member in value))
+    return isinstance(value, type(default))
+
+
 def user():
-    return (config().get('user_name') or '').strip() or 'the user'
+    return str(config().get('user_name') or '').strip() or 'the user'
+
+
+def review_test_command(slug):
+    """Configured full-suite argv for a repo. Missing or malformed configuration cannot supply test evidence."""
+    gate = config().get('pr_gate') or {}
+    commands = gate.get('test_commands')
+    normalized = {key.lower(): value for key, value in commands.items() if isinstance(key, str)} if isinstance(commands, dict) else {}
+    command = normalized.get(slug.lower())
+    if isinstance(command, list) and command and all(isinstance(a, str) and a.strip() and '\x00' not in a for a in command):
+        return command[:]
+    return None
 
 
 def protected_re():

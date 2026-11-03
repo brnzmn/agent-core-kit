@@ -15,8 +15,11 @@ NEUTRAL = 'Please add a unit test for the date parser and run the suite.'
 
 def capture(payload, local, env=None):
     """The finished process; the hook is run with AGENT_CORE_LOCAL pointing at the throwaway folder."""
+    full_env = env_for(local)
+    full_env['AGENT_CORE_TOOL'] = 'claude'
+    full_env.update(env or {})
     return subprocess.run([sys.executable, os.path.join(HOOKS, 'capture.py')], input=json.dumps(payload),
-                          capture_output=True, text=True, env=dict(env_for(local), **(env or {})), timeout=20)
+                          capture_output=True, text=True, env=full_env, timeout=20)
 
 
 def inbox(local):
