@@ -45,7 +45,7 @@ WRAPPER_VALUE = {'sudo': {'-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', 
                  'env': {'-u', '-C', '-S'}, 'nice': {'-n'}, 'timeout': {'-s', '-k'}, 'caffeinate': {'-t', '-w'},
                  'exec': {'-a'}}
 KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until'}  # a command can follow these on the same line
-SHELL_WHITESPACE = ' \t\r\n'  # shlex's shell whitespace, not Python's wider Unicode whitespace category
+SHELL_WHITESPACE = ' \t\n'  # shell word separators: CR and Unicode spaces remain literal word characters
 SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
 READERS = {'cat', 'less', 'more', 'head', 'tail', 'bat', 'nl', 'open', 'strings', 'xxd', 'od', 'tac',
            'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'awk', 'gawk', 'mawk', 'sed', 'source', '.',

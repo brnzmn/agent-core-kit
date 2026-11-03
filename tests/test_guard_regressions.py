@@ -157,6 +157,13 @@ class XargsReplacementStaging(unittest.TestCase):
 
 
 class PersistentShellAssignments(unittest.TestCase):
+    def test_carriage_return_does_not_end_a_shell_word(self):
+        for body in ('if false; then fi\r; D=/tmp; fi;', 'while false; do done\r; D=/tmp; done;'):
+            command = 'D=/srv/lake-data; ' + body + ' rm -rf "$D/raw"'
+            with self.subTest(body=body):
+                self.assertEqual(decision(command), 'deny')
+        self.assertIsNone(decision('echo word\r; git status --short'))
+
     def test_shell_whitespace_is_not_unicode_whitespace(self):
         for cmd in ('echo \u00a0; if true; then rm -rf /srv/lake-data/raw; fi',
                     'echo \u00a0; X=1 git push --force origin main'):
