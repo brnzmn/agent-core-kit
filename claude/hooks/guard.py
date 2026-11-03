@@ -22,7 +22,7 @@ one real passing review plus passing tests on the same head when config pr_gate 
 The one decision that is not a deny: spawning a subagent on a model listed in config gated_models (and the advisor
 agent) returns "ask", so Claude Code prompts the user; that prompt also appears in bypass mode.
 Prints a decision as JSON, or nothing to let the call through.
-Its own errors never block a call; they go to learning/hook-errors.log.
+Its own errors deny the call and go to learning/hook-errors.log.
 """
 import fnmatch
 import glob
@@ -41,6 +41,7 @@ import common  # noqa: E402
 START = time.monotonic()
 MAX_CHARS = 200000
 MAX_DEPTH = 8  # nested bash -c, eval, xargs and substitutions; deeper than this is refused rather than skipped
+MAX_SUBSTITUTIONS = 256  # bound total repeated analysis below the hook deadline
 WRAPPERS = {'sudo', 'doas', 'env', 'time', 'nice', 'nohup', 'command', 'exec', 'builtin', 'caffeinate', 'timeout'}
 WRAPPER_VALUE = {'sudo': {'-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', '-r', '-t'}, 'doas': {'-u', '-C'},
                  'env': {'-u', '-C', '-S'}, 'nice': {'-n'}, 'timeout': {'-s', '-k'}, 'caffeinate': {'-t', '-w'},
@@ -176,14 +177,14 @@ class Protected:
             full = os.path.expanduser(d)
             if os.path.isabs(full):
                 q = os.path.normpath(full)
-                paths.update({_fold(q), _fold(os.path.realpath(q))})
+                paths.update({_fold(q), _fold(os.path.realpath(full))})
             else:
                 names.add(os.path.normpath(d))
         self.paths = sorted(paths)
         self.names = [_fold(name).split(os.sep) for name in sorted(names)]
         self.tails = sorted({'/' + '/'.join(q.split('/')[-3:]) + '/' for q in self.paths})
         body = '|'.join(re.escape(n) for n in sorted(names))
-        self.name_re = re.compile(r'(^|[/=:])(' + body + r')(/|$)') if names else None
+        self.name_re = re.compile(r'(^|[/=:])(' + body + r')(/|$)', re.I if sys.platform == 'darwin' else 0) if names else None
         self.backup_re = re.compile(r'(^|[/=:])(' + body + r')/backups/') if names else None
 
     @staticmethod
@@ -268,7 +269,10 @@ class Protected:
                         return True
                 continue
             norm = os.path.normpath(full)
-            for p in {_fold(norm), _fold(os.path.realpath(norm))}:
+            for p in {_fold(norm), _fold(os.path.realpath(full))}:
+                parts = p.split(os.sep)
+                if any(parts[start:start + len(name)] == name for name in self.names for start in range(len(parts))):
+                    return True
                 for q in self.paths:
                     if _inside(p, q) or (ancestor and _inside(q, p)):
                         return True
@@ -483,6 +487,7 @@ class ShellToken(str):
     unquoted_pattern = False
     substitution_scripts = ()
     process_substitution = False
+    redirect_descriptor = False
 
 
 
@@ -525,12 +530,14 @@ def note_quoting(text, tokens, record_marks=True):
     single-quoted or escaped ('active'), one that is not quoted at all ('unquoted'), or an unquoted brace expansion
     ('braced'). Keep quoting per token occurrence as well, so quoted reserved words never open or close shell scopes.
     When its words do not match the tokenizer's, every word counts as all three and keyword identity stays unknown."""
-    words, cur, i, n = [], None, 0, len(text)
+    words, cur, i, n, descriptors = [], None, 0, len(text), set()
     while i < n:
         c = text[i]
         i += 1
         if c in SHELL_WHITESPACE or c in ';&|()<>':
             if cur is not None:
+                if c in '<>' and cur[0].isdigit() and not cur[4]:
+                    descriptors.add(len(words))
                 words.append(cur)
             cur = None
             if c not in SHELL_WHITESPACE:
@@ -580,12 +587,13 @@ def note_quoting(text, tokens, record_marks=True):
             for k in marks:
                 marks[k].update(tokens)
         return
-    for token, (word, active, unquoted, bare, quoted, assignment, sites) in zip(tokens, words):
+    for index, (token, (word, active, unquoted, bare, quoted, assignment, sites)) in enumerate(zip(tokens, words)):
         token.quoted = quoted
         token.assignment = assignment
         token.expansion_sites = frozenset(sites)
         token.unquoted_expansion = unquoted
         token.unquoted_pattern = bool(GLOB.search(bare) or ('{' in bare and (',' in bare or '..' in bare)))
+        token.redirect_descriptor = index in descriptors
         if not record_marks:
             continue
         if active:
@@ -687,8 +695,12 @@ def split_commands(tokens):
 def wrapper_value_flag(head, flag, values):
     if flag in values:
         return True
-    if head == 'env' and flag.startswith('-') and not flag.startswith('--'):
-        at = next((i for i, ch in enumerate(flag[1:], 1) if ch in 'uCS'), None)
+    if head in ('env', 'sudo') and flag.startswith('--') and '=' not in flag and len(flag) > 2:
+        if any(option.startswith(flag) for option in ('--chdir', '--chroot') if option in values):
+            return True
+    if head in ('env', 'sudo') and flag.startswith('-') and not flag.startswith('--'):
+        letters = 'uCS' if head == 'env' else 'ughpCDRTUrt'
+        at = next((i for i, ch in enumerate(flag[1:], 1) if ch in letters), None)
         return at is not None and at == len(flag) - 1
     return False
 
@@ -708,7 +720,7 @@ def strip_reserved_time(toks, uncertain=None):
     return toks
 
 
-def strip_prefix(toks, assignments=None, wrappers=None, uncertain=None):
+def strip_prefix(toks, assignments=None, wrappers=None, uncertain=None, cwd_changes=None):
     """Drop VAR=value assignments, shell keywords (then, do, ...) and wrappers such as env, sudo, time, nohup, timeout."""
     toks = list(toks)
     env_assignments, keyword_position = False, True
@@ -740,8 +752,27 @@ def strip_prefix(toks, assignments=None, wrappers=None, uncertain=None):
                     wrappers[-1][1].append(flag)
                 if flag == '--':
                     break
+                value = None
                 if wrapper_value_flag(head, flag, values) and toks:
-                    toks.pop(0)
+                    value = toks.pop(0)
+                if cwd_changes is not None and head in ('env', 'sudo'):
+                    option = flag.split('=', 1)[0]
+                    kind = None
+                    dirs = [name for name in ('--chdir', '--chroot') if name in values and
+                            option.startswith('--') and len(option) > 2 and name.startswith(option)]
+                    if dirs:
+                        kind = 'root' if '--chroot' in dirs else 'cwd'
+                        value = flag.split('=', 1)[1] if '=' in flag else value
+                    elif head == 'env' and flag.startswith('-') and not flag.startswith('--'):
+                        at = next((i for i, ch in enumerate(flag[1:], 1) if ch in 'uCS'), None)
+                        if at is not None and flag[at] == 'C':
+                            kind, value = 'cwd', flag[at + 1:] or value
+                    elif head == 'sudo' and flag.startswith('-') and not flag.startswith('--'):
+                        at = next((i for i, ch in enumerate(flag[1:], 1) if ch in 'ughpCDRTUrt'), None)
+                        if at is not None and flag[at] in 'DR':
+                            kind, value = ('root' if flag[at] == 'R' else 'cwd'), flag[at + 1:] or value
+                    if kind:
+                        cwd_changes.append((kind, value))
             if head == 'timeout' and toks and re.match(r'^[0-9.]+[smhd]?$', toks[0]):
                 toks.pop(0)
         else:
@@ -843,12 +874,17 @@ def split_redirects(args):
         if operator(a):
             redirs.append((a, args[k + 1] if k + 1 < len(args) else ''))
             k += 2
-        elif a.isdigit() and syntax(a) and k + 1 < len(args) and operator(args[k + 1]):
+        elif (a.isdigit() and syntax(a) and getattr(getattr(a, 'source_operand', a), 'redirect_descriptor', False)
+              and k + 1 < len(args) and operator(args[k + 1])):
             k += 1  # the 2 of 2>/dev/null
         else:
             plain.append(a)
             k += 1
     return plain, redirs
+
+
+def redirect_writes(op, target):
+    return op in REDIRECTS or op == '<>' or (op == '>&' and not re.fullmatch(r'(?:\d+-?|-)', target))
 
 
 LANE_SUBS = {'commit', 'merge', 'cherry-pick', 'revert', 'am', 'rebase'}
@@ -930,10 +966,32 @@ def review_authors(gh, gate):
     return {login.lower()}
 
 
-def review_verdict(pr, who, head, authors, trust_bot=False, run_id=None):
+def current_review_runs(pr, head, authors):
+    """Trusted starts bind automatic provider comments to this head and current base."""
+    runs = set()
+    for comment in pr.get('comments') or []:
+        if str((comment.get('author') or {}).get('login') or '').lower() not in authors:
+            continue
+        lines = str(comment.get('body') or '').splitlines()
+        if not lines or lines[0] != '## Agent-core review run':
+            continue
+        records = [line[len(REVIEW_RUN):] for line in lines if line.startswith(REVIEW_RUN)]
+        try:
+            record = json.loads(records[0]) if len(records) == 1 else None
+        except ValueError:
+            continue
+        if (isinstance(record, dict) and record.get('status') == 'RUNNING' and record.get('head') == head
+                and record.get('base') == pr.get('baseRefName') and record.get('base_oid') == pr.get('baseRefOid')
+                and re.fullmatch(r'[a-f0-9]{32}', str(record.get('run_id') or ''))):
+            runs.add(record['run_id'])
+    return runs
+
+
+def review_verdict(pr, who, head, authors, trust_bot=False, run_id=None, legacy_only=False):
     """'PASS', 'BLOCK' or None for the latest '## <Who> ...review' comment naming head, written by one of authors.
     Codex's GitHub review app on the head commit counts as a Codex review only when pr_gate.trust_codex_bot is true."""
     found = None
+    current_runs = current_review_runs(pr, head, authors) if run_id is None else set()
     for c in pr.get('comments') or []:
         if str((c.get('author') or {}).get('login') or '').lower() not in authors:
             continue
@@ -943,7 +1001,12 @@ def review_verdict(pr, who, head, authors, trust_bot=False, run_id=None):
                 and lines[1] == 'head: ' + head
                 and (run_id is None or (len(lines) >= 3 and lines[2] == 'run: ' + run_id))):
             m = re.findall(r'^VERDICT: (PASS|BLOCK)\s*$', body, re.M)
-            found = m[-1] if m else found
+            if m:
+                tagged = len(lines) >= 3 and lines[2].startswith('run: ')
+                if tagged and run_id is None:
+                    if legacy_only or (m[-1] == 'PASS' and lines[2][len('run: '):] not in current_runs):
+                        continue
+                found = m[-1]
     if who == 'Codex' and not found and trust_bot:
         for r in pr.get('reviews') or []:
             if (r.get('author') or {}).get('login') in CODEX_BOTS and (r.get('commit') or {}).get('oid') == head:
@@ -1123,12 +1186,13 @@ def merge_decision(args, repo=()):
         if automatic_run_passes(pr, attempt[0], head, authors, gate, command):
             return None
         return 'deny', 'The latest automatic review run is not a verified pass. Run pr_review.py with auto again.'
+    verdicts = {who: review_verdict(pr, who, head, authors, trust, legacy_only=True) for who in ('Claude', 'Codex')}
     missing = [who for who, v in verdicts.items() if not v]
     if missing:
         if len(missing) == 1 and gate.get('allow_single_on_unavailable') is True:
             present = 'Codex' if missing[0] == 'Claude' else 'Claude'
             # A bot comment counted by the legacy two-provider policy is not a real fallback review.
-            if (review_verdict(pr, present, head, authors) == 'PASS'
+            if (review_verdict(pr, present, head, authors, legacy_only=True) == 'PASS'
                     and outage_tests_pass(pr, missing[0], head, authors, common.review_test_command(slug))):
                 return None
         return 'deny', MSG['review_wait'] % (pr.get('number'), branch, slug, head[:12], ' and '.join(missing),
@@ -1171,13 +1235,90 @@ def api_method(args):
 BODY_FLAGS = {'gh': ('-f', '-F', '--field', '--raw-field', '--input'),
               'curl': ('-d', '--data', '--data-raw', '--data-binary', '--data-urlencode', '--data-ascii', '-F', '--form',
                        '--form-string', '-T', '--upload-file', '--json'),
-              'wget': ('--post-data', '--post-file', '--body-data', '--body-file')}
+              'wget': ('--post-data', '--post-file', '--body-data', '--body-file'),
+              'http': ('--raw',), 'https': ('--raw',), 'xh': ('--raw',)}
 HTTP_WORDS = {'GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'}
+
+
+def http_option_arguments(prog, args):
+    """Remove proven one-argument header values before reading methods and request bodies."""
+    out, k = [], 0
+    headers = {'--header', '--proxy-header'} if prog == 'curl' else {'--header'} if prog == 'wget' else set()
+    values = {'--request', '--method', '--url', '--proto-default', '--json', '--raw', '--data', '--data-binary',
+              '--data-raw', '--data-ascii', '--data-urlencode', '--post-data', '--body-data', '--post-file',
+              '--body-file', '--config', '--upload-file', '--form', '--session', '--session-read-only',
+              '--auth', '--auth-type', '--timeout', '--verify', '--cert', '--cert-key', '--proxy', '--output'}
+    letters = 'EKCbcDdFPHhmoUQreyYtzTuAwX' if prog == 'curl' else 'UOTeo' if prog == 'wget' else ''
+
+    def single(value):
+        raw = getattr(value, 'source_operand', value)
+        return not getattr(raw, 'unquoted_expansion', False) and not getattr(raw, 'unquoted_pattern', False)
+
+    while k < len(args):
+        arg = args[k]
+        flag, eq, attached = arg.partition('=')
+        if flag in headers:
+            value = operand_value(attached, arg) if eq else args[k + 1] if k + 1 < len(args) else None
+            if value is not None and single(value):
+                k += 1 if eq else 2
+                continue
+        if prog in ('http', 'https', 'xh') and re.match(r'^[A-Za-z][A-Za-z0-9-]*:(?!=)', arg) and '://' not in arg and single(arg):
+            k += 1
+            continue
+        at = next((n for n, letter in enumerate(arg[1:], 1) if letter in letters), None) if arg.startswith('-') and not arg.startswith('--') else None
+        if at is not None:
+            value = operand_value(arg[at + 1:], arg) if arg[at + 1:] else args[k + 1] if k + 1 < len(args) else None
+            if prog == 'curl' and arg[at] == 'H' and value is not None and single(value):
+                if at > 1:
+                    out.append(operand_value(arg[:at], arg))
+                k += 1 if arg[at + 1:] else 2
+                continue
+            out.append(arg)
+            if not arg[at + 1:] and k + 1 < len(args):
+                k += 1
+                out.append(args[k])
+        else:
+            out.append(arg)
+            if flag in values and not eq and k + 1 < len(args):
+                k += 1
+                out.append(args[k])
+        k += 1
+    return out
+
+
+def http_supplied_stdin(prog, args):
+    if prog not in ('http', 'https', 'xh'):
+        return False
+    options = {'--session', '--session-read-only', '--style', '--format', '--print', '--pretty', '--timeout',
+               '--verify', '--cert', '--cert-key', '--proxy', '--auth', '--auth-type', '--raw', '--output',
+               '--max-redirects', '--default-scheme'}
+    k = 0
+    while k < len(args) and args[k] != '--':
+        if args[k] == '--ignore-stdin':
+            return False
+        k += 2 if args[k] in options else 1
+    return bool(STATE['pipe'] or any(op.startswith('<') for op, _ in split_redirects(args)[1]))
+
+
+def http_request_urls(prog, args):
+    urls = []
+    for arg in http_option_arguments(prog, args):
+        value = arg.split('=', 1)[1] if arg.startswith('--url=') else arg
+        if re.match(r'^https?://', value, re.I):
+            urls.append(value)
+        elif re.match(r'^[A-Za-z0-9.-]+(?::[0-9]+)?/', value):
+            urls.append('https://' + value)  # supported clients infer a scheme, or accept --proto-default
+    return urls
+
 
 
 def reads_only(prog, args):
     """True when a gh api or HTTP client call only reads: GET or HEAD, with no request body (gh api and httpie switch to
     POST when fields are given). A method the guard cannot read counts as a write."""
+    if prog != 'gh':
+        args = http_option_arguments(prog, args)
+    if any(getattr(a, 'path_uncertain', False) or unresolved_path(a, getattr(a, 'source_operand', a)) for a in args):
+        return False  # an unknown argument can supply a write method, upload or configuration option
     flags = BODY_FLAGS.get('gh' if prog == 'gh' else prog, ())
     body = any(a in flags or (a.startswith('--') and len(a.split('=', 1)[0]) > 2 and any(
         f.startswith(a.split('=', 1)[0]) for f in flags if f.startswith('--'))) for a in args)
@@ -1231,7 +1372,8 @@ def reads_only(prog, args):
                     return False
     else:  # httpie and xh: an optional method word, then items; key=value, key:=json and key@file make a body
         method = next((a.upper() for a in args if a.upper() in HTTP_WORDS), '')
-        body = any(re.match(r'^[^-][^=:@]*(=(?!=)|:=|@)', a) for a in args if '://' not in a)
+        body = body or http_supplied_stdin(prog, args) or any(
+            re.match(r'^[^-][^=:@]*(=(?!=)|:=|@)', a) for a in args if '://' not in a)
     method = method.upper()
     if method:
         return method in ('GET', 'HEAD') and not re.search(r'[$`]', method)
@@ -1278,13 +1420,14 @@ def posts_verdict(words, args):
             filtered.append(a)
             value = a in ('-b', '--body', '-f', '-F', '--field', '--raw-field', '--body-file', '--input')
     plain = filtered  # local output filters never publish text
-    texts, files, unknown = list(plain), [], False
+    texts, files, json_files, unknown = list(plain), [], [], False
     if words[:1] == ['api']:
         for flag, value in gh_api_parts(plain)[0]:
             if flag in ('--field', '--raw-field', '--input'):
                 unknown = unknown or value is None or getattr(value, 'path_uncertain', False)
             if flag == '--input':
                 files.append(value)
+                json_files.append(value)
             elif flag == '--field' and value is not None and '=@' in value:
                 files.append(operand_value(value.split('=@', 1)[1], value))
     else:
@@ -1303,6 +1446,16 @@ def posts_verdict(words, args):
         text = gh_body_file(path, args)
         unknown = unknown or text is None
         if text is not None:
+            if path in json_files:
+                try:
+                    body = json.loads(text)
+                    decoded = body.get('body', '') if isinstance(body, dict) else None
+                except ValueError:
+                    decoded = None
+                if not isinstance(decoded, str):
+                    unknown = True
+                else:
+                    texts.append(decoded)
             texts.append(text)
     for op, target in redirs:
         if op == '<<' and target.startswith(HEREDOC_MARK):
@@ -2359,7 +2512,11 @@ def read_text(path):
 
 def heredoc_body(marker):
     try:
-        return STATE['heredocs'][int(marker[len(HEREDOC_MARK):])]
+        index = int(marker[len(HEREDOC_MARK):])
+        text = STATE['heredocs'][index]
+        if STATE['expands'][index] and re.search(r'[$`\\]', text):
+            return None  # expanding heredocs do not send their source spelling as stdin bytes
+        return text
     except (ValueError, IndexError):
         return None
 
@@ -2371,7 +2528,14 @@ def piped_text(prev):
         return None
     prog, (plain, redirs) = os.path.basename(prev[0]), split_redirects(prev[1:])
     if prog == 'echo':
-        return ' '.join(a for a in plain if not re.match(r'^-[neE]+$', a)).replace('\\n', '\n')
+        no_newline = plain[:1] == ['-n']
+        if no_newline:
+            plain = plain[1:]
+        values = [expand(a) for a in plain]
+        if (values and values[0].startswith('-')) or any(
+                unresolved_path(value, raw) or '\\' in value for value, raw in zip(values, plain)):
+            return None  # echo escape/option behavior varies by shell; opaque output is never trusted
+        return ' '.join(values) + ('' if no_newline else '\n')
     if prog == 'printf':
         return printf_output(plain)
     if prog == 'cat':
@@ -2570,6 +2734,35 @@ def analyze(toks, depth, raw=None, mutations=None):
         return analyze_command(toks, depth, raw, mutations)
     saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), STATE['cwd_candidates'])
     try:
+        changes = []
+        strip_prefix(toks, cwd_changes=changes)
+        if any(kind == 'root' for kind, _ in changes):
+            return 'deny', MSG['deep']  # a chroot changes absolute paths too; cwd uncertainty alone is insufficient
+        if changes:
+            toks = list(toks)
+            for k, op in enumerate(toks[:-1]):
+                if op not in REDIRECTS | {'<', '<>', '>&', '<&'} or getattr(getattr(op, 'source_operand', op), 'quoted', False) is True:
+                    continue
+                source = toks[k + 1]
+                if op in ('>&', '<&') and re.fullmatch(r'(?:\d+-?|-)', source):
+                    continue
+                value = operand_value(expand(source), source)
+                if redirect_writes(op, value) and PROTECTED.hit(value):
+                    return 'deny', MSG['lake']
+                path = Protected._absolute(value, literal=not value.path_uncertain)
+                rebased = operand_value(path if path is not None else value, value)
+                rebased.path_uncertain = value.path_uncertain or path is None
+                toks[k + 1] = rebased  # the outer shell opens this path before the wrapper changes directory
+            raw = None
+            for _, target in changes:
+                value = expand(target) if target is not None else None
+                if value is None or unresolved_path(value, target) or GLOB.search(value):
+                    set_cwd(None)
+                else:
+                    path = os.path.expanduser(value)
+                    if not os.path.isabs(path):
+                        path = os.path.join(STATE['cwd'], path) if STATE['cwd'] is not None else None
+                    set_cwd(os.path.realpath(path) if path is not None else None)
         return analyze_command(toks, depth, raw)
     finally:
         STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = saved
@@ -2577,8 +2770,12 @@ def analyze(toks, depth, raw=None, mutations=None):
 
 def analyze_command(toks, depth, raw=None, mutations=None):
     toks = strip_reserved_time(toks)
-    assigns = [t for t in toks if shell_assignment(t)]
-    if assigns and len(assigns) == len(toks):
+    plain, redirs = split_redirects(toks)
+    for op, target in redirs:
+        if redirect_writes(op, target) and PROTECTED.hit(operand_value(expand(target), target)):
+            return 'deny', MSG['lake']
+    assigns = [t for t in plain if shell_assignment(t)]
+    if assigns and len(assigns) == len(plain):
         for t in assigns:
             k, v = expand(t).split('=', 1)
             set_variable(k, v, unknown_expansion(t))
@@ -2666,8 +2863,12 @@ def analyze_command(toks, depth, raw=None, mutations=None):
         return git_decision(args)
     if prog == 'gh':
         return gh_decision(args)
-    if prog in HTTP_CLIENTS and gate_branches() and any(API_MERGE.search(a) for a in args) and not reads_only(prog, args):
-        return 'deny', MSG['api_merge']
+    if prog in HTTP_CLIENTS:
+        if http_posts_review(prog, args):
+            return 'deny', MSG['fake_verdict']
+        if gate_branches() and (http_graphql_merges(prog, args) or (
+                any(API_MERGE.search(a) for a in args) and not reads_only(prog, args))):
+            return 'deny', MSG['api_merge']
     if prog == 'supabase' or (prog in ('npx', 'pnpx', 'bunx') and args[:1] and args[0].startswith('supabase')):
         return supabase_decision(args if prog == 'supabase' else args[1:])
     if prog in SQL_CLIENTS or (prog == 'wrangler' and args[:2] == ['d1', 'execute']):
@@ -2879,7 +3080,7 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
                 head = strip_prefix(cmd, uncertain=ambiguous)
                 external = external_scope(cmd)
                 moves = not external and bool(head) and os.path.basename(head[0]) in ('cd', 'pushd', 'popd')
-                assigned = strip_reserved_time(cmd)
+                assigned, assignment_redirs = split_redirects(strip_reserved_time(cmd))
                 while assigned and shell_keyword(assigned[0]):
                     assigned.pop(0)
                 if external:
@@ -2928,7 +3129,7 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
                     STATE['restricted'].update(restricted_added)
                     for name in names:
                         invalidate_variable(name)  # zsh and bash lastpipe can retain the last stage's assignments
-                elif names and not saved and (scoped or before in ('&&', '||') or (cmd and shell_keyword(cmd[0]))):
+                elif names and not saved and (assignment_redirs or scoped or before in ('&&', '||') or (cmd and shell_keyword(cmd[0]))):
                     if after == '&&' and before != '||' and not shell_keyword(cmd[0]) and not scoped:
                         cond_vars.update(names)
                     else:
@@ -2962,11 +3163,12 @@ def scan_moves(norm, depth=0):
 
 
 def check_script(text, depth=0, mutations=None):
-    if depth > MAX_DEPTH:
+    if depth > MAX_DEPTH or len(text) > MAX_CHARS:
         return 'deny', MSG['deep']
     if depth == 0:
         STATE['moved'] = False
         STATE['body_file_unstable'] = False
+        STATE['substitution_budget'] = MAX_SUBSTITUTIONS
     try:
         norm = normalize(text)
         if depth == 0:
@@ -3163,6 +3365,132 @@ def graphql_merges(args):
     return any(GRAPHQL_MERGE.search(query) for query in queries)
 
 
+def http_request_texts(prog, args):
+    """Request body bytes when every producer and transfer option can be inspected; None otherwise."""
+    args = http_option_arguments(prog, args)
+    if any(getattr(a, 'path_uncertain', False) or unresolved_path(a, getattr(a, 'source_operand', a)) for a in args):
+        return None
+    for a in args:
+        flag = a.split('=', 1)[0]
+        if flag.startswith('--expand-') or a == '-:':
+            return None
+        opaque = ('--config', '--next', '--upload-file', '--form', '--data-urlencode') if prog == 'curl' else ('--config', '--execute')
+        if flag.startswith('--') and len(flag) > 2 and any(name.startswith(flag) for name in opaque):
+            return None
+        if a.startswith('-') and not a.startswith('--'):
+            for letter in a[1:]:
+                if (prog == 'curl' and letter in 'KT') or (prog == 'wget' and letter == 'e'):
+                    return None
+                if letter in 'EKCbcDdFPHhmoUQreyYtzTuAwX':
+                    break
+    bodies, plain = [], split_redirects(args)[0]
+    inline = {'--json', '--raw', '-d', '--data', '--data-binary', '--data-raw', '--data-ascii', '--post-data', '--body-data'}
+    files = {'--post-file', '--body-file'}
+    k = 0
+    fields = {}
+    while k < len(plain):
+        arg = plain[k]
+        flag, eq, value = arg.partition('=')
+        if prog in ('http', 'https', 'xh') and '://' not in arg and not arg.startswith('-'):
+            item = re.match(r'^([^:=@]+)(:=|=|@)(.*)$', arg, re.S)
+            if item:
+                key, operator, value = item.groups()
+                if operator == '@':
+                    return None
+                if operator == ':=':
+                    try:
+                        value = json.loads(value)
+                    except (ValueError, TypeError):
+                        return None
+                fields[key] = value
+                k += 1
+                continue
+        if flag.startswith('--') and len(flag) > 2 and flag not in inline | files:
+            matches = [name for name in inline | files if name.startswith(flag)]
+            if len(matches) > 1:
+                return None
+            if matches:
+                flag = matches[0]
+        if flag in inline | files:
+            if not eq:
+                k += 1
+                value = plain[k] if k < len(plain) else None
+            else:
+                value = operand_value(value, arg)
+        elif prog == 'curl' and arg.startswith('-d') and not arg.startswith('--') and len(arg) > 2:
+            flag, value = '-d', operand_value(arg[2:], arg)
+        else:
+            k += 1
+            continue
+        if value is None or getattr(value, 'path_uncertain', False):
+            return None
+        if flag in files:
+            value = gh_body_file(value, args)
+        elif value.startswith('@') and flag != '--data-raw':
+            value = gh_body_file(operand_value(value[1:], value), args)
+        if value is None:
+            return None
+        bodies.append(value)
+        k += 1
+    if fields:
+        bodies.append(json.dumps(fields))
+    if http_supplied_stdin(prog, args):
+        value = gh_body_file('-', args)
+        if value is None:
+            return None
+        bodies.append(value)
+    return bodies
+
+
+def http_graphql_merges(prog, args):
+    """Inspect JSON GraphQL requests from HTTP clients; an opaque write cannot prove it avoids a merge."""
+    urls = http_request_urls(prog, args)
+    if not any(re.match(r'^https?://[^/]+/(?:api/)?graphql/?(?:[?#]|$)', a, re.I) for a in urls):
+        return False
+    bodies = http_request_texts(prog, args)
+    if bodies is None:
+        return True
+    if not bodies:
+        return not reads_only(prog, args)
+    if len(bodies) != 1:
+        return True
+    try:
+        body = json.loads(bodies[0])
+        query = body.get('query') if isinstance(body, dict) else None
+    except (ValueError, TypeError, RecursionError):
+        return True
+    return not isinstance(query, str) or bool(GRAPHQL_MERGE.search(query))
+
+
+def http_posts_review(prog, args):
+    """GitHub comment and GraphQL writes must not publish trusted reviewer or run evidence."""
+    urls = http_request_urls(prog, args)
+    comment = any(re.match(r'^https?://[^/]+/(?:api/v3/)?repos/[^/]+/[^/]+/(?:issues|pulls)/.*(?:comments|reviews)(?:/|[?#]|$)', a, re.I)
+                  for a in urls)
+    graphql = any(re.match(r'^https?://[^/]+/(?:api/)?graphql/?(?:[?#]|$)', a, re.I) for a in urls)
+    if not (comment or graphql) or reads_only(prog, args):
+        return False
+    bodies = http_request_texts(prog, args)
+    if not bodies:
+        return True
+    texts = []
+    for text in bodies:
+        try:
+            values = [json.loads(text)]
+            while values:
+                value = values.pop()
+                if isinstance(value, str):
+                    texts.append(value)
+                elif isinstance(value, dict):
+                    values.extend(value.values())
+                elif isinstance(value, list):
+                    values.extend(value)
+        except (ValueError, TypeError, RecursionError):
+            return True
+    markers = ('AGENT_CORE_REVIEW_EVIDENCE_V1:', 'AGENT_CORE_REVIEW_RUN_V1:')
+    return any(VERDICT_TEXT.search(text) or any(marker in text for marker in markers) for text in texts)
+
+
 def api_comment_endpoint(args):
     endpoints = [value for value in gh_api_parts(args)[1] if value != 'api']
     if not endpoints:
@@ -3177,7 +3505,7 @@ def queried_branch(token):
     if (len(scripts) != 1 or getattr(token, 'process_substitution', False)
             or not re.fullmatch(r'\$\{__agent_core_substitution_\d+\}', token)
             or not re.fullmatch(r'\s*git\s+branch\s+--show-current\s*', scripts[0])
-            or STATE['cwd'] is None):
+            or STATE['cwd'] is None or STATE['moved']):
         return None
     return current_branch(STATE['cwd'])
 
@@ -3186,9 +3514,11 @@ def recoverable_files(targets):
     """Existing databases and file batches over 1 GB must reach trash.py's review and recovery checks."""
     total = 0
     for target in targets:
-        if STATE['cwd'] is None or re.search(r'[$`*?\[{\\]', target):
-            continue
-        path = os.path.join(STATE['cwd'], os.path.expanduser(target))
+        path = os.path.expanduser(target)
+        if (STATE['cwd'] is None and not os.path.isabs(path)) or re.search(r'[$`*?\[{\\]', target):
+            return True  # an uninspected batch may contain databases or exceed the review threshold
+        if not os.path.isabs(path):
+            path = os.path.join(STATE['cwd'], path)
         if not os.path.isfile(path) or os.path.islink(path):
             continue
         try:
@@ -3265,14 +3595,54 @@ def quiet_inplace_substitution(script):
 
 NAMES_ONLY_SED = re.compile(r'^s(?P<d>[^\\\s])=\.\*(?P=d)[^\\&]*(?P=d)[gp]{0,2}$')
 
+
+def dotenv_lines_have_assignments(path):
+    """Linewise '=' removal is safe only when every nonempty input line is a complete assignment."""
+    if (STATE['body_file_unstable'] or unresolved_path(path, getattr(path, 'source_operand', path))
+            or GLOB.search(path)):
+        return False
+    full = resolve(path)
+    if not os.path.lexists(full):
+        return True  # a missing literal input prints no content
+    text = read_text(path)
+    if text is None or len(text) >= 1 << 20:
+        return False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = re.match(r'\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=', line)
+        if not match:
+            return False
+        quote, escaped = None, False
+        for char in line[match.end():]:
+            if escaped:
+                escaped = False
+            elif char == '\\' and quote != "'":
+                escaped = True
+            elif quote:
+                if char == quote:
+                    quote = None
+            elif char in "\"'":
+                quote = char
+        if quote or escaped:
+            return False
+    return True
+
+
 def names_only(prog, args):
     """True when the read cannot print an env value: sed whose every script is s/=.*/<text>/ (cuts each line at its
     first =, so only names are left), or a search that prints counts, file names or nothing (grep -c/-l/-L/-q)."""
     if prog == 'sed':
-        scripts, script_files, _, _ = sed_arguments(args)
-        return bool(scripts) and not script_files and all(NAMES_ONLY_SED.match(x.strip()) for x in scripts)
+        plain, redirs = split_redirects(args)
+        scripts, script_files, _, files = sed_arguments(plain)
+        inputs = [plain[index] for index in files] + [target for op, target in redirs if op == '<']
+        return (bool(scripts) and not script_files and all(NAMES_ONLY_SED.match(x.strip()) for x in scripts)
+                and all(dotenv_lines_have_assignments(path) for path in inputs if env_hit(path)
+                        or unresolved_path(path, getattr(path, 'source_operand', path))))
     if prog in ('grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack'):
         s, l, _ = flag_parts(args, value_opts=SEARCH_VALUE | PATTERN_OPTS, value_letters=SEARCH_LETTERS.get(prog, ''))
+        if prog == 'rg' and '--json' in l:
+            return False  # a later JSON mode can emit full matching lines despite a filename/count flag
         short, long_ = NO_CONTENT[prog]
         return bool(s & short or l & long_)
     return False
@@ -3379,6 +3749,10 @@ def substitution_spans(text, processes=False):
             i = j + 1
         else:
             i += 1
+    remaining = STATE.get('substitution_budget', MAX_SUBSTITUTIONS) - len(out)
+    if remaining < 0:
+        raise TooDeep()
+    STATE['substitution_budget'] = remaining
     return out
 
 
@@ -3400,7 +3774,8 @@ def execution_tokens(norm):
     note_quoting(masked, tokens)
     associated = set()
     for token in tokens:
-        matches = {marker: item for marker, item in scripts.items() if '${' + marker + '}' in token}
+        matches = {marker: scripts[marker] for marker in re.findall(r'\$\{(__agent_core_substitution_\d+)\}', token)
+                   if marker in scripts}
         associated.update(matches)
         token.substitution_scripts = tuple(body for body, _ in matches.values())
         token.process_substitution = any(process for _, process in matches.values())

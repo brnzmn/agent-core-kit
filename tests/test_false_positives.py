@@ -181,12 +181,12 @@ class RoutineCommandsPass(unittest.TestCase):
                     'rg -l -g ".env*" KEY | xargs cat', 'ls -a | git grep -l "^.env" | xargs cat',
                     'grep -l --regexp=.env src | xargs cat'], 'deny', key='env')
 
-    def test_build_folders_go_by_name_when_the_folder_is_unknown_and_nothing_is_protected(self):
+    def test_unknown_build_folders_cannot_skip_file_and_database_inspection(self):
         local = make_local(config={'user_name': 'Alex', 'protected_dirs': []})
         for cmd in ('cd "$(git rev-parse --show-toplevel)" && rm -rf dist', 'cd $REPO && rm -rf node_modules',
                     'cd $REPO && rm -rf packages/web/.next', 'cd $REPO && rm -rf dist .turbo'):
             with self.subTest(cmd=cmd):
-                self.assertIsNone(bash(cmd, cwd=REPO, local=local)[0])
+                self.assertEqual(bash(cmd, cwd=REPO, local=local)[0], 'deny')
         for cmd in ('cd $REPO && rm -rf src', 'cd $REPO && rm -rf .', 'cd $REPO && rm -rf ..', 'cd $REPO && rm -rf ../dist',
                     'cd $REPO && rm -rf dist/..', 'cd $REPO && rm -rf *', 'rm -rf $d/dist', 'rm -rf "$d/dist"',
                     'for d in "src docs"; do rm -rf $d/dist; done', 'for d in packages/*; do rm -rf "$d/dist"; done',

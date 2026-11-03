@@ -146,13 +146,15 @@ class ConfigListMembers(unittest.TestCase):
                                  env=dict(os.environ, AGENT_CORE_DIR=str(CORE), AGENT_CORE_LOCAL=str(scratch)))
             return json.loads(out.stdout)
 
-    def test_malformed_list_members_keep_the_whole_default(self):
+    def test_malformed_lists_keep_defaults_and_valid_protected_paths(self):
         for value in ([None], [4], [False], [{}], [['lake-data']], [''], ['lake-data', None]):
             with self.subTest(value=value):
                 output = self.config({'protected_dirs': value, 'gated_models': value,
                                       'pr_gate': {'reviewers': value}})
-                for key in ('protected_dirs', 'gated_models'):
-                    self.assertEqual(output['config'][key], output['defaults'][key])
+                expected_dirs = list(output['defaults']['protected_dirs'])
+                expected_dirs.extend(item for item in value if isinstance(item, str) and item.strip())
+                self.assertEqual(set(output['config']['protected_dirs']), set(expected_dirs))
+                self.assertEqual(output['config']['gated_models'], output['defaults']['gated_models'])
                 self.assertEqual(output['config']['pr_gate']['reviewers'], output['defaults']['pr_gate']['reviewers'])
         output = self.config({'protected_dirs': [], 'gated_models': [], 'pr_gate': {'reviewers': []}})
         self.assertEqual(output['config']['protected_dirs'], [])

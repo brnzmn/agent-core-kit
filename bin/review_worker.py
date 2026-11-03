@@ -1,5 +1,6 @@
 """Run PR-controlled tests in a disposable, offline Docker worker. The parent alone can publish reviews."""
 import os
+import re
 import selectors
 import time
 from pathlib import Path
@@ -32,16 +33,17 @@ def worker_args(client, snapshot, head, name, slug, command):
     return args + ['--workdir', '/work', '--entrypoint', '/bin/sh', IMAGE, '-c', BOOT, 'worker', head] + command
 
 
-def execute(root, slug, command):
+def execute(root, slug, command, head):
     """Only a shallow bare snapshot is shared. Never pass the host checkout, Docker socket, CLI config or env."""
+    if not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head):
+        raise ValueError('a verified reviewed commit OID is required for the isolated worker')
     def trusted(*argv, **kw):
         proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               cwd=root, timeout=120, **kw)
         if proc.returncode:
-            raise ValueError('%s failed: %s' % (argv[0], proc.stderr.strip()[-500:]))
+            raise ValueError('%s failed: %s' % (argv[0], proc.stderr.strip()))
         return proc.stdout.strip()
 
-    head = trusted('git', 'rev-parse', '--verify', 'HEAD^{commit}')
     endpoint = trusted('docker', 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}')
     if not endpoint.startswith('unix:///'):
         raise ValueError('a local Docker engine is required for isolated review tests')

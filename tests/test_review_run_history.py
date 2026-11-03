@@ -74,12 +74,16 @@ class AutomaticPublication(unittest.TestCase):
 
 
 class PersistedBlockers(unittest.TestCase):
-    def persisted(self, comments, **metadata):
+    def persisted(self, comments, reviewers=('@reviewer',), **metadata):
         current = dict(META, comments=comments, **metadata)
         completed = merge_tests.subprocess.CompletedProcess([], 0, json.dumps(current), '')
         with patch.object(runner, 'sh', return_value=completed), \
-                patch.object(runner.common, 'config', return_value={'pr_gate': {'reviewers': ['@reviewer']}}):
+                patch.object(runner.common, 'config', return_value={'pr_gate': {'reviewers': reviewers}}):
             return runner.persisted_blockers('7', META)
+
+    def test_single_reviewer_string_is_normalized_like_the_guard(self):
+        block = comment('Claude', 'BLOCK', login='reviewer')
+        self.assertEqual(self.persisted([block], reviewers=' @Reviewer '), ['Claude'])
 
     def test_only_latest_trusted_head_verdict_can_supersede_a_block(self):
         block = comment('Claude', 'BLOCK', login='reviewer')

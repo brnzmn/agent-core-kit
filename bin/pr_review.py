@@ -31,14 +31,14 @@ import common  # noqa: E402
 sys.path.insert(0, os.path.join(CORE, 'bin'))
 import review_worker  # noqa: E402
 
-PLUGIN = os.path.join(common.CORE, 'vendor', 'codex-plugin-cc', 'plugins', 'codex', 'scripts')
+PLUGIN = os.path.join(CORE, 'vendor', 'codex-plugin-cc', 'plugins', 'codex', 'scripts')
 GH = os.environ.get('AGENT_CORE_GH') or 'gh'
 MAX_TEXT = 60000  # GitHub rejects comments over 65536 characters; the verdict line must always survive
 REDACTED = '[REDACTED]'
 # Match the complete literal after a credential name, including dots and quoted whitespace.
 NAMED_SECRET = re.compile(
-    r"""(?P<prefix>\b(?P<name>(?:[\w.-]{1,64}[_-]|[a-zA-Z]{1,32}(?=[A-Z])|(?i:api|access|refresh|client|private|db))?(?i:token|secret|password|passwd|key))\b["']?[ \t]*[:=][ \t]*)"""
-    r"""(?:"(?P<double>(?:\\.|[^"\\])*)(?:"|$)|'(?P<single>(?:\\.|[^'\\])*)(?:'|$)|(?P<bare>(?:\\[\s\S]|[^\s`\\]|\\$)+))""")
+    r"""(?P<prefix>\b(?P<name>(?:[\w.-]{1,64}[_-]|[a-zA-Z]{1,32}(?=[A-Z])|(?i:api|access|refresh|client|private|db))?(?i:token|secret|password|passwd|key))\b["']?[ \t]*[:=][ \t\r\n]*)"""
+    r"""(?:(?P<ticks>`{1,16})(?P<code>[\s\S]*?)(?:(?<!`)(?P=ticks)(?!`)|$)|"(?P<double>(?:\\.|[^"\\])*)(?:"|$)|'(?P<single>(?:\\.|[^'\\])*)(?:'|$)|(?P<bare>(?:\\[\s\S]|[^\s`\\]|\\$)+))""")
 
 EVIDENCE_TITLE = '## Agent-core review availability'
 EVIDENCE_MARK = 'AGENT_CORE_REVIEW_EVIDENCE_V1: '
@@ -83,7 +83,6 @@ def unavailable_reason(text):
         'auth': r'not (?:logged|signed) in|please (?:log|sign) in|authentication failed|unauthorized.*(?:401|sign in)',
         'service': r'(?:service|server) (?:is )?unavailable|(?:selected|requested) model is at capacity\b|'
                    r'overloaded_error|HTTP (?:502|503|504)\b',
-        'missing_cli': r'(?:claude|codex)(?: CLI)? (?:not found|is not installed)|(?:claude|codex): command not found',
     }
     return next((reason for reason, pattern in patterns.items() if re.search(pattern, text, re.I)), None)
 
@@ -93,12 +92,18 @@ def has_blocking_output(text):
     return bool(re.search(r'\[P[01]\]|^VERDICT:\s*BLOCK\s*$', text, re.M))
 
 
+def diagnostic(text, tail=True):
+    """Redact complete credential values before a diagnostic limit can discard their identifying prefix."""
+    text, _ = redact(text)
+    return text[-2000:] if tail else text[:2000]
+
+
 def codex_error_reason(error):
     """Known app-server error codes survive even when native review stdout/stderr are empty."""
     if not isinstance(error, dict):
         return None
     codes = [error.get('code'), error.get('type'), error.get('codexErrorInfo')]
-    known = {'quota': {'usage_limit_reached', 'usageLimitExceeded', 'rate_limit_exceeded', 'insufficient_quota'},
+    known = {'quota': {'usage_limit_reached', 'usageLimitExceeded', 'rateLimitExceeded', 'rate_limit_exceeded', 'insufficient_quota'},
              'auth': {'unauthorized', 'authentication_error', 'invalid_api_key'},
              'service': {'service_unavailable', 'server_overloaded', 'overloaded_error'}}
     return next((reason for reason, values in known.items()
@@ -125,9 +130,9 @@ def codex_review(base, adversarial):
         text = (out.stdout + '\n' + out.stderr).strip()
         if has_blocking_output(text):
             return Review('BLOCK', 'Interrupted Codex review contains blocking findings:\n' + text)
-        return Review(None, text[-2000:], unavailable_reason(out.stderr) if out.returncode not in (0, 124) else None)
+        return Review(None, diagnostic(text), unavailable_reason(out.stderr) if out.returncode not in (0, 124) else None)
     if not isinstance(data, dict) or not isinstance(data.get('codex'), dict):
-        return Review(None, json.dumps(data)[:2000])
+        return Review(None, diagnostic(json.dumps(data), tail=False))
     provider = data['codex']
     raw_text = provider.get('stdout')
     text = raw_text.strip() if isinstance(raw_text, str) else ''
@@ -142,7 +147,7 @@ def codex_review(base, adversarial):
             return Review('BLOCK', 'Interrupted Codex review contains blocking findings:\n' + text + '\n' + error)
         if type(status) is int and status != 0 and out.returncode != 124:
             reason = codex_error_reason(structured) or unavailable_reason(provider.get('stderr') or out.stderr or '')
-        return Review(None, (error or text)[-2000:], reason)
+        return Review(None, diagnostic(error or text), reason)
     found = data.get('result')
     if adversarial:
         if not isinstance(found, dict) or found.get('verdict') not in ('approve', 'needs-attention'):
@@ -154,17 +159,19 @@ def codex_review(base, adversarial):
 
 
 def claude_review(base):
-    out = sh(['bash', os.path.join(common.CORE, 'bin', 'claude-review.sh'), base], timeout=1800,
+    out = sh(['bash', os.path.join(CORE, 'bin', 'claude-review.sh'), base], timeout=1800,
              stdin=subprocess.DEVNULL)
     text = re.sub(r'\n\(saved to [^\n]*\)\s*$', '', out.stdout.strip())
     verdict = {0: 'PASS', 1: 'BLOCK'}.get(out.returncode)
     if verdict is None and has_blocking_output(text + '\n' + out.stderr):
         return Review('BLOCK', 'Interrupted Claude review contains blocking findings:\n' + text + '\n' + out.stderr)
     # A successful review mentioning a quota or outage is still an actual review.
-    reason = unavailable_reason(text or out.stderr) if out.returncode == 4 else None
+    reason = None
+    if out.returncode == 4:
+        reason = 'missing_cli' if text == 'claude-review: claude CLI not found' else unavailable_reason(text or out.stderr)
     if verdict is not None:
         text = re.sub(r'\nVERDICT: (PASS|BLOCK)\s*$', '', text)
-    return Review(verdict, text or out.stderr.strip()[-2000:], reason)
+    return Review(verdict, text or diagnostic(out.stderr.strip()), reason)
 
 
 def redact(text):
@@ -186,10 +193,10 @@ def redact(text):
         total += 1
         start, end = match.span(group)
         return match[0][:start - match.start()] + REDACTED + match[0][end - match.start():]
-    text = NAMED_SECRET.sub(named, text)
     for pattern, replacement in SECRET_PATTERNS:
         text, n = pattern.subn(replacement, text)
         total += n
+    text = NAMED_SECRET.sub(named, text)
     return text, total
 
 
@@ -278,7 +285,7 @@ def test_count(text):
     if re.search(r'^Ran \d+ tests? in ', text, re.M):
         return 0  # an interrupted unittest summary does not establish completed tests
     counts = []
-    for pattern in (r'^[= \t]*(\d+) passed(?:, \d+ (?:skipped|deselected|xfailed|warnings?))* in [\d.]+s[= \t]*$',
+    for pattern in (r'^[= \t]*(\d+) passed(?:, \d+ (?:skipped|deselected|xfailed|warnings?))* in [\d.]+s(?: \(\d+:\d{2}(?::\d{2})?\))?[= \t]*$',
                     r'^[ \t]*Tests:[ \t]+(?:\d+ skipped, )?(\d+) passed, \d+ total[ \t]*$',
                     r'^[ \t]*Tests[ \t]+(\d+) passed(?: \| \d+ skipped)? \(\d+\)[ \t]*$'):
         counts.extend(int(n) for n in re.findall(pattern, text, re.M))
@@ -293,14 +300,27 @@ def checkout_root():
     return path
 
 
-def run_tests(command, slug):
+def run_tests(command, slug, head):
     root = checkout_root()
-    out = review_worker.execute(root, slug, command)
+    out = review_worker.execute(root, slug, command, head)
     text = out.stdout + out.stderr
     print(text)
     count = test_count(text)
     return {'status': 'PASS' if out.returncode == 0 and count > 0 else 'FAIL', 'count': count,
             'command': command, 'exit_code': out.returncode}
+
+
+def repository_identity(url):
+    """The host and repository behind a standard HTTPS or SSH Git URL; reject helpers and ambiguous aliases."""
+    matched = re.fullmatch(r'(?:https://|ssh://(?:[A-Za-z0-9_.-]+@)?)([A-Za-z0-9.-]+)(?::[0-9]+)?/'
+                           r'([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/?', url)
+    if not matched:
+        matched = re.fullmatch(r'(?:[A-Za-z0-9_.-]+@)?([A-Za-z0-9.-]+):'
+                               r'([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)', url)
+    if not matched:
+        return None
+    host, owner, repo = matched.groups()
+    return host.lower(), owner.lower(), repo.removesuffix('.git').lower()
 
 
 def fetch_base(meta):
@@ -309,13 +329,29 @@ def fetch_base(meta):
     oid = meta.get('baseRefOid')
     if not url or not isinstance(oid, str) or not re.fullmatch(r'[a-f0-9]{40}', oid):
         raise ValueError('invalid PR repository or base commit')
-    fetched = sh(['git', 'fetch', '-q', '--no-tags', '--no-recurse-submodules', url[1] + '.git', oid], timeout=120)
-    if fetched.returncode:
-        raise ValueError('could not fetch the PR base: ' + fetched.stderr.strip())
-    resolved = sh(['git', 'rev-parse', '--verify', 'FETCH_HEAD^{commit}'])
-    if resolved.returncode or resolved.stdout.strip() != oid:
-        raise ValueError('fetched commit does not match the upstream PR base')
-    return oid
+    upstream = url[1] + '.git'
+    identity = repository_identity(upstream)
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0')
+    transport = dict(stdin=subprocess.DEVNULL, env=env)
+    candidates = []
+    remotes = sh(['git', 'remote'], timeout=10, **transport)
+    for name in remotes.stdout.splitlines() if not remotes.returncode else []:
+        configured = sh(['git', 'remote', 'get-url', '--all', '--', name], timeout=10, **transport)
+        if not configured.returncode:
+            candidates.extend(u for u in configured.stdout.splitlines() if repository_identity(u) == identity)
+    # Keep the checkout's authenticated SSH transport, while a fork's origin never substitutes for the upstream.
+    candidates.sort(key=lambda u: u.startswith('https://'))
+    candidates = list(dict.fromkeys(candidates + [upstream]))
+    for target in candidates:
+        fetched = sh(['git', 'fetch', '-q', '--no-tags', '--no-recurse-submodules', target, oid],
+                     timeout=120, **transport)
+        if fetched.returncode:
+            continue
+        resolved = sh(['git', 'rev-parse', '--verify', 'FETCH_HEAD^{commit}'], timeout=10, **transport)
+        if resolved.returncode or resolved.stdout.strip() != oid:
+            raise ValueError('fetched commit does not match the upstream PR base')
+        return oid
+    raise ValueError('could not fetch the PR base: ' + fetched.stderr.strip())
 
 
 def persisted_blockers(pr, meta):
@@ -330,13 +366,13 @@ def persisted_blockers(pr, meta):
             raise ValueError()
     except (TypeError, AttributeError, ValueError):
         raise ValueError('persisted reviews do not describe the current PR') from None
-    authors = {str(name).lstrip('@').lower() for name in (common.config().get('pr_gate') or {}).get('reviewers', [])}
+    from guard import _listed, review_verdict
+    authors = {name.lstrip('@').lower() for name in _listed((common.config().get('pr_gate') or {}).get('reviewers'))}
     if not authors:
         login = sh([GH, 'api', 'user', '--jq', '.login'], timeout=60)
         if login.returncode or not login.stdout.strip():
             raise ValueError('could not verify the signed-in review author')
         authors = {login.stdout.strip().lower()}
-    from guard import review_verdict
     return [name for name in ('Codex', 'Claude')
             if review_verdict(data, name, meta['headRefOid'], authors) == 'BLOCK']
 
@@ -410,7 +446,7 @@ def main(argv):
         if command is None:
             raise ValueError('no full test command is configured for ' + slug)
         unchanged(pr, meta)
-        tests = run_tests(command, slug)
+        tests = run_tests(command, slug, head)
         unchanged(pr, meta)
         name, review = missing[0]
         evidence = {'head': head, 'base': base_name, 'base_oid': meta['baseRefOid'],
@@ -429,12 +465,12 @@ def main(argv):
         print('pr_review: fallback satisfied by one PASS and %d passing tests' % tests['count'])
         return code
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        print('pr_review: ' + str(exc))
+        print('pr_review: ' + diagnostic(str(exc)))
         if attempt is not None and not finished:
             try:
                 finish('BLOCK' if any(review.verdict == 'BLOCK' for review in results.values()) else 'INCOMPLETE', 3)
             except (OSError, ValueError, subprocess.SubprocessError) as posting:
-                print('pr_review: attempt remains held: ' + str(posting))
+                print('pr_review: attempt remains held: ' + diagnostic(str(posting)))
         return 3
 
 

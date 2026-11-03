@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -83,10 +84,8 @@ def tilde(path):
 
 
 def kit_cmd(rel, interpreter=None):
-    """A printable command for a kit script, e.g. kit_cmd('bin/trash.py') -> 'python3 ~/agent-core-kit/bin/trash.py'."""
-    path = tilde(os.path.join(CORE, rel))
-    if any(c in path for c in ' \t\'"$`'):
-        path = '"%s"' % os.path.join(CORE, rel).replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
+    """A shell command whose absolute kit script path is always one literal argument."""
+    path = shlex.quote(os.path.abspath(os.path.expanduser(os.path.join(CORE, rel))))
     if interpreter is None:
         interpreter = 'python3' if rel.endswith('.py') else ('bash' if rel.endswith('.sh') else '')
     return (interpreter + ' ' + path).strip()
@@ -106,6 +105,9 @@ def config(reload=False):
     for key, value in (mine.items() if isinstance(mine, dict) else []):
         if key.startswith('_'):
             continue
+        if key == 'protected_dirs' and isinstance(value, list):
+            # A malformed sibling must not erase paths the user explicitly protected.
+            value = [entry for entry in value if isinstance(entry, str) and entry.strip()]
         if key in DEFAULTS and not _fits(key, value):
             continue  # a malformed setting keeps its default instead of crashing or switching off a guard
         if key == 'pr_gate':

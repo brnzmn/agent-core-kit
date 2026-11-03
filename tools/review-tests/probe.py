@@ -35,9 +35,10 @@ def main():
         subprocess.run(['git', 'add', 'check.py'], cwd=repo, check=True)
         subprocess.run(['git', '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
                         '-c', 'commit.gpgsign=false', 'commit', '-qm', 'synthetic isolation probe'], cwd=repo, check=True)
+        head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
         probe.write_text('raise RuntimeError("read uncommitted content")')
         os.environ['AGENT_REVIEW_CANARY'] = 'synthetic'
-        result = review_worker.execute(str(repo), 'example/probe', ['python3', 'check.py', str(outside)])
+        result = review_worker.execute(str(repo), 'example/probe', ['python3', 'check.py', str(outside)], head)
         print(result.stdout, end='')
         return result.returncode
 

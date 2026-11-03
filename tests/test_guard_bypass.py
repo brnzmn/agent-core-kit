@@ -598,7 +598,8 @@ class HolesFromTheSecondReview(Cases):
         for cwd in ('/work/acme/dist-web', '/work/acme/node_modules', '/work/acme/build', '/work/acme/.next'):
             self.denied(['rm -rf .', 'rm -rf ./', 'rm -rf *', 'rm -rf ./*', 'rm -rf %s' % cwd, 'rm -rf ../%s' % os.path.basename(cwd),
                          'rm -rf ~+', 'rm -rf ../../acme/%s' % os.path.basename(cwd)], message='rm_cwd', cwd=cwd)
-        self.passes(['rm -rf .', 'rm -rf *'], cwd='/tmp/akit-not-real/dist-web')  # a temp folder is still fine
+        self.passes(['rm -rf .'], cwd='/tmp/akit-not-real/dist-web')  # a named temp folder is still fine
+        self.denied(['rm -rf *'], message='rm', cwd='/tmp/akit-not-real/dist-web')  # pattern batches require a listing
         self.passes(['rm -rf dist', 'rm -rf node_modules'], cwd='/work/acme/dist-web')
 
     def test_rm_of_the_working_folder_is_denied_not_trashed(self):

@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 CORE = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('pr_review_runner', CORE / 'bin' / 'pr_review.py')
@@ -26,6 +26,36 @@ def completed(code=0, out='', err=''):
 
 
 class ProviderResults(unittest.TestCase):
+    def test_native_rate_limit_error_is_a_confirmed_quota_outage(self):
+        result = self.codex(1, {'codex': {'status': 1, 'stdout': '', 'stderr': '',
+                                          'error': {'codexErrorInfo': 'rateLimitExceeded'}}})
+        self.assertEqual(result.unavailable, 'quota')
+
+    def test_failed_installed_cli_is_not_classified_as_missing(self):
+        result = self.codex(1, err='codex CLI not found in the runtime deployment')
+        self.assertIsNone(result.unavailable)
+        with patch.object(runner, 'sh', return_value=completed(4, 'claude: command not found in runtime')):
+            self.assertIsNone(runner.claude_review('origin/main').unavailable)
+
+    def test_provider_diagnostics_are_redacted_before_the_tail_is_taken(self):
+        secret = 'gh' + 'p_' + 'a' * 3000
+        for result in (self.codex(1, err='failure: ' + secret),
+                       self.codex(1, {'codex': {'status': 1, 'stderr': 'failure: ' + secret}}),
+                       self.codex(1, {'error': 'failure: ' + secret})):
+            with self.subTest(result=result):
+                self.assertIn('[REDACTED]', result.text)
+                self.assertNotIn('a' * 100, result.text)
+        with patch.object(runner, 'sh', return_value=completed(3, err='failure: ' + secret)):
+            result = runner.claude_review('origin/main')
+        self.assertIn('[REDACTED]', result.text)
+        self.assertNotIn('a' * 100, result.text)
+
+    def test_reviewer_script_comes_from_the_runner_installation(self):
+        with patch.object(runner.common, 'CORE', '/untrusted-checkout'), \
+                patch.object(runner, 'sh', return_value=completed(0, 'VERDICT: PASS')) as launch:
+            runner.claude_review('origin/main')
+        self.assertEqual(launch.call_args.args[0][1], str(CORE / 'bin/claude-review.sh'))
+
     def codex(self, code=0, data=None, err='', adversarial=False):
         out = json.dumps(data) if data is not None else 'bad JSON'
         with patch.object(runner.os.path, 'isfile', return_value=True), \
@@ -197,9 +227,23 @@ class ClaudeWrapper(unittest.TestCase):
 
 
 class TestExecution(unittest.TestCase):
+    def test_reviewed_revision_is_passed_to_the_worker(self):
+        with patch.object(runner, 'checkout_root', return_value=str(CORE)), \
+                patch.object(runner.review_worker, 'execute', return_value=completed(0, 'Ran 1 test in 0.1s\nOK')) as work, \
+                contextlib.redirect_stdout(io.StringIO()):
+            runner.run_tests(CMD, 'acme/kit', HEAD)
+        work.assert_called_once_with(str(CORE), 'acme/kit', CMD, HEAD)
+
+    def test_long_pytest_duration_is_a_completed_positive_suite(self):
+        for text in ('=== 345 passed in 95.03s (0:01:35) ===',
+                     '345 passed, 2 skipped in 3661.01s (1:01:01)',
+                     '345 passed in 95.03s (01:35)'):
+            with self.subTest(text=text):
+                self.assertEqual(runner.test_count(text), 345)
+
     def setUp(self):
         # The fixtures exercise real test output and cwd without starting Docker recursively inside the suite.
-        def fixture_worker(root, slug, command):
+        def fixture_worker(root, slug, command, head):
             return subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=15)
         worker = patch.object(runner.review_worker, 'execute', side_effect=fixture_worker)
         self.worker = worker.start()
@@ -222,7 +266,7 @@ class TestExecution(unittest.TestCase):
                 try:
                     os.chdir(package)
                     with contextlib.redirect_stdout(io.StringIO()):
-                        result = runner.run_tests([sys.executable, '-m', 'unittest', 'discover'], slug)
+                        result = runner.run_tests([sys.executable, '-m', 'unittest', 'discover'], slug, HEAD)
                 finally:
                     os.chdir(previous)
                 self.assertEqual(result['status'], 'FAIL')
@@ -236,7 +280,7 @@ class TestExecution(unittest.TestCase):
                 os.chdir(tmp)
                 with self.assertRaisesRegex(ValueError, 'checkout root'), \
                         contextlib.redirect_stdout(io.StringIO()):
-                    runner.run_tests([sys.executable, '-c', 'print("1 passed")'], 'owner/another-repo')
+                    runner.run_tests([sys.executable, '-c', 'print("1 passed")'], 'owner/another-repo', HEAD)
             finally:
                 os.chdir(previous)
 
@@ -245,7 +289,7 @@ class TestExecution(unittest.TestCase):
                    'import unittest; suite=unittest.TestSuite([unittest.FunctionTestCase(lambda: None)]); '
                    'unittest.TextTestRunner().run(suite)']
         with contextlib.redirect_stdout(io.StringIO()):
-            result = runner.run_tests(command, 'acme/kit')
+            result = runner.run_tests(command, 'acme/kit', HEAD)
         self.assertEqual(result, {'status': 'PASS', 'count': 1, 'command': command, 'exit_code': 0})
 
     def test_failed_and_empty_suites_cannot_supply_passing_evidence(self):
@@ -253,7 +297,7 @@ class TestExecution(unittest.TestCase):
             with self.subTest(text=text), patch.object(runner, 'checkout_root', return_value=str(CORE)), \
                     patch.object(runner.review_worker, 'execute', return_value=completed(code, text)), \
                     contextlib.redirect_stdout(io.StringIO()):
-                result = runner.run_tests(CMD, 'acme/kit')
+                result = runner.run_tests(CMD, 'acme/kit', HEAD)
                 self.assertEqual(result['status'], 'FAIL')
                 self.assertEqual(result['exit_code'], code)
 
@@ -277,7 +321,7 @@ class TestExecution(unittest.TestCase):
                   'unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(Skipped))')
         command = [sys.executable, '-c', script]
         with contextlib.redirect_stdout(io.StringIO()):
-            result = runner.run_tests(command, 'acme/kit')
+            result = runner.run_tests(command, 'acme/kit', HEAD)
         self.assertEqual(result['exit_code'], 0)
         self.assertEqual(result['count'], 0)
         self.assertEqual(result['status'], 'FAIL')
@@ -309,8 +353,47 @@ class TestExecution(unittest.TestCase):
         with patch.object(runner, 'checkout_root', return_value='/repo'), \
                 patch.object(runner.review_worker, 'execute', side_effect=ValueError('no worker')), \
                 patch.object(runner, 'sh') as host, self.assertRaisesRegex(ValueError, 'no worker'):
-            runner.run_tests(CMD, 'owner/project')
+            runner.run_tests(CMD, 'owner/project', HEAD)
         host.assert_not_called()
+
+
+class PinnedWorker(unittest.TestCase):
+    def test_worker_snapshots_the_reviewed_object_without_resampling_head(self):
+        calls = []
+        def trusted(args, **kwargs):
+            calls.append(args)
+            output = 'unix:///private/test-docker.sock' if args[:3] == ('docker', 'context', 'inspect') else ''
+            return subprocess.CompletedProcess(args, 0, output, '')
+        read, write = os.pipe()
+        os.write(write, b'1 passed in 0.1s\n')
+        os.close(write)
+        child = MagicMock()
+        child.stdout = os.fdopen(read, 'rb')
+        child.wait.return_value = 0
+        child.__enter__.return_value = child
+        selector = MagicMock()
+        selector.__enter__.return_value = selector
+        selector.select.return_value = [(None, None)]
+        try:
+            with patch.object(runner.review_worker.subprocess, 'run', side_effect=trusted), \
+                    patch.object(runner.review_worker.subprocess, 'Popen', return_value=child) as launch, \
+                    patch.object(runner.review_worker.selectors, 'DefaultSelector', return_value=selector):
+                result = runner.review_worker.execute('/repo', 'acme/kit', CMD, HEAD)
+        finally:
+            child.stdout.close()
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(calls)
+        self.assertFalse(any('HEAD^{commit}' in args for args in calls))
+        fetches = [args for args in calls if 'fetch' in args]
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(fetches[0][-1], HEAD)
+        self.assertIn(HEAD, launch.call_args.args[0])
+
+    def test_worker_rejects_an_unverified_revision_before_any_local_commands(self):
+        with patch.object(runner.review_worker.subprocess, 'run') as command, \
+                self.assertRaisesRegex(ValueError, 'reviewed commit'):
+            runner.review_worker.execute('/repo', 'acme/kit', CMD, 'HEAD')
+        command.assert_not_called()
 
 
 class AutomaticRun(unittest.TestCase):
