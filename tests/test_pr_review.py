@@ -34,7 +34,7 @@ case "$*" in *session-lifecycle-hook*) cat > /dev/null; exit 0 ;; esac
 cat "$FAKE/codex.json"
 '''
 FAKE_CODEX = '#!/bin/sh\nexit 0\n'
-FAKE_CLAUDE = '#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE/claude-args"\ncat "$FAKE/claude.txt"\n'
+FAKE_CLAUDE = '#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE/claude-args"\ncat > "$FAKE/committed.diff"\ncat "$FAKE/claude.txt"\n'
 
 
 # Fake credentials, assembled at run time so this file holds nothing a secret scanner would flag.
@@ -105,6 +105,8 @@ class PrReview(unittest.TestCase):
         run(['git', 'checkout', '-q', '-b', 'main'], self.work)
         self.commit('base.txt', 'base\n')
         run(['git', 'push', '-q', 'origin', 'main'], self.work)
+        self.base = run(['git', 'rev-parse', 'HEAD'], self.work)
+        run(['git', 'config', 'url.file://' + origin + '.insteadOf', 'https://github.com/acme/shop.git'], self.work)
         run(['git', 'checkout', '-q', '-b', 'feature'], self.work)
         self.commit('feature.txt', 'feature\n')
         self.head = run(['git', 'rev-parse', 'HEAD'], self.work)
@@ -119,7 +121,7 @@ class PrReview(unittest.TestCase):
 
     def pr(self, head, number=7, base='main'):
         with open(os.path.join(self.fake, 'pr.json'), 'w') as fh:
-            json.dump({'number': number, 'baseRefName': base, 'headRefOid': head,
+            json.dump({'number': number, 'baseRefName': base, 'headRefOid': head, 'baseRefOid': self.base,
                        'url': 'https://github.com/acme/shop/pull/%d' % number}, fh)
 
     def claude_says(self, text):
@@ -203,46 +205,11 @@ class PrReview(unittest.TestCase):
         self.assertNotIn('--mcp-config', args)
         self.assertNotIn('--dangerously-skip-permissions', args)
         self.assertIn('dontAsk', args)
-        self.assertTrue(any(a.startswith('Review the change on this branch: git diff origin/main...HEAD') for a in args))
-        denied = args[args.index('--disallowedTools') + 1:]
-        for tool in ('Edit', 'Write', 'NotebookEdit'):
-            self.assertIn(tool, denied)
-
-    def kit_settings(self):
-        """The inline --settings value the review was started with, parsed."""
-        self.review('7', 'claude')
-        args = self.calls('claude-args').split('\n')
-        self.assertEqual(args.count('--settings'), 1)
-        value = args[args.index('--settings') + 1]
-        self.assertTrue(value.startswith('{'), 'an inline JSON string, not a file path: %r' % value[:40])
-        self.assertFalse(os.path.exists(value))
-        self.assertLess(args.index('--settings'), args.index('--allowedTools'), 'tool lists take every argument after them')
-        return json.loads(value)
-
-    def test_claude_review_gets_kit_owned_inline_settings_and_never_the_users(self):
-        settings = self.kit_settings()
-        self.assertEqual(list(settings), ['permissions'])
-        self.assertEqual(list(settings['permissions']), ['deny'])
-        args = self.calls('claude-args').split('\n')
-        self.assertEqual(args[args.index('--setting-sources') + 1], '')  # still drops user, project and local files
-        script = open(os.path.join(BIN, 'claude-review.sh'), encoding='utf-8').read()
-        self.assertNotIn('settings.json', script)
-        self.assertNotIn('.claude/settings', script)
-
-    def test_claude_review_cannot_read_credentials(self):
-        deny = self.kit_settings()['permissions']['deny']
-        for rule in ('Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Read(~/.config/gh/**)', 'Read(~/.claude/.credentials.json)',
-                     'Read(~/.codex/auth.json)', 'Read(~/.netrc)', 'Read(**/.env)', 'Read(**/.env.*)',
-                     'Read(**/*.pem)', 'Read(**/*.key)', 'Read(**/id_rsa)', 'Read(**/id_ed25519)'):
-            self.assertIn(rule, deny)
-        self.assertNotIn('Read', [r for r in deny if '(' not in r])  # no blanket Read deny: the review must read code
-
-    def test_claude_review_cannot_make_git_write_or_read_outside_the_repo(self):
-        deny = self.kit_settings()['permissions']['deny']
-        for rule in ('Bash(git diff --output*)', 'Bash(git diff *--output*)', 'Bash(git diff -o*)',
-                     'Bash(git diff * -o*)', 'Bash(git diff --no-index*)', 'Bash(git diff *--no-index*)',
-                     'Bash(git log *--output*)', 'Bash(git show *--output*)'):
-            self.assertIn(rule, deny)
+        self.assertIn('--tools', args)
+        self.assertEqual(args[args.index('--tools') + 1], '')
+        self.assertNotIn('--allowedTools', args)
+        self.assertIn('+feature', self.calls('committed.diff'))
+        self.assertTrue(any(self.base in a and self.head in a for a in args))
 
     def test_codex_p1_blocks_and_p2_passes(self):
         self.codex_says('[P1] feature.txt:1 loses data when the file is empty.')
@@ -251,7 +218,7 @@ class PrReview(unittest.TestCase):
         body = self.comment()
         self.assertTrue(body.startswith('## Codex review\nhead: %s\n\n' % self.head))
         self.assertTrue(body.endswith('\n\nVERDICT: BLOCK\n'))
-        self.assertIn('review --wait --json --base origin/main', self.calls('node-calls'))
+        self.assertIn('review --wait --json --base ' + self.base, self.calls('node-calls'))
         self.assertNotIn('adversarial', self.calls('node-calls'))
 
         self.codex_says('[P2] feature.txt:1 name could be clearer.')
@@ -267,7 +234,7 @@ class PrReview(unittest.TestCase):
         self.assertTrue(body.startswith('## Codex adversarial review\nhead: %s\n\n' % self.head))
         self.assertIn('"race"', body)
         self.assertTrue(body.endswith('\n\nVERDICT: BLOCK\n'))
-        self.assertIn('adversarial-review --wait --json --base origin/main', self.calls('node-calls'))
+        self.assertIn('adversarial-review --wait --json --base ' + self.base, self.calls('node-calls'))
 
         self.codex_says('Nothing found.', {'verdict': 'approve'})
         out = self.review('7', 'codex', '--adversarial')

@@ -25,6 +25,7 @@ Prints a decision as JSON, or nothing to let the call through.
 Its own errors never block a call; they go to learning/hook-errors.log.
 """
 import fnmatch
+import glob
 import json
 import os
 import re
@@ -88,8 +89,8 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'status', 'stripspace', 'submodule', 'subtree', 'switch', 'symbolic-ref', 'tag', 'update-index', 'update-ref',
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(),
-         'pipe': [], 'sep': ';', 'plain': False, 'deferred_body': False,
+STATE = {'cwd': '', 'cwd_candidates': None, 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(),
+         'pipe': [], 'sep': ';', 'plain': False, 'deferred_body': False, 'body_file_unstable': False,
          'raw': [], 'moved': False, 'envcfg': [], 'inherit': [], 'penv': {}, 'pinherit': {}, 'xargs': False,
          'marks': {'active': set(), 'unquoted': set(), 'braced': set()}}  # cwd None = unknown; raw = the command's tokens before $VAR expansion
 TRASH = common.kit_cmd('bin/trash.py')
@@ -179,6 +180,7 @@ class Protected:
             else:
                 names.add(os.path.normpath(d))
         self.paths = sorted(paths)
+        self.names = [_fold(name).split(os.sep) for name in sorted(names)]
         self.tails = sorted({'/' + '/'.join(q.split('/')[-3:]) + '/' for q in self.paths})
         body = '|'.join(re.escape(n) for n in sorted(names))
         self.name_re = re.compile(r'(^|[/=:])(' + body + r')(/|$)') if names else None
@@ -213,6 +215,7 @@ class Protected:
             return None
         return os.path.join(base or os.getcwd(), c)
 
+
     def _tail_hit(self, c):
         """A path we cannot resolve: protected when it names the last folders of a protected path in a row."""
         parts = [x for x in c.split('/') if x and '$' not in x and '`' not in x]
@@ -229,6 +232,16 @@ class Protected:
         for c in self._candidates(token):
             full = self._absolute(c, literal=isinstance(token, ExpandedOperand) and not token.path_uncertain)
             if full is None:
+                bases = STATE['cwd_candidates']
+                literal = isinstance(token, ExpandedOperand) and not token.path_uncertain
+                if (STATE['cwd'] is None and bases is not None and
+                        (literal or not re.search(r'[$`]', c)) and not os.path.isabs(os.path.expanduser(c))):
+                    for base in bases:
+                        candidate = ExpandedOperand(os.path.join(base, os.path.expanduser(c)))
+                        candidate.path_uncertain = False
+                        if self.hit(candidate, ancestor):
+                            return True
+                    continue
                 if STATE['cwd'] is None or self._tail_hit(c):
                     return True
                 continue
@@ -236,6 +249,18 @@ class Protected:
                 return True
             if GLOB.search(full):
                 pat = _fold(os.path.normpath(full)).split(os.sep)
+                if self.names:
+                    for count, match in enumerate(glob.iglob(full)):
+                        for resolved in (match, os.path.realpath(match)):
+                            parts = _fold(os.path.normpath(resolved)).split(os.sep)
+                            for name in self.names:
+                                if any(parts[start:start + len(name)] == name for start in range(len(parts))):
+                                    return True
+                                if ancestor and any(parts[-n:] == name[:n] and os.path.lexists(
+                                        os.path.join(resolved, *name[n:])) for n in range(1, len(name))):
+                                    return True
+                        if count >= 255:
+                            return True  # a larger expansion cannot be established safe during this hook
                 for q in self.paths:
                     qp = q.split(os.sep)
                     if (len(pat) >= len(qp) or ancestor) and all(
@@ -248,6 +273,7 @@ class Protected:
                     if _inside(p, q) or (ancestor and _inside(q, p)):
                         return True
         return False
+
 
     def backup(self, token):
         """True when token is under <protected>/backups/: additive snapshots before a change are allowed."""
@@ -367,12 +393,17 @@ def _ansi_c(body):
 
     def one(m):
         e = m.group(1)
-        if e[0] in 'xu':
-            return chr(int(e[1:], 16))
+        if e[0] in 'xuU':
+            if len(e) == 1:
+                raise TooDeep('incomplete ANSI-C escape')
+            codepoint = int(e[1:], 16)
+            if not 0 < codepoint <= 0x10ffff or 0xd800 <= codepoint <= 0xdfff:
+                raise TooDeep('invalid ANSI-C character')
+            return chr(codepoint)
         if e[0].isdigit():
             return chr(int(e, 8) & 0xFF)
         return plain.get(e, '\\' + e)
-    return re.sub(r'\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|[0-7]{1,3}|.)', one, body, flags=re.S)
+    return re.sub(r'\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|.)', one, body, flags=re.S)
 
 
 def normalize(cmd):
@@ -450,6 +481,8 @@ class ShellToken(str):
     expansion_sites = None
     unquoted_expansion = None
     unquoted_pattern = False
+    substitution_scripts = ()
+    process_substitution = False
 
 
 
@@ -595,8 +628,9 @@ def _split_commands(tokens):
         elif run:
             for s in SEP_PART.findall(t):
                 if s == '(':
+                    entry = prev if not cmd else '('
                     flush('(')
-                    events.append(('open', [], '(', '('))
+                    events.append(('open', [], entry, '('))
                 elif s == ')':
                     flush(')')
                     events.append(('close', [], ')', ')'))
@@ -655,7 +689,7 @@ def wrapper_value_flag(head, flag, values):
         return True
     if head == 'env' and flag.startswith('-') and not flag.startswith('--'):
         at = next((i for i, ch in enumerate(flag[1:], 1) if ch in 'uCS'), None)
-        return at is not None and flag[at] == 'u' and at == len(flag) - 1
+        return at is not None and at == len(flag) - 1
     return False
 
 
@@ -739,8 +773,10 @@ def env_split_script(toks):
                     value = toks.pop(0) if toks else ''
                 elif flag.startswith('--split-string='):
                     value = flag.split('=', 1)[1]
-                elif not flag.startswith('--') and 'S' in flag[1:]:
-                    value = flag[flag.index('S', 1) + 1:] or (toks.pop(0) if toks else '')
+                elif not flag.startswith('--'):
+                    at = next((i for i, ch in enumerate(flag[1:], 1) if ch in 'uCS'), None)
+                    if at is not None and flag[at] == 'S':
+                        value = flag[at + 1:] or (toks.pop(0) if toks else '')
             if value is not None:
                 return ' '.join([value] + [shlex.quote(t) for t in toks])
             if wrapper_value_flag(head, flag, values) and toks:
@@ -894,7 +930,7 @@ def review_authors(gh, gate):
     return {login.lower()}
 
 
-def review_verdict(pr, who, head, authors, trust_bot=False):
+def review_verdict(pr, who, head, authors, trust_bot=False, run_id=None):
     """'PASS', 'BLOCK' or None for the latest '## <Who> ...review' comment naming head, written by one of authors.
     Codex's GitHub review app on the head commit counts as a Codex review only when pr_gate.trust_codex_bot is true."""
     found = None
@@ -902,7 +938,10 @@ def review_verdict(pr, who, head, authors, trust_bot=False):
         if str((c.get('author') or {}).get('login') or '').lower() not in authors:
             continue
         body = str(c.get('body') or '').lstrip()
-        if body.startswith('## ' + who) and ('head: ' + head) in body:
+        lines = body.splitlines()
+        if (len(lines) >= 2 and re.fullmatch('## ' + who + r'(?: adversarial)? review', lines[0])
+                and lines[1] == 'head: ' + head
+                and (run_id is None or (len(lines) >= 3 and lines[2] == 'run: ' + run_id))):
             m = re.findall(r'^VERDICT: (PASS|BLOCK)\s*$', body, re.M)
             found = m[-1] if m else found
     if who == 'Codex' and not found and trust_bot:
@@ -913,6 +952,86 @@ def review_verdict(pr, who, head, authors, trust_bot=False):
 
 
 REVIEW_EVIDENCE = 'AGENT_CORE_REVIEW_EVIDENCE_V1: '
+REVIEW_RUN = 'AGENT_CORE_REVIEW_RUN_V1: '
+
+
+def passing_test_receipt(checks, command):
+    return (bool(command) and isinstance(checks, dict) and checks.get('status') == 'PASS'
+            and type(checks.get('count')) is int and checks['count'] > 0
+            and type(checks.get('exit_code')) is int and checks['exit_code'] == 0
+            and checks.get('command') == command)
+
+
+def latest_availability(pr, head, authors):
+    found = None
+    for index, c in enumerate(pr.get('comments') or []):
+        if str((c.get('author') or {}).get('login') or '').lower() not in authors:
+            continue
+        lines = str(c.get('body') or '').splitlines()
+        if not lines or lines[0] != '## Agent-core review availability':
+            continue
+        records = [line[len(REVIEW_EVIDENCE):] for line in lines if line.startswith(REVIEW_EVIDENCE)]
+        try:
+            data = json.loads(records[0]) if len(records) == 1 else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            found = (None, index)
+        elif data.get('head') == head and data.get('base') == pr.get('baseRefName'):
+            found = (data, index)
+    return found
+
+
+def latest_automatic_run(pr, head, authors):
+    """Only the most recently started automatic attempt can finish and reopen the gate."""
+    latest, active = None, None
+    for index, c in enumerate(pr.get('comments') or []):
+        if str((c.get('author') or {}).get('login') or '').lower() not in authors:
+            continue
+        lines = str(c.get('body') or '').splitlines()
+        if not lines or lines[0] != '## Agent-core review run':
+            continue
+        records = [line[len(REVIEW_RUN):] for line in lines if line.startswith(REVIEW_RUN)]
+        try:
+            data = json.loads(records[0]) if len(records) == 1 else None
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            latest = ({'status': 'INVALID'}, index)
+            continue
+        if data.get('head') != head or data.get('base') != pr.get('baseRefName'):
+            continue
+        run_id = data.get('run_id')
+        if (not isinstance(run_id, str) or not re.fullmatch(r'[a-f0-9]{32}', run_id)
+                or not isinstance(data.get('base_oid'), str)
+                or not re.fullmatch(r'[a-f0-9]{40}', data['base_oid'])
+                or data['base_oid'] != pr.get('baseRefOid')):
+            latest = ({'status': 'INVALID'}, index)
+        elif data.get('status') == 'RUNNING':
+            active, latest = run_id, (data, index)
+        elif run_id == active:
+            latest = (data, index)
+        elif active is None:
+            latest = ({'status': 'INVALID'}, index)  # no corresponding trusted start
+    return latest
+
+
+def automatic_run_passes(pr, attempt, head, authors, gate, command):
+    if attempt.get('status') != 'PASS':
+        return False
+    providers = attempt.get('providers')
+    if not isinstance(providers, dict) or set(providers) != {'Claude', 'Codex'}:
+        return False
+    passed = [name for name, status in providers.items() if status == 'PASS']
+    if any(review_verdict(pr, name, head, authors, run_id=attempt['run_id']) != 'PASS' for name in passed):
+        return False
+    if len(passed) == 2:
+        return True
+    unavailable = [name for name, status in providers.items() if status == 'UNAVAILABLE']
+    reasons = attempt.get('reasons')
+    return (gate.get('allow_single_on_unavailable') is True and len(passed) == len(unavailable) == 1
+            and isinstance(reasons, dict) and reasons.get(unavailable[0]) in ('quota', 'auth', 'service', 'missing_cli')
+            and passing_test_receipt(attempt.get('tests'), command))
 
 
 def outage_tests_pass(pr, provider, head, authors, command):
@@ -935,12 +1054,13 @@ def outage_tests_pass(pr, provider, head, authors, command):
             found = None
         elif data.get('head') == head and data.get('base') == pr.get('baseRefName') and data.get('provider') == provider:
             found = data
-    if not found or found.get('status') != 'UNAVAILABLE' or found.get('reason') not in ('quota', 'auth', 'service', 'missing_cli'):
+    if (not found or found.get('status') != 'UNAVAILABLE'
+            or found.get('base_oid') != pr.get('baseRefOid')
+            or not re.fullmatch(r'[a-f0-9]{40}', str(found.get('base_oid') or ''))
+            or found.get('reason') not in ('quota', 'auth', 'service', 'missing_cli')):
         return False
     checks = found.get('tests')
-    return (isinstance(checks, dict) and checks.get('status') == 'PASS' and type(checks.get('count')) is int
-            and checks['count'] > 0 and type(checks.get('exit_code')) is int and checks['exit_code'] == 0
-            and checks.get('command') == command)
+    return passing_test_receipt(checks, command)
 
 
 def merge_decision(args, repo=()):
@@ -973,7 +1093,7 @@ def merge_decision(args, repo=()):
                             'Use -R owner/repo or a full PR URL.')
     gh = os.environ.get('AGENT_CORE_GH') or 'gh'
     try:
-        out = gh_run([gh, 'pr', 'view'] + sel[:1] + repo + ['--json', 'number,url,baseRefName,headRefOid,'
+        out = gh_run([gh, 'pr', 'view'] + sel[:1] + repo + ['--json', 'number,url,baseRefName,baseRefOid,headRefOid,'
                                                                       'comments,reviews'])
         if out.returncode:
             return 'deny', MSG['review_unread'] % (out.stderr.strip()[:200] or 'gh failed')
@@ -993,6 +1113,16 @@ def merge_decision(args, repo=()):
     for who, v in verdicts.items():
         if v == 'BLOCK':
             return 'deny', MSG['review_block'] % (pr.get('number'), who, head[:12])
+    attempt = latest_automatic_run(pr, head, authors)
+    availability = latest_availability(pr, head, authors)
+    command = common.review_test_command(slug)
+    if availability and (not attempt or availability[1] > attempt[1]) and (
+            not availability[0] or not passing_test_receipt(availability[0].get('tests'), command)):
+        return 'deny', 'The latest automatic review tests failed or are unverified. Run pr_review.py with auto again.'
+    if attempt:
+        if automatic_run_passes(pr, attempt[0], head, authors, gate, command):
+            return None
+        return 'deny', 'The latest automatic review run is not a verified pass. Run pr_review.py with auto again.'
     missing = [who for who, v in verdicts.items() if not v]
     if missing:
         if len(missing) == 1 and gate.get('allow_single_on_unavailable') is True:
@@ -1004,7 +1134,6 @@ def merge_decision(args, repo=()):
         return 'deny', MSG['review_wait'] % (pr.get('number'), branch, slug, head[:12], ' and '.join(missing),
                                              pr.get('number'))
     return None
-
 
 
 def gh_split(args):
@@ -1023,21 +1152,19 @@ def gh_split(args):
             words.append(a)
         else:
             rest.append(a)
+            value_flags = GH_MERGE_VALUE | {'-f', '--field', '--raw-field', '-X', '--method', '-H', '--header',
+                                           '-q', '--jq', '--template', '--json', '--hostname', '--input',
+                                           '--cache', '-p', '--preview'}
+            if a in value_flags and k + 1 < len(args):
+                rest.append(args[k + 1])
+                k += 1  # a body/template value that starts -R is still an option value
         k += 1
     return words, repo, rest
 
 
 def api_method(args):
     """The method of a gh api call: -X DELETE, -X=DELETE, -XDELETE, -iX DELETE, --method DELETE or --method=DELETE; the last wins."""
-    method = ''
-    for k, a in enumerate(args):
-        if a in ('--method',) and k + 1 < len(args):
-            method = args[k + 1]
-        elif a.startswith('--method='):
-            method = a.split('=', 1)[1]
-        elif a.startswith('-') and not a.startswith('--') and 'X' in a and not set(a[1:a.index('X')]) & set('fFHqtp'):
-            tail = a[a.index('X') + 1:]
-            method = tail.lstrip('=') if tail else (args[k + 1] if k + 1 < len(args) else '')
+    method = next(((value or '?').lstrip('=') for flag, value in reversed(gh_api_parts(args)[0]) if flag == '--method'), '')
     return method.upper()
 
 
@@ -1055,12 +1182,17 @@ def reads_only(prog, args):
     body = any(a in flags or (a.startswith('--') and len(a.split('=', 1)[0]) > 2 and any(
         f.startswith(a.split('=', 1)[0]) for f in flags if f.startswith('--'))) for a in args)
     if prog == 'gh':
+        options, _, unknown = gh_api_parts(args)
+        if unknown:
+            return False
         method = api_method(args)
-        body = body or any(re.match(r'^-[A-Za-z]*[fF]', a) and not a.startswith('--') and 'X' not in a for a in args)
+        body = any(flag in ('--field', '--raw-field', '--input') for flag, _ in options)
     elif prog == 'curl':
         method, upload = '', False
         for k, a in enumerate(args):
             flag = a.split('=', 1)[0]
+            if flag.startswith('--expand-'):
+                return False  # curl variable expansion can turn a method, upload or payload into a write
             if a == '-:' or (flag.startswith('--') and len(flag) > 2 and
                               any(name.startswith(flag) for name in ('--config', '--next'))):
                 return False  # config files and separate transfers can change a request the guard cannot see
@@ -1140,32 +1272,52 @@ def posts_verdict(words, args):
         elif value:
             filtered.append(a)
             value = False
-        elif a in ('--jq', '-q', '--template'):
+        elif a in ('--jq', '-q', '--template', '-t'):
             skip = True
-        elif not a.startswith(('--jq=', '--template=', '-q')):
+        elif not a.startswith(('--jq=', '--template=', '-q', '-t')):
             filtered.append(a)
             value = a in ('-b', '--body', '-f', '-F', '--field', '--raw-field', '--body-file', '--input')
     plain = filtered  # local output filters never publish text
-    texts, files = list(plain), []
-    for k, a in enumerate(plain):
-        if a in ('-F', '--body-file', '--input') and k + 1 < len(plain):
-            files.append(plain[k + 1])
-        elif a.startswith(('--body-file=', '--input=')):
-            files.append(a.split('=', 1)[1])
-        if '=@' in a:
-            files.append(a.split('=@', 1)[1])  # gh api -F body=@file
-    stdin = '-' in files
-    texts += [read_text(f) or '' for f in files if f != '-']
+    texts, files, unknown = list(plain), [], False
+    if words[:1] == ['api']:
+        for flag, value in gh_api_parts(plain)[0]:
+            if flag in ('--field', '--raw-field', '--input'):
+                unknown = unknown or value is None or getattr(value, 'path_uncertain', False)
+            if flag == '--input':
+                files.append(value)
+            elif flag == '--field' and value is not None and '=@' in value:
+                files.append(operand_value(value.split('=@', 1)[1], value))
+    else:
+        for k, a in enumerate(plain):
+            if a in ('-F', '--body-file') and k + 1 < len(plain):
+                files.append(plain[k + 1])
+            elif a.startswith('--body-file='):
+                files.append(operand_value(a.split('=', 1)[1], a))
+            elif a.startswith('-F') and len(a) > 2:
+                files.append(operand_value(a[2:], a))
+            if a in ('-b', '--body', '-F', '--body-file') and k + 1 < len(plain):
+                unknown = unknown or getattr(plain[k + 1], 'path_uncertain', False)
+            elif a.startswith(('--body=', '--body-file=', '-b', '-F')):
+                unknown = unknown or getattr(a, 'path_uncertain', False)
+    for path in files:
+        text = gh_body_file(path, args)
+        unknown = unknown or text is None
+        if text is not None:
+            texts.append(text)
     for op, target in redirs:
         if op == '<<' and target.startswith(HEREDOC_MARK):
-            texts.append(heredoc_body(target) or '')
+            text = heredoc_body(target)
         elif op == '<<<':
-            texts.append(target)
+            text = None if getattr(target, 'path_uncertain', False) else target
         elif op == '<':
-            texts.append(read_text(target) or '')
-    if stdin and STATE['pipe']:
-        texts.append(piped_text(STATE['pipe'][-1]) or '')
-    return any(VERDICT_TEXT.search(t) or REVIEW_EVIDENCE.strip() in t for t in texts if t)
+            text = gh_body_file(target, ())
+        else:
+            continue
+        unknown = unknown or text is None
+        if text is not None:
+            texts.append(text)
+    capable = words[:2] in COMMENT_CMDS or (words[:1] == ['api'] and api_comment_endpoint(args))
+    return (unknown and capable) or any(VERDICT_TEXT.search(t) or REVIEW_EVIDENCE.strip() in t or 'AGENT_CORE_REVIEW_RUN_V1:' in t for t in texts if t)
 
 
 def gh_decision(args):
@@ -1174,7 +1326,7 @@ def gh_decision(args):
         return 'deny', MSG['fake_verdict']
     if words[:2] == ['pr', 'merge']:
         return merge_decision(rest, repo)
-    if words[:1] == ['api'] and gate_branches() and (any(GRAPHQL_MERGE.search(a) for a in args) or (
+    if words[:1] == ['api'] and gate_branches() and (graphql_merges(args) or any(GRAPHQL_MERGE.search(a) for a in args) or (
             any(API_MERGE.search(a) for a in args) and not reads_only('gh', args))):
         return 'deny', MSG['api_merge']  # a GET of pulls/N/merge only asks whether it merged
     if words[:2] == ['repo', 'delete']:
@@ -1273,6 +1425,8 @@ def unresolved_path(value, source):
 
 def unknown_expansion(token):
     """An active expansion with no known value; a literal dollar in a known value is never expanded again."""
+    if getattr(token, 'substitution_scripts', ()):
+        return True
     sites = getattr(token, 'expansion_sites', None)
     if sites is None:
         return bool(re.search(r'[$`]', token))
@@ -1567,7 +1721,15 @@ def git_decision(args):
     if sub in ('add', 'stage'):
         if STATE['xargs']:
             return 'deny', MSG['stage']  # xargs appends or replaces paths the guard has not seen
-        s, l, p = flag_parts(rest, value_opts={'--chmod', '--pathspec-from-file'})
+        parsed, end = [], False
+        for argument in rest:
+            option, eq, value = argument.partition('=')
+            if argument == '--':
+                end = True
+            if not end and len(option) > 2 and '--pathspec-from-file'.startswith(option):
+                argument = '--pathspec-from-file' + ('=' + value if eq else '')
+            parsed.append(argument)
+        s, l, p = flag_parts(parsed, value_opts={'--chmod', '--pathspec-from-file'})
         sweeping = bool(s & {'A', 'u'} or l & {'--all', '--update', '--no-ignore-removal'})
         # An unknown folder (unless -C names one) gives no repo root to compare with, so only a plain relative pathspec
         # can be judged then. A word the shell expands or splits ($VAR, brace expansion) is not what the guard sees.
@@ -1607,8 +1769,10 @@ def git_decision(args):
             colon_delete = colon_delete or (bool(sep) and not src)
             main_hit = main_hit or (dst if sep else src) in MAIN_REFS or bool(MAIN_DST.search(dst if sep else src))
             wild = wild or '*' in ref
-            unresolved = unresolved or (bool(VAR_USE.search(ref)) and any(VAR_USE.search(w) and w in STATE['marks']['active']
-                                                                          for w in raw_words(args, rest, ref)))  # a variable (not '$x'): it may hold main
+            raw_refs = [(word, queried_branch(word)) for word in raw_words(args, rest, ref)]
+            main_hit = main_hit or any(branch_class(branch) == 'main' for _, branch in raw_refs if branch)
+            unresolved = unresolved or (bool(VAR_USE.search(ref)) and any(VAR_USE.search(word) and
+                word in STATE['marks']['active'] and branch is None for word, branch in raw_refs))
         # a refspec or mirror in the command line config (remote.<name>.push / .mirror, push.default) is a push nobody can read
         configured = any(risky_config(c, force or plus) for c in config)
         if configured or ((force or plus or deleting or colon_delete) and main_hit):
@@ -1629,6 +1793,10 @@ def git_decision(args):
         if '--mirror' in l:
             return 'deny', MSG['mirror']
     elif sub == 'reset':
+        mode_args = rest[:rest.index('--')] if '--' in rest else rest
+        if any(unknown_expansion(raw) or unresolved_path(ref, raw)
+               for ref in mode_args for raw in raw_words(args, rest, ref)):
+            return 'deny', MSG['reset']  # an inherited or generated word can be --hard rather than a revision
         if '--hard' in widen(flag_parts(rest)[1], {'--hard'}):
             return 'deny', MSG['reset']
     elif sub == 'clean':
@@ -1808,11 +1976,17 @@ def whole_cwd(target):
 
 def rm_decision(args):
     recursive, _, targets = rm_parts(args)
+    here = os.path.normpath(STATE['cwd'] or '/')
+    whole = recursive and any(whole_cwd(t) and not _temp_path(os.path.normpath(os.path.join(
+        here, os.path.expanduser(t)))) for t in targets)
+    if whole and not PROTECTED.hit(here, ancestor=True) and not any(
+            PROTECTED.hit(t, ancestor=True) for t in targets if not GLOB.search(t)):
+        return 'deny', MSG['rm_cwd']
     if any(PROTECTED.hit(t, ancestor=recursive) for t in targets):
         return 'deny', MSG['lake']
-    here = os.path.normpath(STATE['cwd'] or '/')
-    if recursive and any(whole_cwd(t) and not _temp_path(os.path.normpath(os.path.join(here, os.path.expanduser(t))))
-                         for t in targets):
+    if recoverable_files(targets):
+        return 'deny', MSG['rm']
+    if whole:
         return 'deny', MSG['rm_cwd']  # whatever the folder is called: a build-folder name does not make its parent disposable
     if recursive and (not targets or not all(disposable(t) or plain_files(t) for t in targets)):
         return 'deny', MSG['rm']
@@ -1820,20 +1994,34 @@ def rm_decision(args):
 
 
 def destination(args, value_letters):
-    s, l, p = flag_parts(args, value_opts={'-t', '--target-directory', '-e', '--rsh', '--exclude', '--include',
-                                           '--filter', '-S', '--suffix'}, value_letters=value_letters)
-    for k, a in enumerate(args):
-        if a in ('-t', '--target-directory') and k + 1 < len(args):
-            return args[k + 1], p
-        if a.startswith('--target-directory='):
-            return operand_value(a.split('=', 1)[1], a), p
-        if a.startswith('-t') and not a.startswith('--') and len(a) > 2:
-            return operand_value(a[2:], a), p
+    values = {'-t', '--target-directory', '-e', '--rsh', '--exclude', '--include', '--filter', '-S', '--suffix'}
+    s, l, p = flag_parts(args, value_opts=values, value_letters=value_letters)
+    k = 0
+    while k < len(args):
+        a = args[k]
+        if a == '--':
+            break
+        if a.startswith('--'):
+            flag, eq, value = a.partition('=')
+            if flag == '--target-directory':
+                return (operand_value(value, a) if eq else (args[k + 1] if k + 1 < len(args) else None)), p
+            k += 1 + (flag in values and not eq)
+            continue
+        if a.startswith('-'):
+            taking = next((n for n, char in enumerate(a[1:], 1) if char in value_letters), None)
+            if taking is not None:
+                value = a[taking + 1:]
+                if a[taking] == 't':
+                    return (operand_value(value, a) if value else (args[k + 1] if k + 1 < len(args) else None)), p
+                k += not value
+        k += 1
     return (p[-1] if len(p) >= 2 else None), p
 
 
 def inplace_files(prog, args):
     """The files sed -i / perl -i would rewrite: positionals after the script, not the script itself."""
+    if prog == 'sed':
+        return [args[k] for k in sed_arguments(args)[3]]
     files, script_seen, k = [], False, 0
     while k < len(args):
         a = args[k]
@@ -2073,41 +2261,66 @@ def structured_reads_env(prog, args, file_operand):
 
 
 def reads_env(prog, args):
-    """True when a reader program is given an env file (or a glob matching one) to read."""
-    if prog == 'sed' and any(a == '--in-place' or a.startswith('--in-place=') or
-                             (a.startswith('-') and not a.startswith('--') and 'i' in a[1:]) for a in args):
-        return False  # sed -i edits in place and prints nothing; the protected-folder check covers it
-    skip_first = prog in PATTERN_FIRST and not any(a in PATTERN_OPTS or a.startswith(('--regexp=', '--file=',
-                                                                                      '--expression=')) for a in args)
+    """True when a reader program is given an env file (or a glob matching one) to read, unless it can only print
+    variable names, counts or file names (names_only)."""
+    if names_only(prog, args):
+        return False
     raw_args = STATE['raw'][-len(args):] if args else []
+    args, redirects = split_redirects(args)
+    raw_args = [getattr(arg, 'source_operand', arg) for arg in args]
 
     def file_operand(index, value):
-        raw = raw_args[index] if index < len(raw_args) else value
+        raw = getattr(value, 'source_operand', raw_args[index] if index < len(raw_args) else value)
         return env_hit(value) or unresolved_path(value, raw)
 
+    if any(op.startswith('<') and op not in ('<<', '<<-', '<<<') and file_operand(0, target)
+           for op, target in redirects):
+        return True
+    if prog in PATTERN_FIRST and any(getattr(raw, 'unquoted_expansion', False) and unresolved_path(value, raw)
+                                    for value, raw in zip(args, raw_args)):
+        return True  # a skipped pattern/value must not split into additional input files
+    if prog == 'sed':
+        scripts, script_files, inplace, files = sed_arguments(args)
+        if inplace and scripts and not script_files and all(quiet_inplace_substitution(script) for script in scripts):
+            return False
+        return any(file_operand(index, value) for index, value in script_files) or any(
+            file_operand(index, args[index]) for index in files)
     if prog in ('jq', 'yq'):
         if any(unresolved_path(value, raw) or getattr(raw, 'unquoted_pattern', False)
                for value, raw in zip(args, raw_args)):
             return True  # skipped filter/option words must not expand into extra flags or filenames
         return structured_reads_env(prog, args, file_operand)
 
-    k = 0
+    skip_first = prog in PATTERN_FIRST and not supplied_search_pattern(prog, args)
+    literal, k = False, 0
     while k < len(args):
         a = args[k]
         k += 1
-        if a in FILE_FLAGS and k < len(args):  # -g .env*, --include .env, -f patterns: the value names files
+        if not literal and a == '--':
+            literal = True
+        elif not literal and a in FILE_FLAGS and k < len(args):  # -g .env*, --include .env, -f patterns
             if file_operand(k, args[k]):
                 return True
             k += 1
-        elif prog in PATTERN_FIRST and a in PATTERN_OPTS | SEARCH_VALUE and k < len(args):
+        elif not literal and prog in PATTERN_FIRST and a in PATTERN_OPTS | SEARCH_VALUE and k < len(args):
             k += 1  # a search pattern, script or context count is not a file operand
-        elif a.startswith('-') and a != '-':
+        elif not literal and a.startswith('-') and a != '-':
             if a.startswith('--') and '=' in a:
                 flag, value = a.split('=', 1)
                 if flag in FILE_FLAGS and file_operand(k - 1, value):
                     return True
                 if flag not in PATTERN_OPTS and env_hit(value):
                     return True
+            elif prog in PATTERN_FIRST:
+                takes = SEARCH_LETTERS.get(prog, 'efFv')
+                at = next((n for n, char in enumerate(a[1:], 1) if char in takes), None)
+                if at is not None:
+                    attached = a[at + 1:]
+                    index = k - 1 if attached else k
+                    value = attached or (args[k] if k < len(args) else '')
+                    if a[at] in 'fg' and value and file_operand(index, value):
+                        return True
+                    k += not attached and k < len(args)
         elif skip_first:
             skip_first = False  # grep/rg/awk/sed: the first operand is the pattern or script, not a file
         elif file_operand(k - 1, a):
@@ -2120,8 +2333,8 @@ def change_dir(args):
     folder, and a folder that does not exist unless && makes sure the rest only runs after a good cd."""
     target = next((a for a in args if a == '-' or not a.startswith('-')), None)
     if target is None:
-        new = common.HOME
-    elif target == '-' or GLOB.search(target) or '$' in target or '`' in target or re.match(r'^~[^/]', target):
+        target = known_variable('HOME')
+    if target is None or target == '-' or GLOB.search(target) or '$' in target or '`' in target or re.match(r'^~[^/]', target):
         new = None
     else:
         path = os.path.expanduser(target)
@@ -2133,7 +2346,7 @@ def change_dir(args):
             new = os.path.normpath(os.path.join(STATE['cwd'], path))
     if new and STATE['sep'] != '&&' and not os.path.isdir(new):
         new = None  # a failed cd leaves the old folder in place, and `;` runs the next command anyway
-    STATE['cwd'] = new
+    set_cwd(new)
 
 
 def read_text(path):
@@ -2160,7 +2373,7 @@ def piped_text(prev):
     if prog == 'echo':
         return ' '.join(a for a in plain if not re.match(r'^-[neE]+$', a)).replace('\\n', '\n')
     if prog == 'printf':
-        return '\n'.join(plain).replace('\\n', '\n')
+        return printf_output(plain)
     if prog == 'cat':
         texts = [read_text(f) for f in plain if not f.startswith('-')]
         for op, target in redirs:
@@ -2177,7 +2390,7 @@ def piped_text(prev):
 
 def sub_script(text, depth, fresh=False):
     """Judge text as a script run by a child shell: a cd or variable set there does not reach the caller."""
-    saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']))
+    saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), STATE['cwd_candidates'])
     if fresh:
         # Git config can be inherited before its keys appear in a later command. Other parent locals remain unknown,
         # and readonly/local attributes do not survive exec. No export-attribute interpreter is needed to fail closed.
@@ -2190,7 +2403,7 @@ def sub_script(text, depth, fresh=False):
     try:
         return check_script(text, depth)
     finally:
-        STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = saved
+        STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = saved
 
 
 
@@ -2202,7 +2415,7 @@ def shell_decision(args, depth):
         if a == '-c' or (a.startswith('-') and not a.startswith('--') and 'c' in a[1:]):
             return sub_script(args[k + 1], depth + 1, fresh=True)
     plain, redirs = split_redirects(args)
-    if any(a.startswith('<(') for a in plain):
+    if any(a.startswith('<(') or getattr(getattr(a, 'source_operand', a), 'process_substitution', False) for a in plain):
         return 'deny', MSG['pipe_shell']
     operands = [a for a in plain if not a.startswith('-')]
     from_stdin = not operands or any(a == '-' or (a.startswith('-') and not a.startswith('--') and 's' in a[1:])
@@ -2299,7 +2512,8 @@ def builtin_assignments(toks):
     head = strip_prefix(toks)
     if not head or external_scope(toks):
         return set()
-    prog, args = os.path.basename(head[0]), head[1:]
+    prog = os.path.basename(head[0])
+    args, _ = split_redirects(head[1:])
     names = []
     if prog == 'printf' and args:
         if args[0] == '-v':
@@ -2354,11 +2568,11 @@ def set_variable(name, value, unknown):
 def analyze(toks, depth, raw=None, mutations=None):
     if not external_scope(toks):
         return analyze_command(toks, depth, raw, mutations)
-    saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']))
+    saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), STATE['cwd_candidates'])
     try:
         return analyze_command(toks, depth, raw)
     finally:
-        STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = saved
+        STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = saved
 
 
 def analyze_command(toks, depth, raw=None, mutations=None):
@@ -2415,7 +2629,7 @@ def analyze_command(toks, depth, raw=None, mutations=None):
         change_dir(toks[1:])
         return None
     if toks[0] == 'popd':
-        STATE['cwd'] = None
+        set_cwd(None)
         return None
     prog, args = os.path.basename(toks[0]), toks[1:]
     if prog in SHELLS:
@@ -2442,12 +2656,12 @@ def analyze_command(toks, depth, raw=None, mutations=None):
         if k < len(args) and re.search(r'[$`]', args[k]):
             return 'deny', MSG['deep']  # the program xargs runs is not known
         saved, STATE['xargs'] = STATE['xargs'], True
-        shell_state = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']))
+        shell_state = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), STATE['cwd_candidates'])
         try:
             return nested(analyze, args[k:], depth + 1, STATE['raw'][1 + k:]) if depth < MAX_DEPTH else ('deny', MSG['deep'])
         finally:
             STATE['xargs'] = saved
-            STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = shell_state
+            STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = shell_state
     if prog == 'git':
         return git_decision(args)
     if prog == 'gh':
@@ -2564,46 +2778,7 @@ def _skip_double(text, i, level=0):
 
 
 def substitutions(text):
-    """The inner text of every $( ) and backtick command substitution bash would run, also inside double quotes."""
-    out, i, n = [], 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == '\\':
-            i += 2
-        elif ch == "'":
-            j = text.find("'", i + 1)
-            i = n if j < 0 else j + 1
-        elif text.startswith('$(', i):
-            end = _close_paren(text, i + 2)
-            out.append(text[i + 2:end])
-            i = end + 1
-        elif ch == '`':
-            j = i + 1
-            while j < n and text[j] != '`':
-                j += 2 if text[j] == '\\' else 1
-            out.append(re.sub(r'\\([`$\\])', r'\1', text[i + 1:j]))
-            i = j + 1
-        elif ch == '"':
-            j = i + 1  # inside double quotes substitutions still run: scan to the closing quote
-            while j < n and text[j] != '"':
-                if text[j] == '\\':
-                    j += 2
-                elif text.startswith('$(', j):
-                    end = _close_paren(text, j + 2)
-                    out.append(text[j + 2:end])
-                    j = end + 1
-                elif text[j] == '`':
-                    k = j + 1
-                    while k < n and text[k] != '`':
-                        k += 2 if text[k] == '\\' else 1
-                    out.append(re.sub(r'\\([`$\\])', r'\1', text[j + 1:k]))
-                    j = k + 1
-                else:
-                    j += 1
-            i = j + 1
-        else:
-            i += 1
-    return out
+    return [body for _, _, body, _ in substitution_spans(text)]
 
 
 def heredoc_substitutions(norm):
@@ -2630,7 +2805,8 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
     try:
         for kind, cmd, before, after in split_commands(tokens):
             if cond_cd and before != '&&':
-                STATE['cwd'], cond_cd = None, False  # invalidate before a group can snapshot a conditional value
+                set_cwd(None, cond_cd if isinstance(cond_cd, tuple) else None)
+                cond_cd = False  # only these complete old/success states survive the chain
             if cond_vars and before != '&&':
                 for name in cond_vars:
                     invalidate_variable(name)
@@ -2638,17 +2814,19 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
             if kind == 'uncertain':
                 return 'deny', MSG['deep']
             if kind == 'function':
-                saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']))
+                STATE['body_file_unstable'] = True  # a defined function can replace the apparent producer of a body
+                saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), STATE['cwd_candidates'])
                 writes = set()
                 was_deferred, STATE['deferred_body'] = STATE['deferred_body'], True
-                STATE['cwd'], STATE['vars'], STATE['restricted'] = None, {}, set()
+                set_cwd(None)
+                STATE['vars'], STATE['restricted'] = {}, set()
                 STATE['unknown'] = set(os.environ) | set(saved[1]) | saved[3]  # caller state can change before a later call
                 try:
                     decision = check_tokens(cmd, depth + 1, deferred=True, mutations=writes) if depth < MAX_DEPTH else ('deny', MSG['deep'])
                     names = writes - {None}
                     moved = None in writes
                 finally:
-                    STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = saved
+                    STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = saved
                     STATE['deferred_body'] = was_deferred
                 if decision:
                     return decision
@@ -2661,17 +2839,23 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
                     return 'deny', MSG['deep']  # later calls can move again, even after an intervening explicit cd
                 pipe = []
             elif kind == 'open':
-                stack.append((STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), list(scopes)))
+                stack.append((STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), STATE['cwd_candidates'],
+                              list(scopes), cond_cd, set(cond_vars)))
+                cond_cd, cond_vars = False, set()  # the group is already on this chain's success branch
                 pipe = []
             elif kind == 'close':
                 if stack:
-                    STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], scopes = stack.pop()
+                    STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'], scopes, cond_cd, cond_vars = stack.pop()
                 pipe = [['<group>']]
             else:
+                for inner in command_substitutions(cmd):
+                    decision = sub_script(inner, depth + 1)
+                    if decision:
+                        return decision
                 if before not in PIPES:
                     pipe = []
                 forked = before in PIPES or after in PIPES or after == '&'
-                saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown'])) if forked else None
+                saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), STATE['cwd_candidates']) if forked else None
                 STATE['pipe'], STATE['sep'] = [list(c) for c in pipe], after
                 scoped, loop_names = bool(scopes), set()
                 scope_cmd = cmd
@@ -2710,6 +2894,7 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
                 old_unknown = set(STATE['unknown'])
                 try:
                     decision = analyze(cmd, depth, mutations=mutations)
+                    note_body_file_writes(cmd)
                     names.update(k for k in set(old_vars) | set(STATE['vars'])
                                  if k not in old_vars or k not in STATE['vars'] or old_vars[k] != STATE['vars'][k])
                     moved = moves or STATE['cwd'] != old_cwd
@@ -2719,7 +2904,7 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
                 finally:
                     STATE['plain'] = False  # only the first command of the script may rely on PLAIN_RM
                     if saved:
-                        STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = saved
+                        STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = saved
                 if decision:
                     return decision
                 if mutations is not None and not saved:
@@ -2730,15 +2915,15 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
                     for name in names:
                         invalidate_variable(name)
                     if moved:
-                        STATE['cwd'] = None
+                        set_cwd(None)
                 if moved and before in PIPES and after not in PIPES:
-                    STATE['cwd'] = None  # zsh (and bash with lastpipe) run the last stage in this shell: its cd may stick
-                elif moved and not saved and (scoped or before in ('&&', '||') or (cmd and shell_keyword(cmd[0]))):
+                    set_cwd(None)  # zsh (and bash with lastpipe) run the last stage in this shell: its cd may stick
+                elif moved and not saved and (scoped or after == '&&' or before in ('&&', '||') or (cmd and shell_keyword(cmd[0]))):
                     # if/then/else/do or && / ||: the cd may not run. Within a && chain after it, it did
                     if after == '&&' and before != '||' and not shell_keyword(cmd[0]) and not scoped:
-                        cond_cd = True
+                        cond_cd = (old_cwd, STATE['cwd']) if before not in ('&&', '||') and old_cwd is not None and STATE['cwd'] is not None else True
                     else:
-                        STATE['cwd'] = None
+                        set_cwd(None)
                 if names and before in PIPES and after not in PIPES:
                     STATE['restricted'].update(restricted_added)
                     for name in names:
@@ -2753,7 +2938,7 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
     finally:
         STATE['envcfg'] = []
         if stack:
-            STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'] = stack[0][:4]
+            STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = stack[0][:5]
     return None
 
 
@@ -2781,20 +2966,16 @@ def check_script(text, depth=0, mutations=None):
         return 'deny', MSG['deep']
     if depth == 0:
         STATE['moved'] = False
+        STATE['body_file_unstable'] = False
     try:
         norm = normalize(text)
         if depth == 0:
             STATE['plain'] = bool(PLAIN_RM.match(text))
         scan_moves(norm)
-        tokens = tokens_of(norm)
-        note_quoting(norm, tokens)
+        tokens = execution_tokens(norm)
         decision = check_tokens(tokens, depth, mutations=mutations)
         if decision:
             return decision
-        for inner in substitutions(norm) + heredoc_substitutions(norm):
-            decision = sub_script(inner, depth + 1)
-            if decision:
-                return decision
     except (TooDeep, RecursionError):
         return 'deny', MSG['deep']
     return None
@@ -2813,7 +2994,9 @@ def trash_rewrite(text):
     if len(cmds) != 1 or cmds[0][0] != 'rm':
         return None
     recursive, force, targets = rm_parts(cmds[0][1:])
-    if not recursive or not targets or all(disposable(t) for t in targets) or any(PROTECTED.hit(t, True) for t in targets):
+    recovery = recoverable_files(targets)
+    if (not recursive and not recovery or not targets or (not recovery and all(disposable(t) for t in targets))
+            or any(PROTECTED.hit(t, True) for t in targets)):
         return None
     m = RM_HEAD.match(text)
     if not m:
@@ -2839,9 +3022,403 @@ def check_agent(tool_input):
     model = str(tool_input.get('model') or '').lower()
     gated = [g.lower() for g in _listed(common.config().get('gated_models'))]
     hit = next((g for g in gated if g in model), None)
-    if hit is None and kind == 'advisor':
+    if hit is None and kind in ('advisor', 'fable-advisor'):
         hit = next((g for g in gated if g in ADVISOR_MODEL), None)
     return ('ask', MSG['gated'] % hit) if hit else None
+
+
+
+NO_CONTENT = {
+    'grep': ({'c', 'l', 'L', 'q'}, {'--count', '--files-with-matches', '--files-without-match', '--quiet', '--silent'}),
+    'egrep': ({'c', 'l', 'L', 'q'}, {'--count', '--files-with-matches', '--files-without-match', '--quiet', '--silent'}),
+    'fgrep': ({'c', 'l', 'L', 'q'}, {'--count', '--files-with-matches', '--files-without-match', '--quiet', '--silent'}),
+    'rg': ({'c', 'l', 'q'}, {'--count', '--count-matches', '--files-with-matches', '--files-without-match', '--quiet', '--files'}),
+    'ag': ({'c', 'l'}, {'--count', '--files-with-matches'}),
+    'ack': ({'c', 'l'}, {'--count', '--files-with-matches'}),
+}
+
+
+GH_API_FLAGS = {'--include', '--paginate', '--silent', '--slurp', '--verbose', '--help', '--allow-escape-sequences'}
+
+
+GH_API_SHORT = {'X': '--method', 'f': '--raw-field', 'F': '--field', 'H': '--header',
+                'q': '--jq', 't': '--template', 'p': '--preview'}
+
+
+GH_API_VALUES = {'--method', '--field', '--raw-field', '--header', '--input', '--jq', '--template',
+                 '--hostname', '--cache', '--preview'}
+
+
+def gh_api_parts(args):
+    """API options with their values, endpoints, and whether an option's meaning is unknown."""
+    options, positionals, unknown, literal, k = [], [], False, False, 0
+    while k < len(args):
+        a = args[k]
+        if a == '--' and not literal:
+            literal = True
+        elif literal or not a.startswith('-') or a == '-':
+            positionals.append(a)
+        elif a.startswith('--'):
+            flag, eq, value = a.partition('=')
+            if flag in GH_API_VALUES:
+                if not eq:
+                    k += 1
+                    value = args[k] if k < len(args) else None
+                else:
+                    value = operand_value(value, a)
+                options.append((flag, value))
+                unknown = unknown or value is None
+            elif flag not in GH_API_FLAGS:
+                unknown = True
+        else:
+            for n, letter in enumerate(a[1:], 1):
+                if letter in GH_API_SHORT:
+                    value = a[n + 1:]
+                    if not value:
+                        k += 1
+                        value = args[k] if k < len(args) else None
+                    else:
+                        value = operand_value(value, a)
+                    options.append((GH_API_SHORT[letter], value))
+                    unknown = unknown or value is None
+                    break
+                if letter not in 'ih':
+                    unknown = True
+        k += 1
+    return options, positionals, unknown
+
+
+def gh_stdin_text(args):
+    """The effective stdin request body, or None when its producer cannot be inspected exactly."""
+    _, redirs = split_redirects(args)
+    text, redirected = None, False
+    for op, target in redirs:
+        if op == '<<' and target.startswith(HEREDOC_MARK):
+            text, redirected = heredoc_body(target), True
+        elif op == '<<<':
+            text, redirected = (None if getattr(target, 'path_uncertain', False) else target), True
+        elif op == '<':
+            text, redirected = gh_body_file(target, ()), True
+    if not redirected and STATE['pipe']:
+        if STATE['body_file_unstable']:
+            return None
+        text = piped_text(STATE['pipe'][-1])
+    return text
+
+
+def gh_body_file(path, args):
+    if path == '-':
+        return gh_stdin_text(args)
+    if STATE['body_file_unstable'] or path is None or getattr(path, 'path_uncertain', False):
+        return None
+    text = read_text(path)
+    return None if text is not None and len(text) >= 1 << 20 else text
+
+
+def note_body_file_writes(command):
+    """A prior command can replace a request body after the hook has read its old contents."""
+    plain, redirs = split_redirects(command)
+    if any(op not in ('<', '<<', '<<<') for op, _ in redirs):
+        STATE['body_file_unstable'] = True
+        return
+    if not plain or all(shell_assignment(token) for token in plain):
+        return
+    head = strip_prefix(plain)
+    pure = {'echo', 'printf', 'cat', 'true', 'false', ':', 'cd', 'pushd', 'popd',
+            'export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'read'}
+    if not head or head[0] not in pure:
+        STATE['body_file_unstable'] = True
+
+
+def graphql_merges(args):
+    """Known GraphQL reads pass; an unreadable query cannot prove it avoids a merge mutation."""
+    options, endpoints, _ = gh_api_parts(args)
+    if not any(re.search(r'(?:^|/)graphql(?:\?|$)', endpoint) for endpoint in endpoints):
+        return False
+    queries = []
+    for flag, value in options:
+        if flag == '--input':
+            text = gh_body_file(value, args)
+            if text is None:
+                return True
+            try:
+                body = json.loads(text)
+                query = body.get('query') if isinstance(body, dict) else None
+            except ValueError:
+                return True
+            if not isinstance(query, str):
+                return True
+            queries.append(query)
+        elif flag in ('--field', '--raw-field') and value is not None:
+            name, eq, query = value.partition('=')
+            if name != 'query' or not eq:
+                continue
+            if getattr(value, 'path_uncertain', False):
+                return True
+            if flag == '--field' and query.startswith('@'):
+                query = gh_body_file(query[1:], args)
+                if query is None:
+                    return True
+            queries.append(query)
+    return any(GRAPHQL_MERGE.search(query) for query in queries)
+
+
+def api_comment_endpoint(args):
+    endpoints = [value for value in gh_api_parts(args)[1] if value != 'api']
+    if not endpoints:
+        return True
+    endpoint = endpoints[0]
+    return (getattr(endpoint, 'path_uncertain', False) or bool(re.search(
+        r'(?:^|/)(?:issues|pulls)/(?:[^/]+/)?(?:comments|reviews)(?:/|$)', endpoint)))
+
+
+def queried_branch(token):
+    scripts = getattr(token, 'substitution_scripts', ())
+    if (len(scripts) != 1 or getattr(token, 'process_substitution', False)
+            or not re.fullmatch(r'\$\{__agent_core_substitution_\d+\}', token)
+            or not re.fullmatch(r'\s*git\s+branch\s+--show-current\s*', scripts[0])
+            or STATE['cwd'] is None):
+        return None
+    return current_branch(STATE['cwd'])
+
+
+def recoverable_files(targets):
+    """Existing databases and file batches over 1 GB must reach trash.py's review and recovery checks."""
+    total = 0
+    for target in targets:
+        if STATE['cwd'] is None or re.search(r'[$`*?\[{\\]', target):
+            continue
+        path = os.path.join(STATE['cwd'], os.path.expanduser(target))
+        if not os.path.isfile(path) or os.path.islink(path):
+            continue
+        try:
+            total += os.path.getsize(path)
+            if path.lower().endswith(('.db', '.sqlite', '.sqlite3', '.duckdb')):
+                return True
+            with open(path, 'rb') as stream:
+                if stream.read(16) == b'SQLite format 3\x00':
+                    return True
+        except OSError:
+            return True  # an existing file that cannot be inspected is not proven disposable
+    return total > 1 << 30
+
+
+def sed_arguments(args):
+    """Separate scripts, script-file operands and input files without interpreting script text as options."""
+    scripts, script_files, files, inplace, literal, k = [], [], [], False, False, 0
+    while k < len(args):
+        a = args[k]
+        if not literal and a == '--':
+            literal = True
+        elif not literal and a.startswith('--'):
+            flag, eq, value = a.partition('=')
+            if flag in ('--expression', '--file'):
+                index = k if eq else k + 1
+                value = value if eq else (args[index] if index < len(args) else '')
+                if flag == '--expression':
+                    scripts.append(value)
+                else:
+                    script_files.append((index, value))
+                k += not eq
+            elif flag == '--in-place':
+                inplace = True
+        elif not literal and a.startswith('-') and a != '-':
+            for n, char in enumerate(a[1:], 1):
+                if char in 'ef':
+                    value = a[n + 1:]
+                    index = k if value else k + 1
+                    value = value or (args[index] if index < len(args) else '')
+                    if char == 'e':
+                        scripts.append(value)
+                    else:
+                        script_files.append((index, value))
+                    k += index != k
+                    break
+                if char == 'i':
+                    inplace = True
+                    if n == len(a) - 1 and k + 1 < len(args) and args[k + 1] == '':
+                        k += 1  # BSD sed's empty backup suffix
+                    break  # the rest is the backup suffix, never more flags
+        elif not scripts and not script_files:
+            scripts.append(a)
+        else:
+            files.append(k)
+        k += 1
+    return scripts, script_files, inplace, files
+
+
+def quiet_inplace_substitution(script):
+    """A single substitution with no execute/write commands can only print into sed's in-place output file."""
+    if len(script) < 4 or script[0] != 's' or script[1].isspace() or script[1] == '\\':
+        return False
+    delimiter, k = script[1], 2
+    for _ in range(2):
+        while k < len(script) and script[k] != delimiter:
+            if script[k] in '\r\n':
+                return False
+            k += 2 if script[k] == '\\' else 1
+        if k >= len(script):
+            return False
+        k += 1
+    return bool(re.fullmatch(r'[gpI0-9]*', script[k:]))
+
+
+NAMES_ONLY_SED = re.compile(r'^s(?P<d>[^\\\s])=\.\*(?P=d)[^\\&]*(?P=d)[gp]{0,2}$')
+
+def names_only(prog, args):
+    """True when the read cannot print an env value: sed whose every script is s/=.*/<text>/ (cuts each line at its
+    first =, so only names are left), or a search that prints counts, file names or nothing (grep -c/-l/-L/-q)."""
+    if prog == 'sed':
+        scripts, script_files, _, _ = sed_arguments(args)
+        return bool(scripts) and not script_files and all(NAMES_ONLY_SED.match(x.strip()) for x in scripts)
+    if prog in ('grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack'):
+        s, l, _ = flag_parts(args, value_opts=SEARCH_VALUE | PATTERN_OPTS, value_letters=SEARCH_LETTERS.get(prog, ''))
+        short, long_ = NO_CONTENT[prog]
+        return bool(s & short or l & long_)
+    return False
+
+
+def supplied_search_pattern(prog, args):
+    takes = SEARCH_LETTERS.get(prog, 'efFv')
+    for arg in args:
+        if arg == '--':
+            break
+        if arg in PATTERN_OPTS or arg.startswith(('--regexp=', '--file=', '--expression=')):
+            return True
+        if arg.startswith('-') and not arg.startswith('--'):
+            first = next((ch for ch in arg[1:] if ch in takes), None)
+            if first in ('e', 'f'):
+                return True
+    return False
+
+
+def set_cwd(value, candidates=None):
+    STATE['cwd'], STATE['cwd_candidates'] = value, candidates
+
+
+def printf_output(args):
+    """Reproduce only printf's literal escapes, %s and %%; unsupported formatting is unknown output."""
+    if args[:1] == ['--']:
+        args = args[1:]
+    if not args or args[0].startswith('-'):
+        return None
+    values = [expand(arg) for arg in args]
+    if any(unresolved_path(value, arg) for value, arg in zip(values, args)):
+        return None
+    fmt, values = values[0], values[1:]
+    parts, fields, i = [], 0, 0
+    escapes = {'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'b': '\b', 'f': '\f', 'v': '\v', '\\': '\\'}
+    while i < len(fmt):
+        ch = fmt[i]
+        if ch == '%':
+            if i + 1 == len(fmt) or fmt[i + 1] not in ('s', '%'):
+                return None
+            fields += fmt[i + 1] == 's'
+            parts.append(None if fmt[i + 1] == 's' else '%')
+            i += 2
+        elif ch == '\\':
+            if i + 1 == len(fmt) or fmt[i + 1] not in escapes:
+                return None
+            parts.append(escapes[fmt[i + 1]])
+            i += 2
+        else:
+            parts.append(ch)
+            i += 1
+    output, index, length = [], 0, 0
+    while True:
+        for part in parts:
+            value = part
+            if part is None:
+                value = values[index] if index < len(values) else ''
+                index += 1
+            length += len(value)
+            if length > MAX_CHARS:
+                return None
+            output.append(value)
+        if not fields or index >= len(values):
+            return ''.join(output)
+
+
+def substitution_spans(text, processes=False):
+    """Active substitution spans, preserving source quotes and execution order for the containing command."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '\\':
+            i += 2
+        elif ch == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+        elif text.startswith('$(', i) or (processes and text[i:i + 2] in ('<(', '>(')):
+            end = _close_paren(text, i + 2)
+            out.append((i, min(n, end + 1), text[i + 2:end], ch != '$'))
+            i = end + 1
+        elif ch == '`':
+            j = i + 1
+            while j < n and text[j] != '`':
+                j += 2 if text[j] == '\\' else 1
+            out.append((i, min(n, j + 1), re.sub(r'\\([`$\\])', r'\1', text[i + 1:j]), False))
+            i = j + 1
+        elif ch == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                if text[j] == '\\':
+                    j += 2
+                elif text.startswith('$(', j):
+                    end = _close_paren(text, j + 2)
+                    out.append((j, min(n, end + 1), text[j + 2:end], False))
+                    j = end + 1
+                elif text[j] == '`':
+                    k = j + 1
+                    while k < n and text[k] != '`':
+                        k += 2 if text[k] == '\\' else 1
+                    out.append((j, min(n, k + 1), re.sub(r'\\([`$\\])', r'\1', text[j + 1:k]), False))
+                    j = k + 1
+                else:
+                    j += 1
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def execution_tokens(norm):
+    """Keep generated words opaque, with their scripts attached to the exact command that executes them."""
+    parts, scripts, last, number = [], {}, 0, 0
+    for start, end, body, process in substitution_spans(norm, processes=True):
+        marker = '__agent_core_substitution_%d' % number
+        while marker in norm or marker in STATE['vars']:
+            number += 1
+            marker = '__agent_core_substitution_%d' % number
+        number += 1
+        parts.extend((norm[last:start], '${' + marker + '}'))
+        scripts[marker] = (body, process)
+        last = end
+    parts.append(norm[last:])
+    masked = ''.join(parts)
+    tokens = tokens_of(masked)
+    note_quoting(masked, tokens)
+    associated = set()
+    for token in tokens:
+        matches = {marker: item for marker, item in scripts.items() if '${' + marker + '}' in token}
+        associated.update(matches)
+        token.substitution_scripts = tuple(body for body, _ in matches.values())
+        token.process_substitution = any(process for _, process in matches.values())
+    if associated != set(scripts):
+        raise TooDeep()  # malformed scope must not discard an extracted script instead of checking it
+    return tokens
+
+
+def command_substitutions(cmd):
+    for token in cmd:
+        yield from getattr(token, 'substitution_scripts', ())
+        if token.startswith(HEREDOC_MARK):
+            try:
+                index = int(token[len(HEREDOC_MARK):])
+            except ValueError:
+                continue
+            if index < len(STATE['expands']) and STATE['expands'][index]:
+                yield from substitutions(STATE['heredocs'][index])
 
 
 def main():
@@ -2876,6 +3453,8 @@ def main():
             print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': decision,
                                                      'permissionDecisionReason': 'agent-core: ' + why}}))
     except Exception as exc:
+        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+                         'permissionDecisionReason': 'agent-core: Guard could not check this action. See the hook error log.'}}))
         common.log_error('guard', exc)
 
 

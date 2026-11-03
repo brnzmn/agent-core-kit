@@ -125,9 +125,10 @@ class RoutineCommandsPass(unittest.TestCase):
                     'rm -rf package-lock.json'], None, cwd=self.cwd)
         self.check(['rm -rf src', 'rm -rf node_modules src', 'rm -rf package-lock.json src', 'rm -rf srclink',
                     'rm -rf srclink/', 'rm -rf package-lock.json missing-dir',
-                    'rm -rf dist *.tsbuildinfo', 'rm -rf *.tsbuildinfo', 'rm -rf [^n]*', 'rm -rf lake-*/x.csv',
+                    'rm -rf dist *.tsbuildinfo', 'rm -rf *.tsbuildinfo', 'rm -rf [^n]*',
                     'rm -rf package-lock.js?n', 'rm -rf package-lock.json{,}', 'rm -rf ~/package-lock.json'],
                    'deny', cwd=self.cwd, key='rm', tail=' && true')
+        self.check(['rm -rf lake-*/x.csv'], 'deny', cwd=self.cwd, key='lake', tail=' && true')
         self.check(['rm -rf $X/package-lock.json'], 'deny', cwd=self.cwd, key='lake', tail=' && true')
         self.check(['rm -rf *'], 'deny', cwd=self.cwd, key='rm_cwd', tail=' && true')
 
@@ -432,7 +433,8 @@ class Supabase(unittest.TestCase):
 class GatedModels(unittest.TestCase):
     def test_gated_model_and_advisor_ask_the_user(self):
         for name in ('Agent', 'Task'):
-            for inp in ({'subagent_type': 'advisor', 'prompt': 'x'}, {'subagent_type': 'worker', 'model': 'fable'},
+            for inp in ({'subagent_type': 'advisor', 'prompt': 'x'}, {'subagent_type': 'fable-advisor', 'prompt': 'x'},
+                        {'subagent_type': 'worker', 'model': 'fable'},
                         {'subagent_type': 'worker', 'model': 'claude-Fable-5-1'}, {'model': 'fable', 'prompt': 'x'}):
                 with self.subTest(tool=name, input=inp):
                     decision, out = tool(name, inp)

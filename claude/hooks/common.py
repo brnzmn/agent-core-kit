@@ -123,7 +123,7 @@ def config(reload=False):
 def _fits(key, value):
     """Known config keys keep their default on a type error; list-valued guard settings also accept one string."""
     if key == 'protected_supabase':
-        return isinstance(value, (dict, list, str))
+        return isinstance(value, dict) or _fits_default([], value)
     return _fits_default(DEFAULTS[key], value)
 
 
@@ -134,7 +134,8 @@ def _fits_default(default, value):
     if isinstance(default, (int, float)):
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     if isinstance(default, list):
-        return isinstance(value, (list, str))
+        return (isinstance(value, str) and bool(value.strip()) or isinstance(value, list)
+                and all(isinstance(member, str) and bool(member.strip()) for member in value))
     return isinstance(value, type(default))
 
 

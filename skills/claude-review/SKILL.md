@@ -6,7 +6,7 @@ argument-hint: "[base branch, default origin/HEAD]"
 ---
 # Claude review
 
-Claude reviews your diff read-only: it can read files and run `git diff`, `git log`, `git show` and `git status`, nothing else. It never edits.
+The wrapper gives Claude the committed Git diff with surrounding function context. Claude has no shell or file tools.
 
 1. Commit your work on its branch. Pick the base: the argument, else the PR's base, else `origin/HEAD`.
 2. From the repo root, run (it takes a few minutes; it loads no settings files, so nothing widens its tools):

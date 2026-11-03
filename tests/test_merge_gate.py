@@ -54,7 +54,7 @@ class Fixture:
     def pr(self, base='main', repo=REPO, comments=(), reviews=()):
         with open(self.pr_json, 'w') as fh:
             json.dump({'number': 7, 'url': 'https://github.com/%s/pull/7' % repo, 'baseRefName': base,
-                       'headRefOid': HEAD, 'comments': list(comments), 'reviews': list(reviews)}, fh)
+                       'headRefOid': HEAD, 'baseRefOid': HEAD, 'comments': list(comments), 'reviews': list(reviews)}, fh)
 
     def decide(self, command='gh pr merge 7 --squash', config=None, gh=None):
         local = make_local(config=config) if config is not None else None
@@ -392,7 +392,7 @@ class ProviderFallback(Fixture, unittest.TestCase):
     def evidence(self, provider='Claude', head=HEAD, base='main', login='alex', **test_changes):
         checks = dict(status='PASS', count=308, command=self.command, exit_code=0)
         checks.update(test_changes)
-        data = dict(head=head, base=base, provider=provider, status='UNAVAILABLE', reason='quota', tests=checks)
+        data = dict(head=head, base=base, base_oid=HEAD, provider=provider, status='UNAVAILABLE', reason='quota', tests=checks)
         return {'author': {'login': login}, 'body': '## Agent-core review availability\n'
                 'AGENT_CORE_REVIEW_EVIDENCE_V1: ' + json.dumps(data) + '\n'}
 

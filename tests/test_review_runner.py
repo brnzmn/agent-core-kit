@@ -16,7 +16,7 @@ spec = importlib.util.spec_from_file_location('pr_review_runner', CORE / 'bin' /
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 HEAD = 'a' * 40
-META = {'number': 7, 'baseRefName': 'master', 'headRefOid': HEAD,
+META = {'number': 7, 'baseRefName': 'master', 'headRefOid': HEAD, 'baseRefOid': HEAD,
         'url': 'https://github.com/acme/kit/pull/7'}
 CMD = ['python3', '-m', 'unittest', 'discover', '-s', 'tests']
 
@@ -45,6 +45,17 @@ class ProviderResults(unittest.TestCase):
                 self.assertIsNone(result.verdict)
                 self.assertIsNone(result.unavailable)
 
+    def test_partial_prose_is_not_an_outage_diagnostic(self):
+        result = self.codex(1, {'codex': {'status': 1, 'stdout': '[P2] service unavailable handler',
+                                          'error': {'code': 'internal_error', 'message': 'local file missing'}}})
+        self.assertIsNone(result.unavailable)
+        self.assertIsNone(result.verdict)
+
+    def test_a_review_requires_text_not_an_error_object(self):
+        result = self.codex(data={'codex': {'status': 0, 'stdout': {'error': 'bad frame'}}})
+        self.assertIsNone(result.verdict)
+        self.assertIsNone(result.unavailable)
+
     def test_malformed_codex_is_an_error_not_an_outage(self):
         for data in (None, [], {'codex': 'bad'}, {'codex': {'status': 0, 'stdout': ''}}):
             with self.subTest(data=data):
@@ -61,6 +72,13 @@ class ProviderResults(unittest.TestCase):
         result = self.codex(1, {'codex': {'status': 1, 'stderr': "You've hit your usage limit. Try again later."}})
         self.assertIsNone(result.verdict)
         self.assertEqual(result.unavailable, 'quota')
+
+    def test_capacity_diagnostic_counts_only_on_failed_provider_execution(self):
+        message = 'Selected model is at capacity. Please try a different model.'
+        down = self.codex(1, {'codex': {'status': 1, 'stderr': message}})
+        self.assertEqual(down.unavailable, 'service')
+        incomplete = self.codex(1, {'codex': {'status': 1, 'stdout': message}})
+        self.assertIsNone(incomplete.unavailable)
 
     def test_native_structured_quota_error_survives_empty_review_streams(self):
         # executeReviewRun forwards runAppServerReview.error into codex.error; --json has no progress stderr.
@@ -172,13 +190,21 @@ class ClaudeWrapper(unittest.TestCase):
                 cli = Path(tmp) / 'claude'
                 cli.write_text('#!/bin/sh\nprintf \'%s\\n\' ' + json.dumps(text) + '\nexit ' + str(cli_exit) + '\n')
                 cli.chmod(0o755)
-                out = subprocess.run(['bash', str(CORE / 'bin' / 'claude-review.sh'), 'origin/main'],
+                out = subprocess.run(['bash', str(CORE / 'bin' / 'claude-review.sh'), 'HEAD'],
                                      cwd=CORE, env=dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH']),
                                      capture_output=True, text=True, timeout=20)
                 self.assertEqual(out.returncode, expected, out.stdout + out.stderr)
 
 
 class TestExecution(unittest.TestCase):
+    def setUp(self):
+        # The fixtures exercise real test output and cwd without starting Docker recursively inside the suite.
+        def fixture_worker(root, slug, command):
+            return subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=15)
+        worker = patch.object(runner.review_worker, 'execute', side_effect=fixture_worker)
+        self.worker = worker.start()
+        self.addCleanup(worker.stop)
+
     def test_subdirectory_invocation_runs_the_full_checkout_suite(self):
         for slug in ('acme/kit', 'owner/another-repo'):
             with self.subTest(slug=slug), tempfile.TemporaryDirectory() as tmp:
@@ -225,7 +251,7 @@ class TestExecution(unittest.TestCase):
     def test_failed_and_empty_suites_cannot_supply_passing_evidence(self):
         for code, text in ((1, 'Ran 3 tests in 0.01s\nFAILED'), (0, 'Ran 0 tests in 0.00s\nOK'), (0, 'no tests found')):
             with self.subTest(text=text), patch.object(runner, 'checkout_root', return_value=str(CORE)), \
-                    patch.object(runner, 'sh', return_value=completed(code, text)), \
+                    patch.object(runner.review_worker, 'execute', return_value=completed(code, text)), \
                     contextlib.redirect_stdout(io.StringIO()):
                 result = runner.run_tests(CMD, 'acme/kit')
                 self.assertEqual(result['status'], 'FAIL')
@@ -256,20 +282,35 @@ class TestExecution(unittest.TestCase):
         self.assertEqual(result['count'], 0)
         self.assertEqual(result['status'], 'FAIL')
 
+    def test_unrelated_output_does_not_certify_passing_tests(self):
+        for text in ('preflight: 2 passed checks\nNo tests found, exiting with code 0',
+                     'Warning: previously 8 passed', '=== 0 passed in 1.2s ==='):
+            self.assertEqual(runner.test_count(text), 0)
+
     def test_pytest_and_javascript_summaries(self):
         for text in ('=== 17 passed in 1.2s ===', 'Tests: 9 passed, 9 total', ' Tests  13 passed (13)'):
             with self.subTest(text=text):
                 self.assertGreater(runner.test_count(text), 0)
 
-    def test_tests_keep_the_kit_source_environment(self):
-        with patch.object(runner, 'checkout_root', return_value='/checkout/root'), \
-                patch.object(runner, 'sh', return_value=completed(0, 'Ran 2 tests in 1s')) as call, \
-                contextlib.redirect_stdout(io.StringIO()):
-            runner.run_tests(CMD, 'acme/kit')
-        self.assertEqual(call.call_args.kwargs['env'].get('AGENT_CORE_DIR'), os.environ.get('AGENT_CORE_DIR'))
-        self.assertEqual(call.call_args.kwargs['cwd'], '/checkout/root')
-        self.assertEqual(call.call_args.args[0], CMD)
-        self.assertNotIn('shell', call.call_args.kwargs)
+    def test_snapshot_is_the_only_host_mount_in_an_offline_worker(self):
+        command = runner.review_worker.worker_args(['docker'], Path('/scratch/objects.git'), HEAD,
+                                                   'probe', 'owner/repo', CMD)
+        self.assertIn('--network=none', command)
+        self.assertIn('--read-only', command)
+        self.assertIn('--cap-drop=ALL', command)
+        self.assertIn('--security-opt=no-new-privileges', command)
+        self.assertEqual(command.count('--mount'), 1)
+        self.assertEqual(command[command.index('--mount') + 1],
+                         'type=bind,source=/scratch/objects.git,target=/snapshot,readonly')
+        self.assertNotIn('AGENT_CORE_LOCAL', command)
+        self.assertEqual(command[-len(CMD):], CMD)
+
+    def test_missing_worker_never_executes_pr_code_on_host(self):
+        with patch.object(runner, 'checkout_root', return_value='/repo'), \
+                patch.object(runner.review_worker, 'execute', side_effect=ValueError('no worker')), \
+                patch.object(runner, 'sh') as host, self.assertRaisesRegex(ValueError, 'no worker'):
+            runner.run_tests(CMD, 'owner/project')
+        host.assert_not_called()
 
 
 class AutomaticRun(unittest.TestCase):
@@ -284,6 +325,7 @@ class AutomaticRun(unittest.TestCase):
                 patch.object(runner, 'codex_review', return_value=self.codex), \
                 patch.object(runner, 'claude_review', return_value=self.claude), \
                 patch.object(runner, 'run_tests', return_value=self.tests) as test_call, \
+                patch.object(runner, 'persisted_blockers', return_value=[]), \
                 patch.object(runner, 'post_comment', side_effect=lambda pr, meta, body: self.posts.append(body)), \
                 patch.object(runner.common, 'config', return_value={'pr_gate': {'allow_single_on_unavailable': policy}}), \
                 patch.object(runner.common, 'review_test_command', return_value=command, create=True), \
@@ -306,15 +348,16 @@ class AutomaticRun(unittest.TestCase):
 
     def test_one_pass_and_quota_outage_records_passing_test_evidence(self):
         self.assertEqual(self.run_main(), 0)
-        self.assertEqual(len(self.posts), 2)
+        self.assertEqual(len(self.posts), 4)
         evidence = self.evidence()[0]
         self.assertEqual(evidence['head'], HEAD)
         self.assertEqual(evidence['base'], 'master')
         self.assertEqual(evidence['provider'], 'Claude')
         self.assertEqual(evidence['reason'], 'quota')
         self.assertEqual(evidence['tests']['count'], 10)
-        self.assertNotIn('VERDICT:', self.posts[1])
-        self.assertIn('resets tomorrow', self.posts[1])
+        receipt = next(body for body in self.posts if body.startswith(runner.EVIDENCE_TITLE))
+        self.assertNotIn('VERDICT:', receipt)
+        self.assertIn('resets tomorrow', receipt)
 
     def test_reverse_provider_outage_is_supported(self):
         self.assertEqual(self.run_main(codex=runner.Review(None, 'Not signed in', 'auth'),
@@ -338,9 +381,9 @@ class AutomaticRun(unittest.TestCase):
         with patch.object(runner.os.path, 'isfile', return_value=True), \
                 patch.object(runner.shutil, 'which', return_value='/bin/tool'), \
                 patch.object(runner, 'sh', side_effect=[completed(1, json.dumps(envelope)), completed()]):
-            codex = runner.codex_review('origin/main', False)
+            codex = runner.codex_review('origin/master', False)
         with patch.object(runner, 'sh', return_value=completed(4, "VERDICT: BLOCK\nYou've hit your weekly limit")):
-            claude = runner.claude_review('origin/main')
+            claude = runner.claude_review('origin/master')
         for name, opts in (('Codex', {'codex': codex}), ('Claude', {'claude': claude})):
             with self.subTest(provider=name):
                 self.assertEqual(self.run_main(**opts), 1)
@@ -386,7 +429,7 @@ class AutomaticRun(unittest.TestCase):
                 patch.object(runner, 'claude_review', return_value=runner.Review('PASS', 'fine')), \
                 patch.object(runner, 'post_comment') as post, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.main(['7', 'auto']), 3)
-        post.assert_not_called()
+        self.assertFalse(any('VERDICT:' in call.args[2] for call in post.call_args_list))
 
     def test_head_change_during_tests_posts_no_availability_receipt(self):
         posts = []
@@ -396,13 +439,14 @@ class AutomaticRun(unittest.TestCase):
                 patch.object(runner, 'codex_review', return_value=runner.Review('PASS', 'fine')), \
                 patch.object(runner, 'claude_review', return_value=runner.Review(None, 'quota', 'quota')), \
                 patch.object(runner, 'run_tests', return_value={'status': 'PASS', 'count': 4, 'command': CMD, 'exit_code': 0}), \
+                patch.object(runner, 'persisted_blockers', return_value=[]), \
                 patch.object(runner, 'post_comment', side_effect=lambda pr, meta, body: posts.append(body)), \
                 patch.object(runner.common, 'config', return_value={'pr_gate': {'allow_single_on_unavailable': True}}), \
                 patch.object(runner.common, 'review_test_command', return_value=CMD, create=True), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.main(['7', 'auto']), 3)
-        self.assertEqual(len(posts), 1)
-        self.assertIn('## Codex review', posts[0])
+        self.assertEqual(len([body for body in posts if body.startswith('## Codex review')]), 1)
+        self.assertFalse(any(body.startswith(runner.EVIDENCE_TITLE) for body in posts))
 
     def test_fetch_failure_stops_before_provider_calls(self):
         with patch.object(runner, 'metadata', return_value=META), patch.object(runner, 'unchanged'), \
@@ -410,6 +454,7 @@ class AutomaticRun(unittest.TestCase):
                 patch.object(runner, 'codex_review') as review, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.main(['7', 'auto']), 3)
         review.assert_not_called()
+
 
 
 class TestCommandConfiguration(unittest.TestCase):
