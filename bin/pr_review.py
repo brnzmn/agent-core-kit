@@ -261,8 +261,21 @@ def publish_body(pr, expected, body):
     print(body)
 
 
+VERDICT_SHAPE = re.compile(r'(## [^\n]*\nhead: [0-9a-f]{40}\n(?:run: [0-9a-f-]+\n)?)([\s\S]*?)(\n\nVERDICT: (?:PASS|BLOCK)\n)\Z')
+
+
+def redact_comment(body):
+    """Redact a comment for posting. In a verdict comment only the review prose is redacted, so an unclosed
+    `token: ` near its end cannot swallow the head, run or VERDICT line the gate reads."""
+    shaped = VERDICT_SHAPE.fullmatch(body)
+    if not shaped:
+        return redact(body)
+    prose, count = redact(shaped.group(2))
+    return shaped.group(1) + prose + shaped.group(3), count
+
+
 def post_comment(pr, expected, body):
-    body, count = redact(body)
+    body, count = redact_comment(body)
     print('pr_review: redacted %d secret-like string(s) before posting' % count)
     publish_body(pr, expected, body)
 

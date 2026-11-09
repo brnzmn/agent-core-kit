@@ -307,6 +307,16 @@ class CommentRedaction(unittest.TestCase):
         self.assertNotIn('FakeValue', posted)
         self.assertIn('[REDACTED]', posted)
 
+    def test_an_unclosed_credential_label_cannot_swallow_the_verdict_line(self):
+        for prose in ('Fix the token: `', 'Fix the token:', 'password=`\nsee above', "key: '"):
+            with self.subTest(prose=prose):
+                body = runner.verdict_comment('Claude review', HEAD, prose, 'BLOCK', 'run-1')
+                posted = []
+                with patch.object(runner, 'publish_body', side_effect=lambda pr, meta, text: posted.append(text)):
+                    runner.post_comment('8', {}, body)
+                self.assertTrue(posted[0].endswith('\nVERDICT: BLOCK\n'), posted[0])
+                self.assertIn('head: ' + HEAD + '\nrun: run-1\n', posted[0])
+
     def test_token_crossing_comment_cutoff_is_redacted_before_truncation(self):
         secret = 'ghp_' + 'a' * 64
         text = 'x' * 64 + '\n' + secret + '\n' + 'remaining text ' * 20
