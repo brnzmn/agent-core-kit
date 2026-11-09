@@ -211,6 +211,14 @@ class ProviderResults(unittest.TestCase):
                 self.assertIn(message, result.text)
                 self.assertIsNone(result.verdict)
 
+    def test_wrapper_marker_alone_does_not_hide_a_typed_outage(self):
+        # claude-review.sh prints only its (saved to ...) line when the CLI wrote nothing to stdout
+        error = json.dumps({'type': 'error', 'error': {'type': 'rate_limit_error', 'message': 'Quota resets at 1pm'}})
+        with patch.object(runner, 'sh', return_value=completed(4, '(saved to /tmp/claude-review-abc.x1)\n', error)):
+            result = runner.claude_review('origin/main')
+        self.assertEqual(result.unavailable, 'quota')
+        self.assertIsNone(result.verdict)
+
     def test_failed_claude_partial_blocker_cannot_become_an_outage(self):
         for partial in ('VERDICT: BLOCK', '[P1] Unsafe delete', '[P0] Broken protection'):
             for text in (partial + "\nYou've hit your weekly limit", "You've hit your weekly limit\n" + partial):

@@ -4030,8 +4030,25 @@ def names_only(prog, args):
         s, l, _ = flag_parts(args, value_opts=SEARCH_VALUE | PATTERN_OPTS, value_letters=SEARCH_LETTERS.get(prog, ''))
         if prog == 'rg' and '--json' in l:
             return False  # a later JSON mode can emit full matching lines despite a filename/count flag
+        if prog != 'ag' and prog != 'ack' and pattern_file_given(prog, args):
+            return False  # an invalid pattern read from a file is echoed in full by the error diagnostic
         short, long_ = NO_CONTENT[prog]
         return bool(s & short or l & long_)
+    return False
+
+
+def pattern_file_given(prog, args):
+    """grep/rg -f FILE (also bundled, as -cf, or --file=FILE): the search reads patterns from that file."""
+    takes = SEARCH_LETTERS.get(prog, 'efFv')
+    for arg in args:
+        if arg == '--':
+            break
+        if arg == '--file' or arg.startswith('--file='):
+            return True
+        if arg.startswith('-') and not arg.startswith('--'):
+            first = next((ch for ch in arg[1:] if ch in takes), None)
+            if first == 'f':
+                return True
     return False
 
 

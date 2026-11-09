@@ -161,7 +161,7 @@ def claude_review(base):
         return Review(None, 'claude CLI not found on PATH', 'missing_cli')
     out = sh(['bash', os.path.join(CORE, 'bin', 'claude-review.sh'), base], timeout=1800,
              stdin=subprocess.DEVNULL)
-    text = re.sub(r'\n\(saved to [^\n]*\)\s*$', '', out.stdout.strip())
+    text = re.sub(r'(?:^|\n)\(saved to [^\n]*\)\s*$', '', out.stdout.strip()).strip()
     verdict = {0: 'PASS', 1: 'BLOCK'}.get(out.returncode)
     if verdict is None and has_blocking_output(text + '\n' + out.stderr):
         return Review('BLOCK', 'Interrupted Claude review contains blocking findings:\n' + text + '\n' + out.stderr)

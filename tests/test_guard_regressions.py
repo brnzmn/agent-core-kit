@@ -787,3 +787,17 @@ class ProvenPathFields(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PatternFilesAreReads(unittest.TestCase):
+    def test_a_count_search_cannot_read_patterns_from_an_env_file(self):
+        # an invalid pattern from the file comes back in full in the search tool's error message
+        for cmd in ('rg -c -f .env README.md', 'rg -cf .env README.md', 'rg -l --file=.env .', 'grep -c -f .env x',
+                    'grep -q --file .env x'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(decision(cmd), 'deny')
+
+    def test_count_searches_without_an_env_pattern_file_still_pass(self):
+        for cmd in ('grep -c API_KEY .env', 'rg -c -f patterns.txt README.md', 'grep -l TOKEN .env'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(decision(cmd))
