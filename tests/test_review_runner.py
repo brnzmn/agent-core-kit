@@ -26,6 +26,43 @@ def completed(code=0, out='', err=''):
 
 
 class ProviderResults(unittest.TestCase):
+    def setUp(self):
+        available = patch.object(runner.shutil, 'which', return_value='/bin/provider')
+        available.start()
+        self.addCleanup(available.stop)
+
+    def test_model_outage_words_do_not_establish_a_provider_outage(self):
+        words = "You've hit your weekly limit"
+        diagnostics = (words, 'Request failed while processing model output: ' + words,
+                       json.dumps({'type': 'result', 'is_error': True, 'result': words}),
+                       json.dumps({'type': 'error', 'error': {'type': 'internal_error', 'message': words}}))
+        for error in diagnostics:
+            with self.subTest(error=error), patch.object(runner, 'sh', return_value=completed(4, words, error)):
+                self.assertIsNone(runner.claude_review('origin/main').unavailable)
+            result = self.codex(1, {'codex': {'status': 1, 'stdout': words, 'stderr': error,
+                                             'error': {'code': 'internal_error', 'message': words}}})
+            self.assertIsNone(result.unavailable)
+
+    def test_claude_outage_needs_a_typed_provider_error(self):
+        for error_type, expected in (('rate_limit_error', 'quota'), ('authentication_error', 'auth'),
+                                     ('overloaded_error', 'service')):
+            error = json.dumps({'type': 'error', 'error': {'type': error_type, 'message': 'Provider error'}})
+            with self.subTest(error_type=error_type), \
+                    patch.object(runner, 'sh', return_value=completed(4, err=error)):
+                self.assertEqual(runner.claude_review('origin/main').unavailable, expected)
+
+    def test_claude_model_output_prevents_diagnostics_from_becoming_outage_evidence(self):
+        error = json.dumps({'type': 'error', 'error': {'type': 'rate_limit_error'}})
+        for model in ('Partial review prose.', error):
+            with self.subTest(model=model), patch.object(runner, 'sh', return_value=completed(4, model, error)):
+                self.assertIsNone(runner.claude_review('origin/main').unavailable)
+
+    def test_missing_claude_cli_is_independently_checked(self):
+        with patch.object(runner.shutil, 'which', return_value=None), patch.object(runner, 'sh') as execute:
+            result = runner.claude_review('origin/main')
+        self.assertEqual(result.unavailable, 'missing_cli')
+        execute.assert_not_called()
+
     def test_native_rate_limit_error_is_a_confirmed_quota_outage(self):
         result = self.codex(1, {'codex': {'status': 1, 'stdout': '', 'stderr': '',
                                           'error': {'codexErrorInfo': 'rateLimitExceeded'}}})
@@ -99,14 +136,16 @@ class ProviderResults(unittest.TestCase):
         self.assertEqual(self.codex(data=data, adversarial=True).verdict, 'PASS')
 
     def test_codex_quota_failure_is_available_for_fallback(self):
-        result = self.codex(1, {'codex': {'status': 1, 'stderr': "You've hit your usage limit. Try again later."}})
+        result = self.codex(1, {'codex': {'status': 1, 'error': {'codexErrorInfo': 'usageLimitExceeded'}}})
         self.assertIsNone(result.verdict)
         self.assertEqual(result.unavailable, 'quota')
 
-    def test_capacity_diagnostic_counts_only_on_failed_provider_execution(self):
+    def test_capacity_outage_needs_a_typed_provider_error(self):
         message = 'Selected model is at capacity. Please try a different model.'
         down = self.codex(1, {'codex': {'status': 1, 'stderr': message}})
-        self.assertEqual(down.unavailable, 'service')
+        self.assertIsNone(down.unavailable)
+        typed = self.codex(1, {'codex': {'status': 1, 'error': {'type': 'overloaded_error'}}})
+        self.assertEqual(typed.unavailable, 'service')
         incomplete = self.codex(1, {'codex': {'status': 1, 'stdout': message}})
         self.assertIsNone(incomplete.unavailable)
 
@@ -161,15 +200,15 @@ class ProviderResults(unittest.TestCase):
             self.assertEqual(runner.codex_review('origin/main', False).unavailable, 'missing_cli')
 
     def test_claude_outages_keep_reason_and_reset_text(self):
-        examples = [("You've hit your weekly limit · resets Nov 4 at 1pm", 'quota'),
-                    ('Not logged in. Please log in.', 'auth'),
-                    ('Error: service unavailable', 'service'),
-                    ('claude-review: claude CLI not found', 'missing_cli')]
-        for text, reason in examples:
-            with self.subTest(reason=reason), patch.object(runner, 'sh', return_value=completed(4, text)):
+        examples = [('rate_limit_error', 'quota', 'Quota resets Nov 4 at 1pm'),
+                    ('authentication_error', 'auth', 'Sign in is required'),
+                    ('overloaded_error', 'service', 'Service unavailable')]
+        for error_type, reason, message in examples:
+            error = json.dumps({'type': 'error', 'error': {'type': error_type, 'message': message}})
+            with self.subTest(reason=reason), patch.object(runner, 'sh', return_value=completed(4, err=error)):
                 result = runner.claude_review('origin/main')
                 self.assertEqual(result.unavailable, reason)
-                self.assertEqual(result.text, text)
+                self.assertIn(message, result.text)
                 self.assertIsNone(result.verdict)
 
     def test_failed_claude_partial_blocker_cannot_become_an_outage(self):
@@ -197,6 +236,69 @@ class ProviderResults(unittest.TestCase):
 
 
 class CommentRedaction(unittest.TestCase):
+    def record(self, command=CMD):
+        return {'run_id': '1' * 32, 'head': HEAD, 'base': 'master', 'base_oid': HEAD, 'status': 'PASS',
+                'providers': {'Codex': 'PASS', 'Claude': 'UNAVAILABLE'}, 'reasons': {'Claude': 'quota'},
+                'tests': {'status': 'PASS', 'count': 1, 'exit_code': 0, 'command': command}}
+
+    def publish(self, body):
+        posted = []
+        def write(cmd, **kwargs):
+            posted.append(Path(cmd[cmd.index('--body-file') + 1]).read_text())
+            return completed()
+        with patch.object(runner, 'unchanged'), patch.object(runner, 'sh', side_effect=write), \
+                contextlib.redirect_stdout(io.StringIO()):
+            runner.post_comment('7', META, body)
+        return posted
+
+    def publish_record(self, title, record, detail=''):
+        posted = []
+        def write(cmd, **kwargs):
+            posted.append(Path(cmd[cmd.index('--body-file') + 1]).read_text())
+            return completed()
+        with patch.object(runner, 'unchanged'), patch.object(runner, 'sh', side_effect=write), \
+                contextlib.redirect_stdout(io.StringIO()):
+            if title == runner.RUN_TITLE:
+                runner.post_run('7', META, record)
+            else:
+                runner.post_availability('7', META, record, detail)
+        return posted
+
+    def test_receipt_json_and_exact_command_survive_prose_redaction(self):
+        command = ['pytest', '-k', 'a"quoted-name']
+        data = self.record(command)
+        for title, marker in ((runner.RUN_TITLE, runner.RUN_MARK), (runner.EVIDENCE_TITLE, runner.EVIDENCE_MARK)):
+            with self.subTest(title=title):
+                posted = self.publish_record(title, data, 'password=FakeValue')[0]
+                record = json.loads(posted.splitlines()[1][len(marker):])
+                self.assertEqual(record, data)
+                self.assertEqual(record['tests']['command'], command)
+                self.assertNotIn('FakeValue', posted)
+
+    def test_credential_bearing_receipts_are_rejected_before_posting(self):
+        for argument in ('API_KEY=FakeValue', '--api-key=FakeValue'):
+            for marker, title in ((runner.RUN_MARK, runner.RUN_TITLE), (runner.EVIDENCE_MARK, runner.EVIDENCE_TITLE)):
+                raw = json.dumps(self.record(['env', argument, 'pytest']), separators=(',', ':'))
+                for data in (raw, raw.replace('API_KEY', r'API_\u004bEY')):
+                    with self.subTest(argument=argument, marker=marker), \
+                            patch.object(runner, 'unchanged'), patch.object(runner, 'sh') as publish, \
+                            contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'credential') as error:
+                        if title == runner.RUN_TITLE:
+                            runner.post_run('7', META, json.loads(data))
+                        else:
+                            runner.post_availability('7', META, json.loads(data), '')
+                    publish.assert_not_called()
+                    self.assertNotIn('FakeValue', str(error.exception))
+
+    def test_marker_shaped_model_prose_never_uses_the_record_path(self):
+        body = ('## Codex review\nhead: ' + HEAD + '\n\n' + runner.RUN_TITLE + '\n' + runner.RUN_MARK
+                + json.dumps(self.record(['env', 'API_KEY=FakeValue', 'pytest'])) + '\n')
+        with patch.object(runner, 'post_record') as structured:
+            posted = self.publish(body)[0]
+        structured.assert_not_called()
+        self.assertNotIn('FakeValue', posted)
+        self.assertIn('[REDACTED]', posted)
+
     def test_token_crossing_comment_cutoff_is_redacted_before_truncation(self):
         secret = 'ghp_' + 'a' * 64
         text = 'x' * 64 + '\n' + secret + '\n' + 'remaining text ' * 20
@@ -210,6 +312,20 @@ class CommentRedaction(unittest.TestCase):
 
 
 class ClaudeWrapper(unittest.TestCase):
+    def test_model_stdout_and_cli_error_stderr_are_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cli = Path(tmp) / 'claude'
+            cli.write_text('#!/bin/sh\nprintf "Model review prose\\n"\n'
+                           'printf \'{"type":"error","error":{"type":"rate_limit_error"}}\\n\' >&2\nexit 1\n')
+            cli.chmod(0o755)
+            out = subprocess.run(['bash', str(CORE / 'bin/claude-review.sh'), 'HEAD'], cwd=CORE,
+                                 env=dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH']),
+                                 text=True, capture_output=True, timeout=20)
+        self.assertEqual(out.returncode, 4)
+        self.assertIn('Model review prose', out.stdout)
+        self.assertNotIn('rate_limit_error', out.stdout)
+        self.assertEqual(json.loads(out.stderr)['error']['type'], 'rate_limit_error')
+
     def test_provider_failure_is_distinct_from_successful_incomplete_prose(self):
         cases = [(0, 'The service unavailable branch catches wrong exception; review incomplete', 3),
                  (1, "You've hit your weekly limit", 4),
@@ -397,6 +513,15 @@ class PinnedWorker(unittest.TestCase):
 
 
 class AutomaticRun(unittest.TestCase):
+    def test_credential_options_in_test_commands_are_rejected_before_publication(self):
+        for command in (['env', 'API_KEY=FakeValue', 'pytest'], ['pytest', '--api-key=FakeValue'],
+                        ['pytest', '--api-key', 'FakeValue'], ['pytest', '--apiKey', 'FakeValue'],
+                        ['pytest', '--accessToken', 'FakeValue'], ['pytest', '--clientSecret', 'FakeValue']):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_main(command=command), 3)
+                self.assertEqual(self.posts, [])
+                self.test_call.assert_not_called()
+
     def run_main(self, codex=None, claude=None, tests=None, policy=True, command=CMD, mode='auto'):
         self.posts = []
         self.codex = codex or runner.Review('PASS', 'No findings')
@@ -409,7 +534,7 @@ class AutomaticRun(unittest.TestCase):
                 patch.object(runner, 'claude_review', return_value=self.claude), \
                 patch.object(runner, 'run_tests', return_value=self.tests) as test_call, \
                 patch.object(runner, 'persisted_blockers', return_value=[]), \
-                patch.object(runner, 'post_comment', side_effect=lambda pr, meta, body: self.posts.append(body)), \
+                patch.object(runner, 'publish_body', side_effect=lambda pr, meta, body: self.posts.append(body)), \
                 patch.object(runner.common, 'config', return_value={'pr_gate': {'allow_single_on_unavailable': policy}}), \
                 patch.object(runner.common, 'review_test_command', return_value=command, create=True), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -500,7 +625,7 @@ class AutomaticRun(unittest.TestCase):
     def test_stale_or_dirty_checkout_posts_no_review(self):
         with patch.object(runner, 'metadata', return_value=META), \
                 patch.object(runner, 'unchanged', side_effect=ValueError('dirty or changed')), \
-                patch.object(runner, 'post_comment') as post, contextlib.redirect_stdout(io.StringIO()):
+                patch.object(runner, 'publish_body') as post, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.main(['7', 'auto']), 3)
         post.assert_not_called()
 
@@ -510,7 +635,7 @@ class AutomaticRun(unittest.TestCase):
                 patch.object(runner, 'sh', return_value=completed(0, HEAD)), \
                 patch.object(runner, 'codex_review', return_value=runner.Review('PASS', 'fine')), \
                 patch.object(runner, 'claude_review', return_value=runner.Review('PASS', 'fine')), \
-                patch.object(runner, 'post_comment') as post, contextlib.redirect_stdout(io.StringIO()):
+                patch.object(runner, 'publish_body') as post, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(runner.main(['7', 'auto']), 3)
         self.assertFalse(any('VERDICT:' in call.args[2] for call in post.call_args_list))
 
@@ -523,7 +648,7 @@ class AutomaticRun(unittest.TestCase):
                 patch.object(runner, 'claude_review', return_value=runner.Review(None, 'quota', 'quota')), \
                 patch.object(runner, 'run_tests', return_value={'status': 'PASS', 'count': 4, 'command': CMD, 'exit_code': 0}), \
                 patch.object(runner, 'persisted_blockers', return_value=[]), \
-                patch.object(runner, 'post_comment', side_effect=lambda pr, meta, body: posts.append(body)), \
+                patch.object(runner, 'publish_body', side_effect=lambda pr, meta, body: posts.append(body)), \
                 patch.object(runner.common, 'config', return_value={'pr_gate': {'allow_single_on_unavailable': True}}), \
                 patch.object(runner.common, 'review_test_command', return_value=CMD, create=True), \
                 contextlib.redirect_stdout(io.StringIO()):

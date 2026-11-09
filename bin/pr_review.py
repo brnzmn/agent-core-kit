@@ -75,18 +75,6 @@ class Review(NamedTuple):
     unavailable: Optional[str] = None
 
 
-def unavailable_reason(text):
-    """Only call for failed provider execution. Local errors and timeouts do not establish an outage."""
-    patterns = {
-        'quota': r"you['’]ve hit your (?:weekly|usage|session) limit|usage limit (?:reached|exceeded)|"
-                 r"rate limit (?:reached|exceeded)|credit balance is too low|insufficient (?:credits|quota)",
-        'auth': r'not (?:logged|signed) in|please (?:log|sign) in|authentication failed|unauthorized.*(?:401|sign in)',
-        'service': r'(?:service|server) (?:is )?unavailable|(?:selected|requested) model is at capacity\b|'
-                   r'overloaded_error|HTTP (?:502|503|504)\b',
-    }
-    return next((reason for reason, pattern in patterns.items() if re.search(pattern, text, re.I)), None)
-
-
 def has_blocking_output(text):
     """An interrupted review may have already found a blocker; an outage cannot erase it."""
     return bool(re.search(r'\[P[01]\]|^VERDICT:\s*BLOCK\s*$', text, re.M))
@@ -103,11 +91,21 @@ def codex_error_reason(error):
     if not isinstance(error, dict):
         return None
     codes = [error.get('code'), error.get('type'), error.get('codexErrorInfo')]
-    known = {'quota': {'usage_limit_reached', 'usageLimitExceeded', 'rateLimitExceeded', 'rate_limit_exceeded', 'insufficient_quota'},
+    known = {'quota': {'usage_limit_reached', 'usageLimitExceeded', 'rateLimitExceeded', 'rate_limit_exceeded',
+                       'rate_limit_error', 'insufficient_quota'},
              'auth': {'unauthorized', 'authentication_error', 'invalid_api_key'},
              'service': {'service_unavailable', 'server_overloaded', 'overloaded_error'}}
     return next((reason for reason, values in known.items()
                  if any(isinstance(code, str) and code in values for code in codes)), None)
+
+
+def claude_error_reason(stderr):
+    """Only a typed API error on the CLI error stream establishes an outage; prose and wrapped model text do not."""
+    try:
+        error = json.loads(stderr)
+    except (ValueError, TypeError):
+        return None
+    return codex_error_reason(error.get('error')) if isinstance(error, dict) and error.get('type') == 'error' else None
 
 
 def codex_review(base, adversarial):
@@ -130,7 +128,7 @@ def codex_review(base, adversarial):
         text = (out.stdout + '\n' + out.stderr).strip()
         if has_blocking_output(text):
             return Review('BLOCK', 'Interrupted Codex review contains blocking findings:\n' + text)
-        return Review(None, diagnostic(text), unavailable_reason(out.stderr) if out.returncode not in (0, 124) else None)
+        return Review(None, diagnostic(text))
     if not isinstance(data, dict) or not isinstance(data.get('codex'), dict):
         return Review(None, diagnostic(json.dumps(data), tail=False))
     provider = data['codex']
@@ -146,7 +144,7 @@ def codex_review(base, adversarial):
         if has_blocking_output(text + '\n' + error):
             return Review('BLOCK', 'Interrupted Codex review contains blocking findings:\n' + text + '\n' + error)
         if type(status) is int and status != 0 and out.returncode != 124:
-            reason = codex_error_reason(structured) or unavailable_reason(provider.get('stderr') or out.stderr or '')
+            reason = codex_error_reason(structured)
         return Review(None, diagnostic(error or text), reason)
     found = data.get('result')
     if adversarial:
@@ -159,6 +157,8 @@ def codex_review(base, adversarial):
 
 
 def claude_review(base):
+    if not shutil.which('claude'):
+        return Review(None, 'claude CLI not found on PATH', 'missing_cli')
     out = sh(['bash', os.path.join(CORE, 'bin', 'claude-review.sh'), base], timeout=1800,
              stdin=subprocess.DEVNULL)
     text = re.sub(r'\n\(saved to [^\n]*\)\s*$', '', out.stdout.strip())
@@ -166,9 +166,7 @@ def claude_review(base):
     if verdict is None and has_blocking_output(text + '\n' + out.stderr):
         return Review('BLOCK', 'Interrupted Claude review contains blocking findings:\n' + text + '\n' + out.stderr)
     # A successful review mentioning a quota or outage is still an actual review.
-    reason = None
-    if out.returncode == 4:
-        reason = 'missing_cli' if text == 'claude-review: claude CLI not found' else unavailable_reason(text or out.stderr)
+    reason = claude_error_reason(out.stderr) if out.returncode == 4 and not text else None
     if verdict is not None:
         text = re.sub(r'\nVERDICT: (PASS|BLOCK)\s*$', '', text)
     return Review(verdict, text or diagnostic(out.stderr.strip()), reason)
@@ -249,10 +247,9 @@ def unchanged(pr, expected):
         raise ValueError('the PR head, base or repository changed during the run')
 
 
-def post_comment(pr, expected, body):
+def publish_body(pr, expected, body):
+    """Publish already prepared prose or an explicitly serialized record. Model text never chooses its path."""
     unchanged(pr, expected)
-    body, count = redact(body)
-    print('pr_review: redacted %d secret-like string(s) before posting' % count)
     with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False) as fh:
         fh.write(body)
     try:
@@ -262,6 +259,46 @@ def post_comment(pr, expected, body):
     if posted.returncode:
         raise ValueError('posting the comment failed: ' + posted.stderr.strip())
     print(body)
+
+
+def post_comment(pr, expected, body):
+    body, count = redact(body)
+    print('pr_review: redacted %d secret-like string(s) before posting' % count)
+    publish_body(pr, expected, body)
+
+
+def public_test_command(command):
+    """Bound argv cannot be redacted without changing the command the gate checks."""
+    if (not isinstance(command, list) or not command or not all(isinstance(arg, str) for arg in command)
+            or any(arg.startswith('-') and NAMED_SECRET.fullmatch(arg.lstrip('-').split('=', 1)[0] + '="x"')
+                   for arg in command) or redact(json.dumps(command))[1]):
+        raise ValueError('configured full test command contains credential-like arguments; use an offline command without embedded credentials')
+    return command
+
+
+def post_record(pr, expected, title, marker, record, detail=''):
+    if not isinstance(record, dict):
+        raise ValueError('review receipt must be an object')
+    tests = record.get('tests')
+    if isinstance(tests, dict) and 'command' in tests:
+        public_test_command(tests['command'])
+    encoded = json.dumps(record, separators=(',', ':'))
+    if redact(encoded)[1]:
+        raise ValueError('review receipt contains credential-like bound data; remove embedded credentials before publishing')
+    detail, count = redact(detail)
+    body = title + '\n' + marker + encoded + '\n'
+    if detail:
+        body += '\n' + detail[:4000] + '\n'
+    print('pr_review: redacted %d secret-like string(s) before posting' % count)
+    publish_body(pr, expected, body)
+
+
+def post_run(pr, expected, record):
+    post_record(pr, expected, RUN_TITLE, RUN_MARK, record)
+
+
+def post_availability(pr, expected, record, detail):
+    post_record(pr, expected, EVIDENCE_TITLE, EVIDENCE_MARK, record, detail)
 
 
 def test_count(text):
@@ -393,7 +430,7 @@ def main(argv):
                          for name, review in results.items()}
             reasons = {name: review.unavailable for name, review in results.items() if review.unavailable}
             outcome = dict(attempt, status=status, providers=providers, reasons=reasons, tests=tests)
-            post_comment(pr, meta, RUN_TITLE + '\n' + RUN_MARK + json.dumps(outcome, separators=(',', ':')) + '\n')
+            post_run(pr, meta, outcome)
             finished = True
         return code
 
@@ -402,9 +439,13 @@ def main(argv):
         unchanged(pr, meta)
         base_name, head = meta['baseRefName'], meta['headRefOid']
         if who == 'auto':
+            if (common.config().get('pr_gate') or {}).get('allow_single_on_unavailable') is True:
+                configured = common.review_test_command('/'.join(meta['url'].split('/')[3:5]))
+                if configured is not None:
+                    public_test_command(configured)
             attempt = {'run_id': uuid.uuid4().hex, 'head': head, 'base': base_name,
                        'base_oid': meta['baseRefOid'], 'status': 'RUNNING'}
-            post_comment(pr, meta, RUN_TITLE + '\n' + RUN_MARK + json.dumps(attempt, separators=(',', ':')) + '\n')
+            post_run(pr, meta, attempt)
         base = fetch_base(meta)
         if who == 'auto':
             with ThreadPoolExecutor(max_workers=2) as pool:
@@ -445,6 +486,7 @@ def main(argv):
         command = common.review_test_command(slug)
         if command is None:
             raise ValueError('no full test command is configured for ' + slug)
+        public_test_command(command)
         unchanged(pr, meta)
         tests = run_tests(command, slug, head)
         unchanged(pr, meta)
@@ -452,9 +494,7 @@ def main(argv):
         evidence = {'head': head, 'base': base_name, 'base_oid': meta['baseRefOid'],
                     'run_id': attempt['run_id'], 'provider': name, 'status': 'UNAVAILABLE',
                     'reason': review.unavailable, 'tests': tests}
-        detail, _ = redact(review.text)
-        body = EVIDENCE_TITLE + '\n' + EVIDENCE_MARK + json.dumps(evidence, separators=(',', ':')) + '\n\n' + detail[:4000] + '\n'
-        post_comment(pr, meta, body)
+        post_availability(pr, meta, evidence, review.text)
         if tests['status'] != 'PASS':
             print('pr_review: fallback held: the full tests failed or reported no positive test count')
             return finish('FAIL', 3)

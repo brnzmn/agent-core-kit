@@ -639,6 +639,29 @@ class StructuredReaderOperands(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIsNone(decision(command))
 
+    def test_quoted_arg_values_may_be_generated_but_other_roles_stay_certain(self):
+        for command in ('jq --arg rev "$(git rev-parse HEAD)" \'.rev = $rev\' config.json',
+                        'jq --argjson n "$(printf 1)" \'.n = $n\' config.json',
+                        'jq --arg a "$(git rev-parse HEAD)" --arg b "`date`" \'.a = $a\' config.json',
+                        'jq -r --arg rev "$(git rev-parse HEAD)" \'.rev = $rev\' config.json',
+                        'yq --arg rev "$(git rev-parse HEAD)" \'.rev = $rev\' config.json'):
+            with self.subTest(command=command):
+                self.assertIsNone(decision(command))
+        for command in ('jq --arg rev $(git rev-parse HEAD) \'.rev = $rev\' config.json',
+                        'jq --argjson n $(printf 1) \'.n = $n\' config.json',
+                        'jq --arg rev "$(git rev-parse HEAD)" . .env',
+                        'jq --arg rev "$(git rev-parse HEAD)" . "$(printf .env)"',
+                        'jq --arg rev "$(git rev-parse HEAD)" "$(printf .)" config.json',
+                        'jq --arg rev "$(git rev-parse HEAD)" "$(printf -f)" .env config.json',
+                        'jq --arg "$(printf rev)" v . config.json',
+                        'jq "$(printf -f)" .env',
+                        'jq --rawfile rev "$(printf .env)" . config.json',
+                        'jq --indent "$(printf 2)" . config.json',
+                        'jq --arg rev "$(git rev-parse HEAD)" -- . "$(printf .env)"',
+                        'jq --arg rev .* . config.json'):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), 'deny')
+
     def test_expressions_and_literal_option_values_are_not_files(self):
         for command in ('jq .env claude/settings.json', 'jq -e .env claude/settings.json',
                         'jq --arg label .env .env settings.json',

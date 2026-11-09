@@ -119,7 +119,7 @@ Subagents without a pinned model run on Sonnet. When a model refuses or a task k
 
 - **Claude orchestrates.** Planning, delegation, judgment calls and work you steer stay in Claude Code.
 - **Codex is the second opinion and the overflow lane.** New implementation lanes go to Claude until `bin/usage.py` reports Claude's weekly usage past `routing.claude_week_limit_pct` (80 by default). Past that, new lanes go to Codex. If both are past it, running lanes finish and no new ones start.
-- **The review gate covers deploy branches.** `pr_review.py <pr> auto` attempts both providers on the exact PR head. Both must pass when available. If `pr_gate.allow_single_on_unavailable` is enabled, a confirmed quota, authentication, service or missing-CLI outage may use one real PASS plus a passing configured full test suite. A BLOCK always holds the merge. Both unavailable, malformed results, timeouts, failed tests or stale evidence hold it too. Only your signed-in gh user or `pr_gate.reviewers` may publish counted evidence; only `pr_review.py` posts it. A new commit needs fresh reviews and tests. Codex bot reviews cannot supply the outage fallback. Once an automatic run starts, its latest completed result controls the gate. Failed or interrupted automatic runs require a fresh successful `auto` run; manual verdict comments cannot reuse an older automatic success.
+- **The review gate covers deploy branches.** `pr_review.py <pr> auto` attempts both providers on the exact PR head. Both must pass when available. If `pr_gate.allow_single_on_unavailable` is enabled, a confirmed quota, authentication, service or missing-CLI outage may use one real PASS plus a passing configured full test suite. Quota, authentication and service outages require a typed provider error code; model prose and unstructured CLI diagnostics cannot establish one. A missing CLI is checked independently. A BLOCK always holds the merge. Both unavailable, malformed results, timeouts, failed tests or stale evidence hold it too. Only your signed-in gh user or `pr_gate.reviewers` may publish counted evidence; only `pr_review.py` posts it. A new commit needs fresh reviews and tests. Codex bot reviews cannot supply the outage fallback. Once an automatic run starts, its latest completed result controls the gate. Failed or interrupted automatic runs require a fresh successful `auto` run; manual verdict comments cannot reuse an older automatic success.
 
 Invoke the installed review runner from the PR checkout. Fallback tests run offline in a disposable
 Docker container. Build the worker once from a trusted checkout: `docker build -t agent-core-review-tests:1 tools/review-tests`. Keep the local Docker engine
@@ -135,9 +135,15 @@ Codex reviews block on any P0 or P1 finding. The adversarial review blocks on a 
 
 The automatic runner records the unavailable provider separately from a verdict, runs the configured test command,
 and posts the actual exit code and positive test count. It checks clean source and the local and remote heads before
-publishing. The gate checks the author, exact head, base branch and configured command. Supported test summaries are
+publishing. The gate checks the author, exact head, base branch, base commit and configured command. A change to the
+base branch's tip aborts an in-flight automatic run and invalidates its completed result, even if the PR head is
+unchanged. Run `auto` again against the current base. Supported test summaries are
 unittest, pytest and Jest/Vitest; no positive test count means no passing evidence. Existing personal configs stay
 unchanged during updates; use `/setup` or edit `local/config.json` to opt in and configure test commands.
+
+Fallback test commands must work offline without embedded credentials. Credential-like assignments and key,
+token, secret or password options are rejected before publication. Receipts preserve the exact configured argv;
+the runner validates structured data separately from redacting review prose.
 
 ```text
 PR head -> Claude + Codex reviews -> both PASS -> merge
@@ -147,7 +153,7 @@ PR head -> Claude + Codex reviews -> both PASS -> merge
 
 ## The guard hook
 
-A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs, `sudo` and `env` wrappers) and denies the dangerous ones, including commands hidden in `eval`, `$( )`, backticks, pipes into `sh` and heredocs fed to a shell. Each denial names the alternative. It asks only for gated models; everything else is a plain deny, so bypass mode does not stall on it. The same policy runs in Codex through its hooks, with a rules file as a second layer for the git commands. Codex rules match a command prefix, so they also forbid `git add -A <path>`, which the hook allows.
+A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs, `sudo` and `env` wrappers) and denies the dangerous ones, including commands hidden in `eval`, `$( )`, backticks, pipes into `sh` and heredocs fed to a shell. Each denial names the alternative. It asks only for gated models; everything else is a plain deny, so bypass mode does not stall on it. The same policy runs in Codex through its hooks, with a rules file as a second layer for unconditional Git denials. The hook checks complete staging paths and permits named staging such as `git add -A src/file.py`.
 
 | Blocked | Use instead |
 |---|---|
@@ -161,7 +167,7 @@ A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs
 | `find -delete`, `find -exec rm`, bulk or pattern moves out of a repo | List the matches, show them to the user, then `bin/trash.py --approved`. |
 | `DROP`, `TRUNCATE`, `ALTER ... DROP COLUMN` in SQL clients, heredocs and SQL MCP tools | Rename to `_to_delete_<date>_<name>`. |
 | Reading `.env` files (cat, grep, rg, awk, sed, source, cp, globs like `.env*`) | Read `.env.example` or check variable names. |
-| Writes, deletes and moves in `protected_dirs`, or of a folder that holds one | Prove the change on a scratch copy; the user decides. |
+| Writes, deletes and moves in `protected_dirs`, or of a parent of a protected path entry | Prove the change on a scratch copy; the user decides. |
 | Schema changes to a `protected_supabase` project outside `scripts/deploy` | Use the repo's deploy script. |
 | Applying learning proposals directly | Leave them for the user and say how many wait. |
 | Spawning a subagent on a model in `gated_models` | Not denied: Claude Code asks you first. |
@@ -172,7 +178,7 @@ Write paths the guard cannot resolve as one known word are held whenever protect
 
 Two more hooks guard the instruction files. The budget hook denies edits that add log entries to an instruction file or push it past its line budget: the rulebook 120 lines, each adapter 60, a repo's AGENTS.md 150, a CLAUDE.md that imports AGENTS.md 40, each `.claude/rules` file 80. The Stop hook pushes back once when a turn ends by handing work to you that the agent could do.
 
-A hook that fails for its own reasons lets the call through and logs to `local/learning/hook-errors.log`. Neither layer covers commands run inside scripts (`bash x.sh`, `python -c`), MCP tools other than SQL ones, or hosted tools. The hooks stop accidents, not a determined agent: an agent with shell access can edit `local/config.json` or `local/AGENTS.md` like any other file, so review what your agents change there.
+A guard exception prints a denial and logs to `local/learning/hook-errors.log`. A timeout or killed guard process can still let the call through because the outer hook uses `|| true`. Neither layer covers commands run inside scripts (`bash x.sh`, `python -c`), MCP tools other than SQL ones, or hosted tools. The hooks stop accidents, not a determined agent: an agent with shell access can edit `local/config.json` or `local/AGENTS.md` like any other file, so review what your agents change there.
 
 ## The learning loop
 
@@ -205,7 +211,7 @@ Hooks capture corrections in both tools without being asked. `/learn review` min
 |---|---|---|
 | `user_name` | `""` | How instructions and hook messages address you. Empty reads as "the user". |
 | `projects_root` | `""` | The folder holding your repos. The pre-commit hook is installed there and `/worktree` puts worktrees there. Empty switches both off and worktrees go next to their repo. |
-| `protected_dirs` | `[]` | Read-only data. A bare name (`client-exports`) matches that folder name anywhere; a path (`~/clients/acme/data`) protects that path only. The guard denies writes, deletes and moves there. |
+| `protected_dirs` | `[]` | Read-only data. A bare name (`client-exports`) matches that folder name anywhere; a path (`~/clients/acme/data`) also protects its parent folders from moves and deletes. Include path entries for actual locations and symlink aliases you use. |
 | `protected_supabase` | `{}` | Supabase project ref mapped to a one-line note. Schema changes are denied unless they go through `scripts/deploy`. |
 | `gated_models` | `["fable"]` | Subagent models that need your yes. Claude Code asks you before spawning one, the `advisor` agent included. |
 | `stop_hook` | `true` | The Stop hook pushes back once when a turn ends by handing work to you. |

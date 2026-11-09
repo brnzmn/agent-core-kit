@@ -92,7 +92,7 @@ class Sql(unittest.TestCase):
 
     def test_heredoc_sql_is_checked(self):
         self.assertEqual(bash('psql "$URL" <<SQL\nbegin;\nDROP TABLE accounts;\ncommit;\nSQL')[0], 'deny')
-        self.assertIsNone(bash('psql "$URL" <<SQL\nselect count(*) from accounts;\nSQL')[0])
+        self.assertIsNone(bash('psql -d "$URL" <<SQL\nselect count(*) from accounts;\nSQL')[0])
 
     def test_sql_file_is_checked(self):
         with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False) as fh:

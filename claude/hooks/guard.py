@@ -26,6 +26,7 @@ Its own errors deny the call and go to learning/hook-errors.log.
 """
 import fnmatch
 import glob
+import io
 import json
 import os
 import re
@@ -42,6 +43,7 @@ START = time.monotonic()
 MAX_CHARS = 200000
 MAX_DEPTH = 8  # nested bash -c, eval, xargs and substitutions; deeper than this is refused rather than skipped
 MAX_SUBSTITUTIONS = 256  # bound total repeated analysis below the hook deadline
+ANALYSIS_BUDGET = 7.0  # one clock for the whole hook; leave cleanup and JSON output before the outer 10-second kill
 WRAPPERS = {'sudo', 'doas', 'env', 'time', 'nice', 'nohup', 'command', 'exec', 'builtin', 'caffeinate', 'timeout'}
 WRAPPER_VALUE = {'sudo': {'-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', '-r', '-t'}, 'doas': {'-u', '-C'},
                  'env': {'-u', '-C', '-S'}, 'nice': {'-n'}, 'timeout': {'-s', '-k'}, 'caffeinate': {'-t', '-w'},
@@ -97,6 +99,7 @@ STATE = {'cwd': '', 'cwd_candidates': None, 'heredocs': [], 'expands': [], 'vars
 TRASH = common.kit_cmd('bin/trash.py')
 PR_REVIEW = common.kit_cmd('bin/pr_review.py')
 SQL_CLIENTS = {'psql', 'sqlite3', 'mysql', 'mariadb', 'duckdb', 'turso', 'pgcli', 'litecli', 'mycli'}
+RUNNERS = {'npx', 'pnpx', 'bunx', 'pnpm', 'yarn', 'npm', 'bun'}
 DESTRUCTIVE_SQL = re.compile(r'\b(drop\s+(table|database|schema)\b|truncate(\s+table)?\s+["`\w]|'
                              r'alter\s+table\b[^;]*?\bdrop\s+(column\b|(?!constraint|index|default|not\b)["`\w]))', re.I)
 HEREDOC_MARK = 'AGENTCORE_HEREDOC_'
@@ -133,6 +136,55 @@ PLAIN_WORD = (r"(?:[A-Za-z0-9._\-/~+@:,]|'[A-Za-z0-9._\-/~+@:, ]*'|\"[A-Za-z0-9.
 PLAIN_TAIL = re.compile(r'^(?:\s+' + PLAIN_WORD + r')+\s*$')  # what may follow `rm -rf` when it is rewritten
 GH_TIMEOUT = 8  # seconds per gh call; the hook is killed at 10 and a killed hook lets the merge through
 GH_BUDGET = 7.0  # seconds from start for all gh calls together; leaves room for startup and the kill below
+
+
+class AnalysisExpired(BaseException):
+    """A deadline must escape broad error handlers that otherwise return an unchecked command."""
+
+
+def analysis_remaining():
+    deadline = STATE.get('analysis_deadline')
+    left = ANALYSIS_BUDGET if deadline is None else deadline - time.monotonic()
+    if left <= 0:
+        raise AnalysisExpired()
+    return left
+
+
+def analysis_alarm(signum, frame):
+    raise AnalysisExpired()
+
+
+def bounded_analysis(run, *args, **kwargs):
+    """Nested analysis shares one deadline; the alarm also interrupts blocked filesystem and subprocess work."""
+    if STATE.get('analysis_deadline') is not None:
+        analysis_remaining()
+        return run(*args, **kwargs)
+    started = time.monotonic()
+    STATE['analysis_deadline'] = started + ANALYSIS_BUDGET
+    previous_handler, previous_timer, changed = None, None, False
+    try:
+        try:
+            previous_handler = signal.getsignal(signal.SIGALRM)
+            previous_timer = signal.getitimer(signal.ITIMER_REAL)
+            signal.signal(signal.SIGALRM, analysis_alarm)
+            changed = True
+            delay = analysis_remaining()
+            if previous_timer[0] > 0:
+                delay = min(delay, previous_timer[0])
+            signal.setitimer(signal.ITIMER_REAL, delay)
+        except (AttributeError, ValueError):
+            raise AnalysisExpired()  # this hook cannot establish a bounded decision in this execution context
+        result = run(*args, **kwargs)
+        analysis_remaining()
+        return result
+    finally:
+        if changed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            if previous_timer[0] > 0:
+                remaining = max(0.000001, previous_timer[0] - (time.monotonic() - started))
+                signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
+        STATE.pop('analysis_deadline', None)
 
 
 def _esc(text):
@@ -281,6 +333,8 @@ class Protected:
 
     def backup(self, token):
         """True when token is under <protected>/backups/: additive snapshots before a change are allowed."""
+        if getattr(token, 'path_uncertain', False) or re.search(r'[$`*?\[{\\]', token):
+            return False
         if self.backup_re and self.backup_re.search(token):
             return True
         for c in self._candidates(token):
@@ -320,12 +374,12 @@ MSG = {
     'fake_verdict': ('Review verdicts and availability/test evidence count toward the merge gate, so only bin/pr_review.py '
                      'posts them. Run: ' + PR_REVIEW + ' <pr> auto.'),
     'repo_delete': 'Deleting a GitHub repo is blocked; ' + USER + ' deletes repos. Name the repo in your final message.',
-    'review_wait': ('PR #%s goes into %s, a gated branch of %s. The review gate is incomplete for head %s. Missing: %s. '
+    'review_wait': ('PR #%s goes into %s, a gated branch of %s. The review gate is incomplete for head %s against the current base branch and base commit. Missing: %s. '
                     'Run ' + _esc(PR_REVIEW) + ' %s auto from a checkout of the head. A configured provider-outage '
                     'fallback needs one real PASS and passing tests; a BLOCK still holds the merge.'),
     'review_block': ('PR #%s: the %s review of head %s says VERDICT: BLOCK. Fix the findings, push, and review the new '
                      'head before merging.'),
-    'review_unread': 'gh pr merge is held: the PR\'s reviews could not be read (%s). Retry once gh works.',
+    'review_unread': 'gh pr merge is held: reviews of the PR\'s current head and base commit could not be read (%s). Retry once gh works; a base change requires fresh automatic reviews.',
     'api_merge': ('gh api cannot merge a PR around the review gate (pr_gate in config). Merge with gh pr merge <number>, '
                   'which checks the review and provider-outage evidence.'),
     'lane': ('This worktree\'s .agent-lane names the other tool, which owns its commits. Leave your change '
@@ -350,9 +404,12 @@ MSG = {
     'rm_cwd': ('That deletes the whole working folder. Name the files or folders to delete; a recursive delete of plain '
                'paths then goes to the trash.'),
     'mv_wt': 'Moving a worktree with mv breaks git links. Use git worktree move.',
-    'env': 'Reading an env file puts secrets into the conversation. Read .env.example or check variable names instead.',
+    'env': 'Reading an env file puts secrets into the conversation. Read .env.example, or run '
+            "sed 's/=.*//' .env on its own. For multiline or commented env files that cannot be safely redacted, "
+            'use grep -c NAME .env to check a name without printing its value.',
     'lake': ('This writes to a protected folder (protected_dirs in config), which is read-only unless ' + USER +
-             ' says otherwise. Prove it on a scratch copy first.'),
+             ' says otherwise. Prove it on a scratch copy first. For additive backups, use a literal timestamp '
+             'in the filename; an unknown basename cannot be verified as a safe snapshot.'),
     'apply': ('Do not apply learning-loop proposals yourself. Leave them in ' + PROPOSALS + ' for ' + USER_S +
               ' review and tell ' + USER + ' how many are waiting.'),
     'gated': ('Claude Code asks you before spawning this subagent because %s is gated in local/config.json '
@@ -410,25 +467,139 @@ def _ansi_c(body):
     return re.sub(r'\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|.)', one, body, flags=re.S)
 
 
+def heredoc_marks(line, quote=None, word_start=True, arithmetic=None):
+    """Real << operators and decoded delimiter words, retaining quote state across physical lines.
+
+    `quote` is a stack of open frames (a tuple, or None when empty): '"' and "'" for quotes, and an int paren depth
+    for a $( ) substitution opened inside double quotes, which is shell code again, so its << operators are real."""
+    marks, i, continued = [], 0, False
+    stack = list(quote) if isinstance(quote, tuple) else ([quote] if quote else [])
+    while i < len(line):
+        char = line[i]
+        top = stack[-1] if stack else None
+        if top in ('"', "'"):
+            if char == '\\' and top == '"':
+                continued = i + 1 == len(line)
+                i += 2
+                continue
+            if top == '"' and line.startswith('$(', i) and not line.startswith('$((', i):
+                stack.append(1)
+                word_start = True
+                i += 2
+                continue
+            if char == top:
+                stack.pop()
+            i += 1
+            word_start = False
+            continue
+        if char == '\\':
+            continued = i + 1 == len(line)
+            i += 2
+            if not continued:
+                word_start = False
+            continue
+        if char in "\"'":
+            stack.append(char)
+            word_start = False
+            i += 1
+            continue
+        if arithmetic is not None:
+            depth, expansion = arithmetic
+            depth += (char == '(') - (char == ')')
+            arithmetic = (depth, expansion) if depth else None
+            if not depth:
+                word_start = not expansion
+            i += 1
+            continue
+        if line.startswith('$((', i) or line.startswith('((', i):
+            expansion = line.startswith('$((', i)
+            arithmetic, word_start = (2, expansion), False
+            i += 3 if expansion else 2
+            continue
+        if char == '#' and word_start:
+            return marks, tuple(stack) or None, True, arithmetic
+        if line.startswith('<<<', i):
+            i += 3
+            word_start = True
+            continue
+        if line.startswith('<<', i):
+            start, i = i, i + 2
+            strip_tabs = i < len(line) and line[i] == '-'
+            i += strip_tabs
+            while i < len(line) and line[i] in ' \t':
+                i += 1
+            begin, delimiter_quote = i, None
+            while i < len(line):
+                current = line[i]
+                if current == '\\' and delimiter_quote != "'":
+                    if i + 1 == len(line):
+                        raise TooDeep('incomplete heredoc delimiter')
+                    i += 2
+                    continue
+                if delimiter_quote:
+                    if current == delimiter_quote:
+                        delimiter_quote = None
+                elif current in "\"'":
+                    delimiter_quote = current
+                elif current in ' \t;&|()<>':
+                    break
+                i += 1
+            if delimiter_quote or i == begin:
+                raise TooDeep('unreadable heredoc delimiter')
+            raw = line[begin:i]
+            if raw.startswith('$"'):
+                raise TooDeep('translated heredoc delimiter')
+            if raw.startswith("$'") and raw.endswith("'"):
+                delimiter, quoted = _ansi_c(raw[2:-1]), True
+            else:
+                words = tokens_of(raw)
+                if len(words) != 1:
+                    raise TooDeep('unreadable heredoc delimiter')
+                delimiter, quoted = str(words[0]), words[0].quoted
+            if '\n' in delimiter or '\r' in delimiter:
+                raise TooDeep('multiline heredoc delimiter')
+            if not delimiter.startswith(HEREDOC_MARK):
+                marks.append((start, i, delimiter, not quoted, strip_tabs))
+            word_start = False
+            continue
+        if stack and isinstance(stack[-1], int) and char in '()':
+            stack[-1] += 1 if char == '(' else -1
+            if not stack[-1]:
+                stack.pop()  # back in the double-quoted string that held the substitution
+                word_start = False
+                i += 1
+                continue
+        word_start = char in ' \t;&|()<>'
+        i += 1
+    in_quote = bool(stack) and stack[-1] in ('"', "'")
+    return marks, tuple(stack) or None, word_start if continued or in_quote or arithmetic else True, arithmetic
+
+
+
 def normalize(cmd):
     """Drop heredoc bodies, comments and line continuations; turn unquoted line breaks into ';'."""
     lines = cmd[:MAX_CHARS].split('\n')
-    kept, i = [], 0
+    kept, i, lexical_quote, word_start, arithmetic = [], 0, None, True, None
     while i < len(lines):
         line = lines[i]
         i += 1
-        marks = [m for m in HEREDOC.finditer(line) if not m.group(2).startswith(HEREDOC_MARK)]
-        for m in marks:
+        marks, lexical_quote, word_start, arithmetic = heredoc_marks(line, lexical_quote, word_start, arithmetic)
+        for _, _, delimiter, expands_body, strip_tabs in marks:
             body = []
-            while i < len(lines) and lines[i].strip() != m.group(2):
-                body.append(lines[i])
+            while i < len(lines):
+                value = lines[i].lstrip('\t') if strip_tabs else lines[i]
+                if value == delimiter:
+                    break
+                body.append(value)
                 i += 1
+            if i == len(lines):
+                raise TooDeep('unterminated heredoc')
             i += 1
             STATE['heredocs'].append('\n'.join(body))
-            STATE['expands'].append(m.group(1) == '')  # an unquoted delimiter lets $( ) and backticks in the body run
-        for k, m in reversed(list(enumerate(marks))):
+            STATE['expands'].append(expands_body)
+        for k, (start, end, _, _, _) in reversed(list(enumerate(marks))):
             n = len(STATE['heredocs']) - len(marks) + k
-            line = line[:m.start()] + '<< %s%d' % (HEREDOC_MARK, n) + line[m.end():]
+            line = line[:start] + '<< %s%d' % (HEREDOC_MARK, n) + line[end:]
         kept.append(line)
     text = '\n'.join(kept)
     out, quote, esc, word_start, i = [], None, False, True, 0
@@ -932,14 +1103,14 @@ def gate_covers(slug, branch):
 def gh_run(argv):
     """Run gh with a hard timeout (GH_TIMEOUT, and GH_BUDGET for all calls of this hook run) and kill its whole process
     group on expiry. The hook itself is killed at its own timeout, and a killed hook lets the merge through."""
-    left = GH_BUDGET - (time.monotonic() - START)
+    left = min(GH_BUDGET - (time.monotonic() - START), analysis_remaining())
     if left < 0.5:
         raise subprocess.TimeoutExpired(argv, 0)
     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             cwd=STATE['cwd'] or None, start_new_session=True)
     try:
         out, err = proc.communicate(timeout=min(GH_TIMEOUT, left))
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, AnalysisExpired):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
@@ -1181,11 +1352,11 @@ def merge_decision(args, repo=()):
     command = common.review_test_command(slug)
     if availability and (not attempt or availability[1] > attempt[1]) and (
             not availability[0] or not passing_test_receipt(availability[0].get('tests'), command)):
-        return 'deny', 'The latest automatic review tests failed or are unverified. Run pr_review.py with auto again.'
+        return 'deny', 'The latest automatic review tests failed or are unverified for the current head, base branch and base commit. Run pr_review.py with auto again.'
     if attempt:
         if automatic_run_passes(pr, attempt[0], head, authors, gate, command):
             return None
-        return 'deny', 'The latest automatic review run is not a verified pass. Run pr_review.py with auto again.'
+        return 'deny', 'The latest automatic review run is not a verified pass for the current head, base branch and base commit. Run pr_review.py with auto again.'
     verdicts = {who: review_verdict(pr, who, head, authors, trust, legacy_only=True) for who in ('Claude', 'Codex')}
     missing = [who for who, v in verdicts.items() if not v]
     if missing:
@@ -1496,7 +1667,7 @@ def current_branch(where):
     """The branch checked out in where, or None when it cannot be read (detached HEAD, no repo, git missing)."""
     try:
         out = subprocess.run(['git', '-C', where, 'symbolic-ref', '--short', 'HEAD'], capture_output=True, text=True,
-                             timeout=3)
+                             timeout=min(3, analysis_remaining()))
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
@@ -1506,7 +1677,7 @@ def branch_exists(where, name):
     """True when refs/heads/<name> exists in where, or cannot be told (git missing, no repo)."""
     try:
         out = subprocess.run(['git', '-C', where, 'show-ref', '--verify', '--quiet', 'refs/heads/' + name],
-                             capture_output=True, text=True, timeout=3)
+                             capture_output=True, text=True, timeout=min(3, analysis_remaining()))
     except (OSError, subprocess.SubprocessError):
         return True
     return out.returncode != 1
@@ -1592,6 +1763,8 @@ def unknown_expansion(token):
 def expands(token):
     """True when a raw token holds a $ or backtick the shell will act on and the guard cannot see the result of: not
     single-quoted or escaped, and, inside double quotes, not just references to variables the guard knows (one word)."""
+    if getattr(token, 'path_uncertain', False):
+        return True  # container/argv recursion may already have expanded this uncertain source operand
     sites = getattr(token, 'expansion_sites', None)
     if sites is not None:
         if not sites:
@@ -2225,7 +2398,9 @@ def sql_texts(args):
         a = args[k]
         if a.startswith(HEREDOC_MARK):
             try:
-                texts.append(STATE['heredocs'][int(a[len(HEREDOC_MARK):])])
+                index = int(a[len(HEREDOC_MARK):])
+                body = STATE['heredocs'][index]
+                texts.append(expand(body) if STATE['expands'][index] else body)
             except (ValueError, IndexError):
                 pass
         elif a in ('-f', '--file', '<', '-init') and k + 1 < len(args) or a.startswith('--file='):
@@ -2241,7 +2416,124 @@ def sql_texts(args):
     return texts
 
 
+def opaque_sql_operands(prog, args):
+    """Validate SQL inputs by client role; one-argument connection values do not supply SQL."""
+    pg = prog in ('psql', 'pgcli', 'usql')
+    mysql = prog in ('mysql', 'mariadb', 'mycli')
+    sqlite = prog in ('sqlite3', 'duckdb', 'litecli', 'turso')
+    inline = {'-c', '--command'} if pg or prog == 'duckdb' else {'-e', '--execute'} if mysql or prog == 'litecli' else {'--command'} if prog == 'wrangler' else set()
+    files = {'-f', '--file'} if pg or prog == 'duckdb' else {'--file'} if prog == 'wrangler' else set()
+    variables = {'-v', '--set', '--variable'} if prog == 'psql' else set()
+    extra = {'--init-command'} if mysql else {'-cmd'} if sqlite else set()
+    extra_files = {'-init'} if sqlite else set()
+    sql_values = inline | files | variables | extra | extra_files
+    connections = {'-h', '--host', '-p', '--port', '-U', '-u', '--username', '--user', '-d', '--dbname', '-D', '--database',
+                   '-L', '--log-file', '-o', '--output', '-P', '--pset', '-R', '--record-separator',
+                   '-F', '--field-separator', '-separator', '-nullvalue', '-newline', '-vfs'}
+    flags = {'-header', '-noheader', '-column', '-csv', '-html', '-line', '-list', '-markdown', '-table',
+             '-json', '-quote', '-readonly', '-batch', '-bail', '-echo', '-interactive', '-stats', '-version', '-help'} if sqlite else set()
+    plain, redirs = split_redirects(args)
+
+    def opaque(value):
+        return value is None or unresolved_path(value, getattr(value, 'source_operand', value))
+
+    def single(value):
+        if value is None:
+            return False
+        raw = getattr(value, 'source_operand', value)
+        return not opaque(value) or (not getattr(raw, 'unquoted_expansion', False)
+                                     and not getattr(raw, 'unquoted_pattern', False))
+
+    def unknown_file(value):
+        if opaque(value):
+            return True
+        text = gh_body_file(value, args)
+        return text is None or (value == '-' and DESTRUCTIVE_SQL.search(text))
+
+    def bad_value(option, value):
+        return unknown_file(value) if option in files | extra_files else opaque(value)
+
+    for op, value in redirs:
+        if op in ('<<', '<<-') and value.startswith(HEREDOC_MARK):
+            if proven_heredoc_body(value) is None:
+                return True
+        elif op == '<' and unknown_file(value) or op == '<<<' and opaque(value):
+            return True
+    positionals, supplied, k = [], any(op in ('<', '<<', '<<-', '<<<') for op, _ in redirs), 0
+    while k < len(plain):
+        argument = plain[k]
+        if argument.startswith(HEREDOC_MARK):
+            if proven_heredoc_body(argument) is None:
+                return True
+            supplied = True
+            k += 1
+            continue
+        if argument == '--':
+            positionals.extend(plain[k + 1:])
+            break
+        option, eq, value = argument.partition('=')
+        if option.startswith('--') and len(option) > 2:
+            matches = [name for name in sql_values if name.startswith(option)]
+            if matches:
+                option = matches[0]
+        if mysql and argument == '-p':
+            k += 1
+            continue  # an optional MySQL password does not consume the following SQL option
+        if option in sql_values | connections:
+            if eq:
+                value = operand_value(value, argument)
+            else:
+                k += 1
+                value = plain[k] if k < len(plain) else None
+            if option in sql_values:
+                supplied = supplied or option in inline | files
+                if bad_value(option, value):
+                    return True
+            elif not single(value):
+                return True
+        elif argument.startswith('-') and not argument.startswith('--') and argument not in flags:
+            letters = 'cfhpUdvLoPRF' if pg else 'ehPupDS' if mysql else 'c' if prog == 'duckdb' else 'e' if prog == 'litecli' else ''
+            at = next((n for n, letter in enumerate(argument[1:], 1) if letter in letters), None)
+            if at is not None:
+                short = '-' + argument[at]
+                attached = argument[at + 1:]
+                if attached:
+                    value = operand_value(attached, argument)
+                elif mysql and short == '-p':
+                    k += 1
+                    continue  # MySQL's optional password never consumes the next argument
+                else:
+                    k += 1
+                    value = plain[k] if k < len(plain) else None
+                if short in sql_values:
+                    supplied = supplied or short in inline | files
+                    if bad_value(short, value):
+                        return True
+                elif not single(value):
+                    return True
+        elif not argument.startswith('-'):
+            if opaque(argument):
+                return True  # even one quoted unknown field can expand to a SQL-bearing option
+            positionals.append(argument)
+        k += 1
+    positional_sql = sqlite and bool(positionals[1:])
+    if positional_sql and any(opaque(value) for value in positionals[1:]):
+        return True
+    if any(not single(value) for value in positionals[:1] if sqlite) or (not sqlite and any(not single(value) for value in positionals)):
+        return True
+    if not supplied and not positional_sql and STATE['pipe']:
+        text = piped_text(STATE['pipe'][-1])
+        return text is None or DESTRUCTIVE_SQL.search(text)
+    return False
+
+
+
 def sql_decision(prog, args):
+    if prog in ('sqlite3', 'duckdb') and any(PROTECTED.hit(m.group(1)) and not PROTECTED.backup(m.group(1))
+            for a in args for m in DB_DUMP_TO.finditer(a)):
+        return 'deny', MSG['lake']
+    if opaque_sql_operands(prog, args):
+        return 'deny', MSG['sql']
     if not any(DESTRUCTIVE_SQL.search(t) for t in sql_texts(args)):
         return None
     if prog in ('sqlite3', 'duckdb', 'litecli'):
@@ -2356,18 +2648,24 @@ def feeds_env(cmd):
     return any(env_hint(t) for t in names) or any(pattern_env(q) for q in patterns)
 
 
-def structured_reads_env(prog, args, file_operand):
-    """jq filters and option values are not filenames; yq's automatic filename detection stays conservative."""
+def structured_reads_env(prog, args, file_operand, uncertain=None):
+    """jq filters and option values are not filenames; yq's automatic filename detection stays conservative.
+    `uncertain(index, literal_value)` marks words whose expansion could add flags or files: every word the walk visits
+    or skips is checked, except the value of --arg/--argjson, which only needs to be quoted."""
     expression, values_only, literal, k = False, False, False, 0
+    literal_values = set()
     value_flags = {'--indent', '--width', '-w', '-I', '-p', '-o', '--input-format', '--output-format',
                    '--front-matter', '--yaml-output-grammar-version', '--yml-out-ver'}
     file_flags = {'-f', '--from-file', '-L', '--library-path', '--split-exp-file', '--run-tests'}
     while k < len(args):
         a = args[k]
+        start = k
         flag, eq, attached = a.partition('=')
         if not literal and a == '--':
             literal = True
         elif not literal and flag in ('--arg', '--argjson'):
+            if not eq:
+                literal_values.add(k + 2)
             k += 2  # name and literal value
         elif not literal and flag in ('--rawfile', '--slurpfile', '--argfile'):
             if k + 2 < len(args) and file_operand(k + 2, args[k + 2]):
@@ -2409,6 +2707,8 @@ def structured_reads_env(prog, args, file_operand):
         elif not values_only and file_operand(k, a):
             return True
         k += 1
+        if uncertain and any(uncertain(j, j in literal_values) for j in range(start, min(k, len(args)))):
+            return True
     return False
 
 
@@ -2439,10 +2739,16 @@ def reads_env(prog, args):
         return any(file_operand(index, value) for index, value in script_files) or any(
             file_operand(index, args[index]) for index in files)
     if prog in ('jq', 'yq'):
-        if any(unresolved_path(value, raw) or getattr(raw, 'unquoted_pattern', False)
-               for value, raw in zip(args, raw_args)):
-            return True  # skipped filter/option words must not expand into extra flags or filenames
-        return structured_reads_env(prog, args, file_operand)
+        def uncertain(index, literal_value=False):
+            value, raw = args[index], raw_args[index]
+            if getattr(raw, 'unquoted_pattern', False):
+                return True
+            if literal_value:  # a quoted --arg/--argjson value stays one literal word, whatever it expands to
+                return not isinstance(raw, ShellToken) or raw.unquoted_expansion is not False
+            return unresolved_path(value, raw)
+
+        # skipped filter/option words must not expand into extra flags or filenames
+        return structured_reads_env(prog, args, file_operand, uncertain)
 
     skip_first = prog in PATTERN_FIRST and not supplied_search_pattern(prog, args)
     literal, k = False, 0
@@ -2510,6 +2816,39 @@ def read_text(path):
         return None
 
 
+def proven_heredoc_body(marker):
+    """The exact stdin bytes of a heredoc, or None when shell expansion cannot be established."""
+    try:
+        index = int(marker[len(HEREDOC_MARK):])
+        text = STATE['heredocs'][index]
+        if not STATE['expands'][index]:
+            return text
+    except (ValueError, IndexError):
+        return None
+    out, i = [], 0
+    while i < len(text):
+        char = text[i]
+        if char == '\\' and i + 1 < len(text) and text[i + 1] in '\\$`\n':
+            if text[i + 1] != '\n':
+                out.append(text[i + 1])
+            i += 2
+            continue
+        if char == '`':
+            return None
+        if char == '$':
+            match = STRICT_REF.match(text, i)
+            value = known_variable(match.group(1) or match.group(2)) if match else None
+            if value is None:
+                return None
+            out.append(value)
+            i = match.end()
+            continue
+        out.append(char)
+        i += 1
+    return ''.join(out)
+
+
+
 def heredoc_body(marker):
     try:
         index = int(marker[len(HEREDOC_MARK):])
@@ -2539,12 +2878,14 @@ def piped_text(prev):
     if prog == 'printf':
         return printf_output(plain)
     if prog == 'cat':
-        texts = [read_text(f) for f in plain if not f.startswith('-')]
+        texts = [None if unresolved_path(f, getattr(f, 'source_operand', f)) else read_text(f)
+                 for f in plain if not f.startswith('-')]
         for op, target in redirs:
             if op == '<<' and target.startswith(HEREDOC_MARK):
-                texts.append(heredoc_body(target))
+                texts.append(proven_heredoc_body(target))
             elif op == '<<<':
-                texts.append(target)
+                value = expand(target)
+                texts.append(None if unresolved_path(value, target) else value)
             elif op == '<':
                 texts.append(read_text(target))
         if texts and None not in texts:
@@ -2729,6 +3070,24 @@ def set_variable(name, value, unknown):
 
 
 
+def container_command(prog, args):
+    """The argv a container exec runs, preserving expanded-operand provenance."""
+    if 'exec' not in args[:8]:
+        return []
+    rest = args[args.index('exec') + 1:]
+    values = {'-e', '-u', '-w', '-n', '-c', '--env', '--user', '--workdir', '--env-file', '--namespace',
+              '--container', '--context', '--index', '-f', '--file', '-p', '--project-name'}
+    k = 0
+    while k < len(rest) and rest[k].startswith('-') and rest[k] != '--':
+        k += 2 if rest[k] in values else 1
+    if k < len(rest) and rest[k] == '--':
+        k += 1
+    inner = rest[k + 1:]
+    if prog == 'kubectl' and '--' in inner:
+        inner = inner[inner.index('--') + 1:]
+    return inner
+
+
 def analyze(toks, depth, raw=None, mutations=None):
     if not external_scope(toks):
         return analyze_command(toks, depth, raw, mutations)
@@ -2871,6 +3230,29 @@ def analyze_command(toks, depth, raw=None, mutations=None):
             return 'deny', MSG['api_merge']
     if prog == 'supabase' or (prog in ('npx', 'pnpx', 'bunx') and args[:1] and args[0].startswith('supabase')):
         return supabase_decision(args if prog == 'supabase' else args[1:])
+    if prog in RUNNERS:
+        k = 0
+        while k < len(args) and (args[k].startswith('-') or args[k] in ('exec', 'dlx', 'x')):
+            k += 2 if args[k] in ('-p', '--package') else 1
+        if k < len(args) and (os.path.basename(args[k]) in SQL_CLIENTS or os.path.basename(args[k]) == 'wrangler'):
+            if depth >= MAX_DEPTH:
+                return 'deny', MSG['deep']
+            saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), STATE['cwd_candidates'])
+            try:
+                return analyze(args[k:], depth + 1)
+            finally:
+                STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = saved
+    if prog in ('docker', 'podman', 'nerdctl', 'kubectl', 'docker-compose'):
+        inner = container_command(prog, args)
+        if not inner:
+            return None
+        if depth >= MAX_DEPTH:
+            return 'deny', MSG['deep']
+        saved = (STATE['cwd'], dict(STATE['vars']), set(STATE['restricted']), set(STATE['unknown']), STATE['cwd_candidates'])
+        try:
+            return analyze(inner, depth + 1)
+        finally:
+            STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = saved
     if prog in SQL_CLIENTS or (prog == 'wrangler' and args[:2] == ['d1', 'execute']):
         decision = sql_decision(prog, args)
         if decision or prog not in ('sqlite3', 'duckdb'):
@@ -2918,9 +3300,6 @@ def analyze_command(toks, depth, raw=None, mutations=None):
             sql = ' '.join(p[1:])
             if not sql or DB_WRITE.search(sql) or any(a.startswith('<') for a in args):
                 return 'deny', MSG['lake']
-        if any(PROTECTED.hit(m.group(1)) and not PROTECTED.backup(m.group(1))
-               for a in p[1:] for m in DB_DUMP_TO.finditer(a)):
-            return 'deny', MSG['lake']
         return None
     if prog in READERS:
         return ('deny', MSG['env']) if reads_env(prog, args) else None
@@ -3005,6 +3384,7 @@ def check_tokens(tokens, depth, deferred=False, mutations=None):
     cond_vars = set()  # assignments are known only while the same successful && chain continues
     try:
         for kind, cmd, before, after in split_commands(tokens):
+            analysis_remaining()
             if cond_cd and before != '&&':
                 set_cwd(None, cond_cd if isinstance(cond_cd, tuple) else None)
                 cond_cd = False  # only these complete old/success states survive the chain
@@ -3163,6 +3543,13 @@ def scan_moves(norm, depth=0):
 
 
 def check_script(text, depth=0, mutations=None):
+    try:
+        return bounded_analysis(check_script_body, text, depth, mutations)
+    except AnalysisExpired:
+        return 'deny', MSG['deep']
+
+
+def check_script_body(text, depth=0, mutations=None):
     if depth > MAX_DEPTH or len(text) > MAX_CHARS:
         return 'deny', MSG['deep']
     if depth == 0:
@@ -3296,7 +3683,7 @@ def gh_stdin_text(args):
     text, redirected = None, False
     for op, target in redirs:
         if op == '<<' and target.startswith(HEREDOC_MARK):
-            text, redirected = heredoc_body(target), True
+            text, redirected = proven_heredoc_body(target), True
         elif op == '<<<':
             text, redirected = (None if getattr(target, 'path_uncertain', False) else target), True
         elif op == '<':
@@ -3593,7 +3980,7 @@ def quiet_inplace_substitution(script):
     return bool(re.fullmatch(r'[gpI0-9]*', script[k:]))
 
 
-NAMES_ONLY_SED = re.compile(r'^s(?P<d>[^\\\s])=\.\*(?P=d)[^\\&]*(?P=d)[gp]{0,2}$')
+NAMES_ONLY_SED = re.compile(r'^s(?P<d>[^\\\s])=\.\*(?P=d)(?:(?!(?P=d))[^\\&\r\n])*(?P=d)[gp]{0,2}$')
 
 
 def dotenv_lines_have_assignments(path):
@@ -3719,6 +4106,8 @@ def substitution_spans(text, processes=False):
         elif ch == "'":
             j = text.find("'", i + 1)
             i = n if j < 0 else j + 1
+        elif text.startswith('$((', i):
+            i += 3  # arithmetic is not a child shell; continue scanning for real nested substitutions
         elif text.startswith('$(', i) or (processes and text[i:i + 2] in ('<(', '>(')):
             end = _close_paren(text, i + 2)
             out.append((i, min(n, end + 1), text[i + 2:end], ch != '$'))
@@ -3734,6 +4123,8 @@ def substitution_spans(text, processes=False):
             while j < n and text[j] != '"':
                 if text[j] == '\\':
                     j += 2
+                elif text.startswith('$((', j):
+                    j += 3
                 elif text.startswith('$(', j):
                     end = _close_paren(text, j + 2)
                     out.append((j, min(n, end + 1), text[j + 2:end], False))
@@ -3796,7 +4187,7 @@ def command_substitutions(cmd):
                 yield from substitutions(STATE['heredocs'][index])
 
 
-def main():
+def main_body():
     try:
         data = json.load(sys.stdin)
     except Exception:
@@ -3831,6 +4222,21 @@ def main():
         print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
                          'permissionDecisionReason': 'agent-core: Guard could not check this action. See the hook error log.'}}))
         common.log_error('guard', exc)
+
+
+def main():
+    output, original = io.StringIO(), sys.stdout
+    try:
+        sys.stdout = output
+        try:
+            bounded_analysis(main_body)
+        finally:
+            sys.stdout = original
+    except AnalysisExpired:
+        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+                         'permissionDecisionReason': 'agent-core: ' + MSG['deep']}}))
+    else:
+        sys.stdout.write(output.getvalue())
 
 
 if __name__ == '__main__':

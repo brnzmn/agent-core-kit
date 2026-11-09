@@ -32,7 +32,7 @@ class AutomaticPublication(unittest.TestCase):
                 patch.object(runner, 'codex_review', return_value=codex), \
                 patch.object(runner, 'claude_review', return_value=claude), \
                 patch.object(runner, 'run_tests', return_value=tests), \
-                patch.object(runner, 'post_comment', side_effect=post), \
+                patch.object(runner, 'publish_body', side_effect=post), \
                 patch.object(runner, 'persisted_blockers', return_value=list(blockers), create=True), \
                 patch.object(runner.common, 'config', return_value={'pr_gate': {'allow_single_on_unavailable': True}}), \
                 patch.object(runner.common, 'review_test_command', return_value=CMD), \

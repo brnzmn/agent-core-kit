@@ -346,8 +346,11 @@ class Timeouts(Fixture, unittest.TestCase):
         out = self.decide(gh=self.slow_gh())
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(out['permissionDecision'], 'deny')
-        self.assertIn('could not be read', out['permissionDecisionReason'])
-        self.assertIn('8 seconds', out['permissionDecisionReason'])
+        reason = out['permissionDecisionReason']
+        if 'could not be read' in reason:
+            self.assertIn('8 seconds', reason)
+        else:
+            self.assertEqual(reason, 'agent-core: ' + guard.MSG['deep'])
 
     def test_a_hanging_login_lookup_holds_the_merge_too(self):
         """The second gh call (`gh api user`), in-process with a 1 second limit so the suite stays fast."""
