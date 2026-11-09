@@ -10,7 +10,7 @@
   "spend_limit_usd": 5,
   "permission_mode": "",
   "auto_mode_environment": [],
-  "pr_gate": {"enabled": true, "branches": ["main", "master", "production"], "repos": "*", "reviewers": [], "trust_codex_bot": false},
+  "pr_gate": {"enabled": true, "branches": ["main", "master", "production"], "repos": "*", "reviewers": [], "trust_codex_bot": false, "allow_single_on_unavailable": false, "test_commands": {}},
   "routing": {"claude_week_limit_pct": 80},
   "codex": {"models": {}, "pin_memories_off": false}
 }

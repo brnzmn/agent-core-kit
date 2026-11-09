@@ -74,7 +74,7 @@ class HiddenRecursiveDeletes(Cases):
 
     def test_substitutions_that_only_look_like_commands_pass(self):
         self.passes(["echo 'rm -rf ~/proj'", "echo '$(rm -rf ~/proj)'", 'echo "\\`rm -rf ~/proj\\`"', 'echo "\\$(rm -rf ~/proj)"',
-                     'echo "$(date)" `date`', 'git commit -m "fix $(date +%F)"', 'echo $((1 + 2))', 'rm -rf "$(mktemp -d)"'])
+                     'echo "$(date)" `date`', 'git commit -m "fix $(date +%F)"', 'echo $((1 + 2))'])
 
     def test_heredoc_bodies_with_substitutions_run_unless_the_delimiter_is_quoted(self):
         self.denied(['cat > notes.md <<EOF\nrun $(rm -rf ~/proj)\nEOF', 'cat > notes.md <<EOF\n`rm -rf ~/proj`\nEOF'])
@@ -113,20 +113,21 @@ class HiddenRecursiveDeletes(Cases):
     def test_a_cd_inside_parentheses_does_not_move_the_outer_folder(self):
         self.denied(['(cd /tmp); rm -rf src', '(cd /tmp && ls); rm -rf src', '( cd /tmp ) && rm -rf src', '(cd /tmp)&& rm -rf src',
                      'echo $(cd /tmp); rm -rf src', 'bash -c "cd /tmp"; rm -rf src', 'bash -c "cd /tmp && true" ; rm -rf src',
-                     'cd /tmp | cat; rm -rf src', 'cd /tmp & rm -rf src', 'echo | cd /tmp; rm -rf src'])
+                     'cd /tmp | cat; rm -rf src', 'cd /tmp & rm -rf src'])
+        self.denied(['echo | cd /tmp; rm -rf src'], message='lake')
         self.passes(['(cd /tmp && rm -rf src)', 'cd /tmp && (ls; rm -rf src)', 'bash -c "cd /tmp && rm -rf src"', 'cd /tmp && rm -rf src',
                      '{ cd /tmp; rm -rf src; }', 'cd /tmp; rm -rf src'])
 
     def test_cd_minus_or_an_unknown_target_makes_the_folder_unknown(self):
         self.denied(['cd /tmp && cd - && rm -rf src', 'cd /tmp && cd "$WHERE" && rm -rf src', 'cd /tmp && cd $(pwd)/.. && rm -rf src',
                      'cd /tmp && cd ~root && rm -rf src', 'cd /tmp && cd /tmp/* && rm -rf src', 'cd /tmp && popd && rm -rf src',
-                     'cd - && rm -rf node_modules'])
+                     'cd - && rm -rf node_modules'], message='lake')
         self.passes(['cd /tmp && cd sub && rm -rf src', 'cd /tmp && rm -rf /tmp/x', 'cd - && rm -rf /tmp/x', 'pushd /tmp && rm -rf src'])
-        self.denied(['cd - && rm -rf .', 'cd - && rm -rf ..'], message='rm_cwd')
+        self.denied(['cd - && rm -rf .', 'cd - && rm -rf ..'], message='lake')
 
     def test_a_cd_into_a_missing_folder_only_counts_when_and_and_guards_the_rest(self):
         self.denied(['cd /tmp/does-not-exist-1; rm -rf src', 'cd /tmp/does-not-exist-1 || true; rm -rf src',
-                     'cd /tmp/does-not-exist-1\nrm -rf src'])
+                     'cd /tmp/does-not-exist-1\nrm -rf src'], message='lake')
         self.passes(['cd /tmp/does-not-exist-1 && rm -rf src', 'mkdir -p /tmp/does-not-exist-1 && cd /tmp/does-not-exist-1 && rm -rf src'])
 
     def test_dotdot_and_variables_are_never_disposable(self):
@@ -134,15 +135,17 @@ class HiddenRecursiveDeletes(Cases):
                            'rm -rf "$OTHER/x"', 'rm -rf "$TMPDIR"', 'rm -rf "$TMPDIR/$X"', 'rm -rf "$TMPDIR/`id`"', 'rm -rf "$(mktemp -d)/../.."',
                            'rm -rf node_modules/..', 'rm -rf ../dist', 'rm -rf "$HOME/proj"', 'rm -rf "${TMPDIR}x/y"', 'rm -rf "$(mktemp -d; id)"'])
         # inside a compound command nothing is rewritten, so the same targets are plain denials
-        self.denied([c + ' && true' for c in ('rm -rf "$TMPDIR/../.."', 'rm -rf /tmp/x/..', 'rm -rf ../dist',
-                                              'rm -rf "$OTHER/x"', 'rm -rf "$TMPDIR"', 'rm -rf "$(mktemp -d)/../.."')])
+        self.denied([c + ' && true' for c in ('rm -rf /tmp/x/..', 'rm -rf ../dist')])
+        self.denied([c + ' && true' for c in ('rm -rf "$TMPDIR/../.."', 'rm -rf "$OTHER/x"',
+                                              'rm -rf "$TMPDIR"', 'rm -rf "$(mktemp -d)/../.."')], message='lake')
         self.denied(['rm -rf node_modules/.. && true', 'rm -rf ../project && true', 'rm -rf ~+ && true'], message='rm_cwd')  # the working folder
-        self.passes(['rm -rf "$TMPDIR/x"', 'rm -rf ${TMPDIR}/x/y', 'rm -rf "${TMPDIR:-/tmp}/x"', 'rm -rf "$(mktemp -d)"',
-                     'rm -rf "$(mktemp -d)/sub"', 'D="$(mktemp -d)"; rm -rf "$D/x"', 'rm -rf /tmp/a/b', 'rm -rf node_modules'])
+        self.denied(['rm -rf "$TMPDIR/x"', 'rm -rf ${TMPDIR}/x/y', 'rm -rf "${TMPDIR:-/tmp}/x"', 'rm -rf "$(mktemp -d)"',
+                     'rm -rf "$(mktemp -d)/sub"', 'D="$(mktemp -d)"; rm -rf "$D/x"'], message='lake')
+        self.passes(['rm -rf /tmp/a/b', 'rm -rf node_modules'])
 
     def test_a_variable_set_earlier_is_expanded_before_judging(self):
         self.denied(['T=/etc; rm -rf $T/x', 'export T=/etc; rm -rf "$T"', 'TMPDIR=/etc; rm -rf "$TMPDIR/x"'])
-        self.passes(['T=/tmp/work; rm -rf $T/x'])
+        self.passes(['T=/tmp/work; rm -rf $T/x', 'T=/tmp/work; rm -rf "$T/x"'])
 
     def test_a_temp_symlink_into_the_real_tree_is_not_disposable(self):
         base = os.path.realpath(tempfile.mkdtemp(prefix='akit-link-'))
@@ -394,9 +397,10 @@ class FollowUpToTheReviews(Cases):
                     message='force_main', cwd=repo)  # named main by its start point as well
         self.denied(['git switch --create=feat --no-create main && git push -f', 'git switch --create=feat --no-force-create && git push -f',
                      'git checkout --crea=main && git push -f', 'git checkout -b feat --no-track origin/x && git push --force-with-lease',
-                     'git switch --made-up -c feat && git push --force-with-lease', 'git checkout --no-guess feat && git push -f',
-                     'git checkout --forc -- a.txt && git push --force-with-lease'],
+                     'git switch --made-up -c feat && git push --force-with-lease', 'git checkout --no-guess feat && git push -f'],
                     message='branch_unknown', cwd=repo)
+        # --forc is git's abbreviation of --force: a forced checkout, denied before the push is looked at
+        self.denied(['git checkout --forc -- a.txt && git push --force-with-lease'], message='discard', cwd=repo)
         self.denied(['git switch --orphan main && git push -f', 'git switch --orphan main && git push --force-with-lease origin HEAD', 'git checkout --orphan=main && git push -f',
                      'git checkout --orphan main origin/main && git push --force-with-lease'], message='force_main', cwd=repo)
         self.passes(['git checkout -qb feat && git push -u origin feat', 'git checkout -b feat origin/main && git push -u origin feat',
@@ -594,7 +598,8 @@ class HolesFromTheSecondReview(Cases):
         for cwd in ('/work/acme/dist-web', '/work/acme/node_modules', '/work/acme/build', '/work/acme/.next'):
             self.denied(['rm -rf .', 'rm -rf ./', 'rm -rf *', 'rm -rf ./*', 'rm -rf %s' % cwd, 'rm -rf ../%s' % os.path.basename(cwd),
                          'rm -rf ~+', 'rm -rf ../../acme/%s' % os.path.basename(cwd)], message='rm_cwd', cwd=cwd)
-        self.passes(['rm -rf .', 'rm -rf *'], cwd='/tmp/akit-not-real/dist-web')  # a temp folder is still fine
+        self.passes(['rm -rf .'], cwd='/tmp/akit-not-real/dist-web')  # a named temp folder is still fine
+        self.denied(['rm -rf *'], message='rm', cwd='/tmp/akit-not-real/dist-web')  # pattern batches require a listing
         self.passes(['rm -rf dist', 'rm -rf node_modules'], cwd='/work/acme/dist-web')
 
     def test_rm_of_the_working_folder_is_denied_not_trashed(self):
@@ -727,10 +732,11 @@ class ProtectedPaths(Cases):
                     message='lake', local=local)
         self.passes(['touch ~/clients/acme/o*/x', 'cat ~/clients/acme/data/*'], local=local)
 
-    def test_unresolvable_targets_are_judged_by_their_tail(self):
+    def test_unresolvable_targets_remain_protected(self):
         local = make_local(config=self.PATH)
         self.denied(['touch "$ROOT/clients/acme/data/x"', 'cd - && touch clients/acme/data/x'], message='lake', local=local)
-        self.passes(['touch "$ROOT/data/x"', 'cd - && touch data/x', 'touch "$ROOT/other/x"'], local=local)
+        self.denied(['touch "$ROOT/data/x"', 'cd - && touch data/x', 'touch "$ROOT/other/x"'], message='lake', local=local)
+        self.passes(['touch /tmp/guard-control'], local=local)
 
     def test_backups_below_a_path_entry_stay_allowed(self):
         local = make_local(config=self.PATH)

@@ -78,15 +78,10 @@ git branch -f feature main
 rm -rf node_modules
 rm -rf dist .next
 rm -rf /tmp/x
-rm -rf "$(mktemp -d)"
 rm -rf __pycache__ .pytest_cache
 rm -f build.log
 rm notes.txt
 rm -rf dist-installer
-rm -rf "$TMPDIR/build-cache"
-rm -rf "${TMPDIR:-/tmp}/scratch"
-rm -rf "$(mktemp -d)/sub"
-D="$(mktemp -d)"; rm -rf "$D/x"
 (cd /tmp/work && ls); rm -f a.txt
 cd /private/tmp/x && rm -rf probe
 mkdir -p /tmp/x && cd /tmp/x && rm -rf logins
@@ -171,3 +166,7 @@ python3 -m unittest discover -s tests
 cd / && ls
 awk -F/ '{print $1}' paths.txt
 tr / _ < a > b
+
+# A plain comment, a lease push spelled short, a list of Supabase refs elsewhere
+gh pr comment 7 -b 'Fixed the P1, rerunning the review'
+git push --force-w origin feat

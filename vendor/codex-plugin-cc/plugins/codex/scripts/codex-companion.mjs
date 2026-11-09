@@ -379,6 +379,7 @@ async function executeReviewRun(request) {
       sourceThreadId: result.sourceThreadId,
       codex: {
         status: result.status,
+        error: result.error,
         stderr: result.stderr,
         stdout: result.reviewText,
         reasoning: result.reasoningSummary
@@ -430,6 +431,7 @@ async function executeReviewRun(request) {
     },
     codex: {
       status: result.status,
+      error: result.error,
       stderr: result.stderr,
       stdout: result.finalMessage,
       reasoning: result.reasoningSummary

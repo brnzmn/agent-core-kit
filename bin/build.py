@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 try:  # Python 3.11+; older Pythons skip TOML validation and use a plain-text check for config.toml
@@ -105,15 +106,21 @@ def mine(entry):
 
 
 def write_bytes(path, data, exe=False, mode=None):
-    """Atomic write (a temp file next to the target, then rename). Resolves a symlinked target first."""
+    """Private atomic write; only publish after permissions succeed. Resolves a symlinked target first."""
     if os.path.islink(path):
         path = os.path.realpath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + '.agent-core.tmp'
-    with open(tmp, 'wb') as fh:
-        fh.write(data)
-    os.chmod(tmp, mode if mode is not None else (0o755 if exe else 0o644))
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.agent-core-', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(data)
+        os.chmod(tmp, mode if mode is not None else (0o755 if exe else 0o644))
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def write_json(path, obj):

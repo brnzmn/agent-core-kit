@@ -255,25 +255,28 @@ class OtherPeoplesHooks(GitCase):
     def hook(self, repo):
         return os.path.join(repo, '.git', 'hooks', 'pre-commit')
 
-    def test_a_saved_original_is_never_overwritten(self):
+    def test_a_replacement_is_chained_and_the_older_hook_is_preserved(self):
         repo = self.repo('twice')
         self.write(repo, '.git/hooks/pre-commit', '#!/bin/sh\ntouch "$(git rev-parse --show-toplevel)/.ran-a"\n', 0o755)
         self.hooks('install')
         orig = os.path.join(repo, '.git', 'hooks', 'pre-commit.agent-core-orig')
         first = self.read(orig)
         self.assertIn('.ran-a', first)
-        self.write(repo, '.git/hooks/pre-commit', '#!/bin/sh\necho second hook\n', 0o755)  # something replaced ours
-        out = self.hooks('install')
-        self.assertEqual(self.read(orig), first, 'the saved original is untouched')
+        second = '#!/bin/sh\ntouch "$(git rev-parse --show-toplevel)/.ran-b"\n'
+        self.write(repo, '.git/hooks/pre-commit', second, 0o755)  # something replaced ours
+        out = self.hooks('install', '-q')
+        self.assertEqual(self.read(orig), second, 'the latest user hook is the one chained')
         saved = [n for n in os.listdir(os.path.dirname(orig)) if n.startswith('pre-commit.agent-core-orig.')]
         self.assertEqual(len(saved), 1, saved)
-        self.assertIn('second hook', self.read(os.path.join(os.path.dirname(orig), saved[0])))
+        self.assertEqual(self.read(os.path.join(os.path.dirname(orig), saved[0])), first)
         self.assertIn(saved[0], out.stdout)
+        self.assertIn('moved to hooks/', out.stdout, 'the archive notice survives quiet mode')
         self.assertIn('agent-core pre-commit', self.read(self.hook(repo)))
         self.assertEqual(self.commit(repo, 'a.txt', 'a\n').returncode, 0)
-        self.assertTrue(os.path.exists(os.path.join(repo, '.ran-a')), 'the earlier original still runs')
+        self.assertTrue(os.path.exists(os.path.join(repo, '.ran-b')), 'the latest hook runs')
+        self.assertFalse(os.path.exists(os.path.join(repo, '.ran-a')), 'the older hook is retained as an archive')
         out = self.hooks('uninstall')
-        self.assertIn('.ran-a', self.read(self.hook(repo)))
+        self.assertEqual(self.read(self.hook(repo)), second)
         self.assertIn(saved[0], out.stdout, 'uninstall says what else it kept')
 
     def test_hooks_made_by_the_pre_commit_framework_husky_and_lefthook_are_left_alone(self):
