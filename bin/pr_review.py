@@ -75,6 +75,49 @@ class Review(NamedTuple):
     unavailable: Optional[str] = None
 
 
+SHORT_DIAGNOSTIC = 500  # longer output is a partial review, not a legacy CLI diagnostic
+
+
+def unavailable_reason(text):
+    """Legacy short Claude diagnostics only. Missing CLIs are checked independently; Codex requires typed errors."""
+    patterns = {
+        'quota': r"you['’]ve hit your (?:weekly|usage|session) limit|usage limit (?:reached|exceeded)|"
+                 r"rate limit (?:reached|exceeded)|credit balance is too low|insufficient (?:credits|quota)",
+        'auth': r'not (?:logged|signed) in|please (?:log|sign) in|authentication failed|unauthorized.*(?:401|sign in)',
+        'service': r'(?:service|server) (?:is )?unavailable|(?:selected|requested) model is at capacity\b|'
+                   r'overloaded_error|HTTP (?:502|503|504)\b',
+    }
+    return next((reason for reason, pattern in patterns.items() if re.search(pattern, text, re.I)), None)
+
+
+def typed_claude_failure(stderr):
+    """The compact JSON diagnostic bin/claude-review.sh prints for a failed `claude -p --output-format json`, or None."""
+    for line in reversed(stderr.strip().splitlines()):
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get('type') == 'result' and 'terminal_reason' in data:
+            return data
+    return None
+
+
+def claude_typed_reason(failure):
+    """Outage reason from typed fields; anything else (bad model, bad request, budget or turn limits) fails closed."""
+    if failure.get('terminal_reason') != 'api_error' or failure.get('is_error') is not True:
+        return None
+    status = failure.get('api_error_status')
+    if type(status) is not int:
+        return None
+    if status == 429:
+        return 'quota'
+    if status == 401:
+        return 'auth'  # not 403: that is also a permission denial (a model tier the account may not use), which holds
+    if status in (500, 502, 503, 504, 529):
+        return 'service'
+    return None
+
+
 def has_blocking_output(text):
     """An interrupted review may have already found a blocker; an outage cannot erase it."""
     return bool(re.search(r'\[P[01]\]|^VERDICT:\s*BLOCK\s*$', text, re.M))
@@ -165,8 +208,28 @@ def claude_review(base):
     verdict = {0: 'PASS', 1: 'BLOCK'}.get(out.returncode)
     if verdict is None and has_blocking_output(text + '\n' + out.stderr):
         return Review('BLOCK', 'Interrupted Claude review contains blocking findings:\n' + text + '\n' + out.stderr)
-    # A successful review mentioning a quota or outage is still an actual review.
-    reason = claude_error_reason(out.stderr) if out.returncode == 4 and not text else None
+    # A successful review mentioning a quota or outage is still an actual review, and so is a long partial one:
+    # a typed failure line from claude-review.sh decides first; for older CLIs only a short text diagnostic is classified.
+    diag = text or out.stderr.strip()
+    reason = None
+    if out.returncode == 4:
+        typed = typed_claude_failure(out.stderr)
+        if typed is not None:
+            reason = claude_typed_reason(typed)
+            # A CLI-built failure (a subscription limit, an older CLI's JSON) has no API status: its short message
+            # is classified like the text-mode prose. An actual API status (404, 400) is final and fails closed.
+            # Budget, turn and completed results stay final, and only a short message counts (stdout holds the
+            # full result; the typed line's copy is cut at 500 characters).
+            message = text or str(typed.get('result') or '')
+            if (reason is None and typed.get('is_error') is True and type(typed.get('api_error_status')) is not int
+                    and typed.get('terminal_reason') in (None, '', 'api_error') and len(message) <= SHORT_DIAGNOSTIC):
+                reason = unavailable_reason(message)
+        else:
+            # Older typed stderr errors count at any length; only the prose fallback is capped, so a long partial
+            # review or JSON model prose is never read as a diagnostic.
+            reason = claude_error_reason(out.stderr) if not text else None
+            if reason is None and len(diag) <= SHORT_DIAGNOSTIC and not diag.startswith(('{', '[')):
+                reason = unavailable_reason(diag)  # older CLI: short plain diagnostic
     if verdict is not None:
         text = re.sub(r'\nVERDICT: (PASS|BLOCK)\s*$', '', text)
     return Review(verdict, text or diagnostic(out.stderr.strip()), reason)
