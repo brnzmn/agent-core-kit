@@ -174,12 +174,16 @@ class ReviewedGuardInputs(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 8)
 
     def test_numeric_operands_separated_from_redirects_remain_arguments(self):
+        # its own repo: the scratch dir sits inside the checkout running the suite, and a .agent-lane at that
+        # checkout's root (a Claude lane worktree) would refuse every commit from this Codex-driven guard
+        repo = self.cwd / 'lane-free'
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True, capture_output=True)
         for command in ('git commit -m 123 >/dev/null -a', 'git commit -m 123 > /dev/null --all',
                         'git -c x.y=z commit -m 456 2>/dev/null -a'):
             with self.subTest(command=command):
-                self.assertEqual(self.decide(command), 'deny')
-        self.assertIsNone(self.decide('git commit -m 123 2>/dev/null README.md'))
-        self.assertIsNone(self.decide('git status 2>/dev/null'))
+                self.assertEqual(self.decide(command, cwd=repo), 'deny')
+        self.assertIsNone(self.decide('git commit -m 123 2>/dev/null README.md', cwd=repo))
+        self.assertIsNone(self.decide('git status 2>/dev/null', cwd=repo))
 
     def test_multiline_or_unreadable_dotenv_is_not_linewise_names_only(self):
         env = self.cwd / '.env'
