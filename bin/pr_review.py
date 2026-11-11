@@ -111,8 +111,8 @@ def claude_typed_reason(failure):
         return None
     if status == 429:
         return 'quota'
-    if status in (401, 403):
-        return 'auth'
+    if status == 401:
+        return 'auth'  # not 403: that is also a permission denial (a model tier the account may not use), which holds
     if status in (500, 502, 503, 504, 529):
         return 'service'
     return None
@@ -224,10 +224,11 @@ def claude_review(base):
             if (reason is None and typed.get('is_error') is True and type(typed.get('api_error_status')) is not int
                     and typed.get('terminal_reason') in (None, '', 'api_error') and len(message) <= SHORT_DIAGNOSTIC):
                 reason = unavailable_reason(message)
-        elif len(diag) <= SHORT_DIAGNOSTIC:
-            # Keep support for older typed stderr errors, without treating JSON model prose as a diagnostic.
+        else:
+            # Older typed stderr errors count at any length; only the prose fallback is capped, so a long partial
+            # review or JSON model prose is never read as a diagnostic.
             reason = claude_error_reason(out.stderr) if not text else None
-            if reason is None and not diag.startswith(('{', '[')):
+            if reason is None and len(diag) <= SHORT_DIAGNOSTIC and not diag.startswith(('{', '[')):
                 reason = unavailable_reason(diag)  # older CLI: short plain diagnostic
     if verdict is not None:
         text = re.sub(r'\nVERDICT: (PASS|BLOCK)\s*$', '', text)

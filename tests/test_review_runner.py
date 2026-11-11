@@ -388,11 +388,21 @@ class ClaudeTypedOutage(unittest.TestCase):
         self.assertIn('Invalid API key', result.text)
 
     def test_status_maps_to_outage_kind(self):
-        cases = {429: 'quota', 401: 'auth', 403: 'auth', 500: 'service', 502: 'service', 503: 'service',
+        cases = {429: 'quota', 401: 'auth', 403: None, 500: 'service', 502: 'service', 503: 'service',
                  504: 'service', 529: 'service', 404: None, 400: None, 413: None, 418: None, None: None}
         for status, reason in cases.items():
             with self.subTest(status=status):
                 self.assertEqual(self.review(typed_line(REAL_AUTH_401, api_error_status=status)).unavailable, reason)
+
+    def test_short_outage_prose_from_a_finished_review_is_not_an_outage(self):
+        # a review that exited 0, 1 or 3 is a verdict or a local error, whatever its text says
+        for code in (0, 1, 3):
+            with self.subTest(code=code):
+                self.assertIsNone(self.review('', "You've hit your weekly limit\n", code=code).unavailable)
+
+    def test_a_long_typed_stderr_error_still_counts(self):
+        err = json.dumps({'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'x' * 900}})
+        self.assertEqual(self.review(err).unavailable, runner.codex_error_reason({'type': 'overloaded_error'}))
 
     def test_real_404_bad_model_fails_closed(self):
         result = self.review(typed_line(REAL_MODEL_404), 'There is an issue with the selected model\n')
