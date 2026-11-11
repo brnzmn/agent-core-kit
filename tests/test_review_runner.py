@@ -21,6 +21,11 @@ META = {'number': 7, 'baseRefName': 'master', 'headRefOid': HEAD, 'baseRefOid': 
 CMD = ['python3', '-m', 'unittest', 'discover', '-s', 'tests']
 
 
+# Sanitized CLI result shapes. subtype may be success even on a provider error.
+REAL_AUTH_401 = '{"terminal_reason": "api_error", "is_error": true, "subtype": "success", "api_error_status": 401, "api_error_origin": "first_party", "result": "Invalid API key \\u00b7 Fix external API key", "type": "result", "session_id": "fixture-session"}'
+REAL_MODEL_404 = '{"terminal_reason": "api_error", "is_error": true, "subtype": "success", "api_error_status": 404, "result": "There\'s an issue with the selected model (claude-nonexistent-9). It may not exist or you may not have access to it. Run --model to pick a different model.", "type": "result", "session_id": "fixture-session"}'
+REAL_OK = '{"terminal_reason": "completed", "is_error": false, "subtype": "success", "api_error_status": null, "result": "OK", "type": "result", "session_id": "fixture-session"}'
+
 def completed(code=0, out='', err=''):
     return subprocess.CompletedProcess([], code, out, err)
 
@@ -32,7 +37,7 @@ class ProviderResults(unittest.TestCase):
         self.addCleanup(available.stop)
 
     def test_model_outage_words_do_not_establish_a_provider_outage(self):
-        words = "You've hit your weekly limit"
+        words = "Partial review. " * 40 + "You've hit your weekly limit"
         diagnostics = (words, 'Request failed while processing model output: ' + words,
                        json.dumps({'type': 'result', 'is_error': True, 'result': words}),
                        json.dumps({'type': 'error', 'error': {'type': 'internal_error', 'message': words}}))
@@ -358,6 +363,224 @@ class ClaudeWrapper(unittest.TestCase):
                                      cwd=CORE, env=dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH']),
                                      capture_output=True, text=True, timeout=20)
                 self.assertEqual(out.returncode, expected, out.stdout + out.stderr)
+
+
+def typed_line(raw, **changes):
+    """The diagnostic claude-review.sh prints on stderr for a failed JSON run, built from a real CLI result."""
+    data = json.loads(raw)
+    data.update(changes)
+    keys = ('type', 'is_error', 'terminal_reason', 'api_error_status', 'api_error_origin', 'subtype')
+    line = {k: data.get(k) for k in keys}
+    line['result'] = data.get('result', '')[:500]
+    return json.dumps(line, separators=(',', ':'))
+
+
+class ClaudeTypedOutage(unittest.TestCase):
+    def review(self, stderr, stdout='', code=4):
+        with patch.object(runner.shutil, 'which', return_value='/bin/claude'), \
+                patch.object(runner, 'sh', return_value=completed(code, stdout, stderr)):
+            return runner.claude_review('origin/main')
+
+    def test_real_401_is_auth_and_keeps_the_message(self):
+        result = self.review(typed_line(REAL_AUTH_401), 'Invalid API key \u00b7 Fix external API key\n')
+        self.assertEqual(result.unavailable, 'auth')
+        self.assertIsNone(result.verdict)
+        self.assertIn('Invalid API key', result.text)
+
+    def test_status_maps_to_outage_kind(self):
+        cases = {429: 'quota', 401: 'auth', 403: 'auth', 500: 'service', 502: 'service', 503: 'service',
+                 504: 'service', 529: 'service', 404: None, 400: None, 413: None, 418: None, None: None}
+        for status, reason in cases.items():
+            with self.subTest(status=status):
+                self.assertEqual(self.review(typed_line(REAL_AUTH_401, api_error_status=status)).unavailable, reason)
+
+    def test_real_404_bad_model_fails_closed(self):
+        result = self.review(typed_line(REAL_MODEL_404), 'There is an issue with the selected model\n')
+        self.assertIsNone(result.unavailable)
+        self.assertIsNone(result.verdict)
+
+    def test_only_an_api_error_that_is_flagged_as_error_counts(self):
+        for changes in ({'terminal_reason': 'max_turns'}, {'terminal_reason': 'completed'},
+                        {'terminal_reason': 'budget_exceeded'}, {'is_error': False}, {'is_error': None}):
+            with self.subTest(changes=changes):
+                self.assertIsNone(self.review(typed_line(REAL_AUTH_401, **changes)).unavailable)
+
+    def test_typed_fields_win_over_prose_that_looks_like_an_outage(self):
+        # a 404 whose message happens to match the old text patterns must still fail closed
+        line = typed_line(REAL_MODEL_404, result="You've hit your weekly limit")
+        self.assertIsNone(self.review(line, "You've hit your weekly limit\n").unavailable)
+
+    def test_typed_outage_cannot_hide_a_blocking_partial_review(self):
+        result = self.review(typed_line(REAL_AUTH_401), '[P1] Unsafe delete\n')
+        self.assertEqual(result.verdict, 'BLOCK')
+        self.assertIsNone(result.unavailable)
+
+    def test_typed_line_only_counts_on_a_failed_provider_exit(self):
+        for code in (0, 1, 3, 124):
+            with self.subTest(code=code):
+                self.assertIsNone(self.review(typed_line(REAL_AUTH_401), 'Review text.\n', code=code).unavailable)
+
+    def test_cli_built_failure_without_an_api_status_uses_its_message(self):
+        # a subscription limit the CLI reports itself carries is_error but no api_error_status
+        line = typed_line(REAL_AUTH_401, terminal_reason=None, api_error_status=None, result="You've hit your weekly limit")
+        self.assertEqual(self.review(line, "You've hit your weekly limit\n").unavailable, 'quota')
+        quiet = typed_line(REAL_AUTH_401, terminal_reason=None, api_error_status=None, result='Something went wrong')
+        self.assertIsNone(self.review(quiet, 'Something went wrong\n').unavailable)
+
+    def test_cli_built_fallback_keeps_the_final_cases_final(self):
+        limit = "You've hit your weekly limit"
+        for changes in ({'terminal_reason': 'budget_exceeded'}, {'terminal_reason': 'max_turns'},
+                        {'terminal_reason': 'completed'}, {'terminal_reason': None, 'api_error_status': 404}):
+            with self.subTest(changes=changes):
+                line = typed_line(REAL_AUTH_401, **dict({'api_error_status': None, 'result': limit}, **changes))
+                self.assertIsNone(self.review(line, limit + '\n').unavailable)
+        # a long partial review that mentions a rate limit is not an outage, even though the typed copy is short
+        long_review = 'Partial review. ' * 40 + 'rate limit exceeded while reading the diff'
+        line = typed_line(REAL_AUTH_401, terminal_reason=None, api_error_status=None, result=long_review)
+        self.assertIsNone(self.review(line, long_review + '\n').unavailable)
+
+    def test_malformed_and_noninteger_statuses_do_not_establish_an_outage(self):
+        for status in ('429', True, 429.0, [], {}):
+            with self.subTest(status=status):
+                self.assertIsNone(self.review(typed_line(REAL_AUTH_401, api_error_status=status)).unavailable)
+        for raw in ('[]', '{broken json', '{"type":"error","error":{"message":"rate limit exceeded"}}'):
+            with self.subTest(raw=raw):
+                self.assertIsNone(self.review(raw).unavailable)
+
+    def test_warnings_do_not_hide_a_typed_failure_or_override_a_final_result(self):
+        for status, expected in ((429, 'quota'), (404, None)):
+            with self.subTest(status=status):
+                line = typed_line(REAL_AUTH_401, api_error_status=status)
+                result = self.review('warning before\n' + line + '\nwarning after\n')
+                self.assertEqual(result.unavailable, expected)
+
+    def test_non_json_stderr_keeps_the_text_fallback(self):
+        self.assertEqual(self.review('', "You've hit your weekly limit").unavailable, 'quota')
+        self.assertEqual(self.review('some warning\nnot json {', 'Not logged in. Please log in.').unavailable, 'auth')
+
+
+class ClaudeJsonWrapper(unittest.TestCase):
+    """bin/claude-review.sh end to end with a stub `claude` that prints a canned JSON object."""
+
+    def run_script(self, stdout, cli_exit=0, stderr='', **extra_env):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / 'stdout').write_text(stdout)
+            (d / 'stderr').write_text(stderr)
+            cli = d / 'claude'
+            cli.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$STUB_DIR/args"\ncat > /dev/null\n'
+                           'cat "$STUB_DIR/stdout"\ncat "$STUB_DIR/stderr" >&2\nexit ' + str(cli_exit) + '\n')
+            cli.chmod(0o755)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH'], TMPDIR=tmp, STUB_DIR=tmp)
+            env.pop('AGENT_CORE_CLAUDE_REVIEW_MODEL', None)
+            env.update(extra_env)
+            out = subprocess.run(['bash', str(CORE / 'bin' / 'claude-review.sh'), 'HEAD'], cwd=CORE, env=env,
+                                 capture_output=True, text=True, timeout=30)
+            args = d / 'args'
+            out.args_seen = args.read_text().splitlines() if args.exists() else []
+            out.leftovers = sorted(p.name for p in d.iterdir() if p.name.startswith('claude-review-raw')
+                                   or p.name.startswith('claude-review-err'))
+            return out
+
+    def success(self, text):
+        return json.dumps(dict(json.loads(REAL_OK), result=text))
+
+    def test_requests_json_and_keeps_the_tool_lockdown(self):
+        out = self.run_script(self.success('Fine.\nVERDICT: PASS'))
+        args = out.args_seen
+        self.assertEqual(args[args.index('--output-format') + 1], 'json')
+        self.assertEqual(args[args.index('--tools') + 1], '')
+        self.assertIn('--strict-mcp-config', args)
+        self.assertEqual(args[args.index('--permission-mode') + 1], 'dontAsk')
+        self.assertEqual(args[args.index('--setting-sources') + 1], '')
+        self.assertEqual(out.leftovers, [])
+
+    def test_model_defaults_to_opus_and_takes_fable(self):
+        out = self.run_script(self.success('Fine.\nVERDICT: PASS'))
+        self.assertEqual(out.args_seen[out.args_seen.index('--model') + 1], 'opus')
+        out = self.run_script(self.success('Fine.\nVERDICT: PASS'), AGENT_CORE_CLAUDE_REVIEW_MODEL='fable')
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.args_seen[out.args_seen.index('--model') + 1], 'fable')
+
+    def test_a_lower_or_unknown_model_is_refused_without_calling_claude(self):
+        for model in ('sonnet', 'haiku', 'opus --tools Bash', ''):
+            with self.subTest(model=model):
+                out = self.run_script(self.success('Fine.\nVERDICT: PASS'), AGENT_CORE_CLAUDE_REVIEW_MODEL=model)
+                if model == '':
+                    self.assertEqual(out.args_seen[out.args_seen.index('--model') + 1], 'opus')
+                    continue
+                self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+                self.assertEqual(out.args_seen, [])
+                self.assertIn('must be opus or fable', out.stdout)
+
+    def test_success_json_pass_and_block_come_from_the_result_text(self):
+        for verdict, code in (('PASS', 0), ('BLOCK', 1)):
+            with self.subTest(verdict=verdict):
+                out = self.run_script(self.success('Looked at it.\nVERDICT: ' + verdict))
+                self.assertEqual(out.returncode, code, out.stdout + out.stderr)
+                self.assertIn('Looked at it.', out.stdout)
+                self.assertNotIn('"terminal_reason"', out.stdout)
+                self.assertIn('(saved to ', out.stdout)
+
+    def test_success_json_without_a_verdict_is_no_verdict(self):
+        self.assertEqual(self.run_script(self.success('No verdict line here.')).returncode, 3)
+
+    def test_successful_review_mentioning_quota_is_not_a_failure(self):
+        out = self.run_script(self.success("Handle the rate_limit_error path.\nVERDICT: PASS"))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_real_error_shapes_exit_4_with_one_typed_stderr_line(self):
+        for raw, status in ((REAL_AUTH_401, 401), (REAL_MODEL_404, 404)):
+            with self.subTest(status=status):
+                out = self.run_script(raw, cli_exit=1)
+                self.assertEqual(out.returncode, 4, out.stdout + out.stderr)
+                typed = [json.loads(line) for line in out.stderr.splitlines() if line.startswith('{')]
+                self.assertEqual(len(typed), 1, out.stderr)
+                self.assertEqual(sorted(typed[0]), sorted(['type', 'is_error', 'terminal_reason', 'api_error_status',
+                                                           'api_error_origin', 'subtype', 'result']))
+                self.assertEqual(typed[0]['api_error_status'], status)
+                self.assertEqual(typed[0]['terminal_reason'], 'api_error')
+                self.assertIs(typed[0]['is_error'], True)
+                self.assertNotIn('session_id', out.stderr)
+
+    def test_error_result_is_cut_to_500_characters(self):
+        raw = json.dumps(dict(json.loads(REAL_AUTH_401), result='x' * 900))
+        out = self.run_script(raw, cli_exit=1)
+        typed = [json.loads(line) for line in out.stderr.splitlines() if line.startswith('{')]
+        self.assertEqual(len(typed[0]['result']), 500)
+
+    def test_is_error_with_a_zero_exit_still_fails_and_never_passes(self):
+        raw = json.dumps(dict(json.loads(REAL_AUTH_401), result='Fine.\nVERDICT: PASS'))
+        self.assertEqual(self.run_script(raw, cli_exit=0).returncode, 4)
+
+    def test_nonzero_exit_with_successful_json_is_a_failure(self):
+        self.assertEqual(self.run_script(self.success('Fine.\nVERDICT: PASS'), cli_exit=1).returncode, 4)
+
+    def test_script_output_classifies_end_to_end(self):
+        for raw, reason in ((REAL_AUTH_401, 'auth'), (REAL_MODEL_404, None),
+                            (json.dumps(dict(json.loads(REAL_AUTH_401), api_error_status=429)), 'quota'),
+                            (json.dumps(dict(json.loads(REAL_AUTH_401), api_error_status=529)), 'service')):
+            with self.subTest(reason=reason, raw=raw[-120:]):
+                out = self.run_script(raw, cli_exit=1)
+                with patch.object(runner.shutil, 'which', return_value='/bin/claude'), \
+                        patch.object(runner, 'sh', return_value=completed(out.returncode, out.stdout, out.stderr)):
+                    result = runner.claude_review('origin/main')
+                self.assertIsNone(result.verdict)
+                self.assertEqual(result.unavailable, reason)
+
+    def test_non_json_stdout_is_printed_raw_with_todays_exit_codes(self):
+        for cli_exit, text, expected in ((0, 'VERDICT: PASS', 0), (0, 'VERDICT: BLOCK', 1), (0, 'prose only', 3),
+                                         (1, "You've hit your weekly limit", 4), (1, 'VERDICT: PASS', 4)):
+            with self.subTest(text=text, cli_exit=cli_exit):
+                out = self.run_script(text + '\n', cli_exit=cli_exit)
+                self.assertEqual(out.returncode, expected, out.stdout + out.stderr)
+                self.assertIn(text, out.stdout)
+
+    def test_non_json_stderr_stays_on_the_error_stream(self):
+        out = self.run_script('', cli_exit=1, stderr='Not logged in. Please log in.\n')
+        self.assertEqual(out.returncode, 4)
+        self.assertIn('Not logged in', out.stderr)
+        self.assertNotIn('Not logged in', out.stdout)
 
 
 class TestExecution(unittest.TestCase):
