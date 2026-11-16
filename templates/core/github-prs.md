@@ -1,0 +1,4 @@
+## GitHub pull requests
+- Agents run the relevant checks locally before pushing. Use drafts during iteration when the workflow defers paid jobs on drafts. Otherwise keep iterations local and publish the ready head once.
+- Before scoping hosted CI or removing duplicate runs in a repo that deploys, agents verify that production release requires a successful full suite on the merged commit. Hosted PR jobs deferred on drafts start on `ready_for_review` and cancel superseded runs for that PR. Fast checks cover documented allowlisted changes; risky, mixed, or uncertain changes get full checks. Keep local-only repos local.
+- A ready PR with hosted CI can merge only after its expected gate jobs report success for the current head. Missing, pending, failed, or skipped gate jobs do not count. Agents verify the actual verdict and merge with `gh pr merge --match-head-commit` using the checked SHA.
