@@ -310,12 +310,25 @@ class Sync(Sandbox):
 
     def test_edited_rulebook_reaches_both_tools_on_sync(self):
         self.ok()
-        with open(os.path.join(self.local, 'AGENTS.md'), 'a') as fh:
+        rulebook = os.path.join(self.local, 'AGENTS.md')
+        with open(rulebook, 'a') as fh:
             fh.write('- Always greet the reviewer.\n')
+        local_text = read(rulebook)
+        codex_override = os.path.join(self.local, 'codex.md')
+        override_text = '- Use the team-specific PR policy in Codex.\n'
+        write(codex_override, override_text)
         self.assertEqual(self.install('--check').returncode, 1)
         self.ok('--sync')
-        self.assertIn('greet the reviewer', read(os.path.join(self.claude, 'CLAUDE.md')))
-        self.assertIn('greet the reviewer', read(os.path.join(self.codex, 'AGENTS.md')))
+        claude_text = read(os.path.join(self.claude, 'CLAUDE.md'))
+        codex_text = read(os.path.join(self.codex, 'AGENTS.md'))
+        policy = read(os.path.join(self.kit, 'templates', 'core', 'github-prs.md'))
+        for text in (claude_text, codex_text):
+            self.assertEqual(text.count(policy), 1)
+            self.assertGreater(text.index('greet the reviewer'), text.index(policy))
+        self.assertEqual(read(rulebook), local_text)
+        self.assertEqual(read(codex_override), override_text)
+        self.assertTrue(codex_text.endswith(override_text))
+        self.assertNotIn(override_text, claude_text)
         self.assertIn('in sync', self.ok('--check').stdout)
         self.assertEqual(len(self.backups()), 1, 'regenerated files that the kit wrote itself are not backed up again')
 

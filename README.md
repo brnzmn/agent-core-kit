@@ -48,8 +48,8 @@ Rerun `/setup` any time to change answers.
 
 | From the kit | Installed to |
 |---|---|
-| `local/AGENTS.md` + `adapters/claude.md` + `local/claude.md` | `~/.claude/CLAUDE.md` (generated, do not edit) |
-| `local/AGENTS.md` + `adapters/codex.md` + `local/codex.md` | `~/.codex/AGENTS.md` (generated, do not edit) |
+| Kit defaults + `local/AGENTS.md` + `adapters/claude.md` + `local/claude.md` | `~/.claude/CLAUDE.md` (generated, do not edit) |
+| Kit defaults + `local/AGENTS.md` + `adapters/codex.md` + `local/codex.md` | `~/.codex/AGENTS.md` (generated, do not edit) |
 | `claude/agents/*.md` | `~/.claude/agents/` |
 | The same roles for Codex (`explorer`, `worker`, `verifier`, `reviewer`) | `~/.codex/agents/*.toml` |
 | `skills/*` | `~/.claude/skills/` and `~/.agents/skills/` (Codex reads that one) |
@@ -61,6 +61,8 @@ Rerun `/setup` any time to change answers.
 | What the installer replaced | `local/backups/<timestamp>/` |
 
 Skills and agents are tracked in manifests. The installer adds or replaces only its own files and leaves anything of yours with the same name alone, with a message. If `~/.claude/CLAUDE.md` or another file it writes is a symlink (dotfiles), the link stays and the content goes through it.
+
+Install and `--sync` include the kit's [GitHub PR defaults](templates/core/github-prs.md) in both generated rulebooks. Set your own defaults in `local/AGENTS.md` or override them for a tool in `local/claude.md` or `local/codex.md`.
 
 The pre-commit hook is skipped, with a message, in repos whose hooks come from the pre-commit framework, husky or lefthook. A hook of your own is chained only when you run `install.sh`, never silently at session start.
 
