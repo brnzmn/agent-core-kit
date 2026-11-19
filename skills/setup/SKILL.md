@@ -61,7 +61,7 @@ Round 3, machine and safety:
 
 ## 5. Tell the user, briefly
 - What you set (autonomy level, spend limit, protected folders, PR gate scope), in a few lines.
-- What needs them, as a numbered checklist with the exact command per line and a last line starting `Blocked:` (or `Blocked: nothing` when nothing does). Typical items:
+- What needs them, only if something does, as one block starting `Needs you:` with what to do, why and the exact command in a code block. Typical items:
   - Start a new Claude Code session so hooks and agents load.
   - In Codex, run `/hooks` once and trust the kit's hooks.
   - Sign in to gh (`gh auth login`) if the PR gate is on and gh isn't signed in.
