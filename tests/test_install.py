@@ -148,7 +148,8 @@ class FirstInstall(Sandbox):
         self.assertIn(MARK, json.dumps(codex_hooks['Stop']))
         # the kit's files are in
         hooks = os.path.join(self.claude, 'hooks', 'agent-core')
-        for f in ('guard.py', 'budget.py', 'capture.py', 'session_start.py', 'stop_steps.py', 'common.py', 'codex_hook.py'):
+        for f in ('guard.py', 'budget.py', 'ask_pick.py', 'capture.py', 'session_start.py', 'stop_steps.py', 'common.py',
+                  'codex_hook.py'):
             self.assertTrue(os.access(os.path.join(hooks, f), os.X_OK), f)
         self.assertEqual(read(os.path.join(hooks, '.core-dir')).strip(), self.kit)
         claude_md = read(os.path.join(self.claude, 'CLAUDE.md'))
@@ -166,7 +167,9 @@ class FirstInstall(Sandbox):
             self.assertTrue(os.path.isfile(os.path.join(self.codex, 'agents', f + '.toml')), f)
         self.assertTrue(os.path.isfile(os.path.join(self.codex, 'rules', 'agent-core.rules')))
         # every kit hook points at the installed scripts
-        self.assertEqual(json.dumps(s['hooks']).count(MARK), 6)
+        self.assertEqual(json.dumps(s['hooks']).count(MARK), 7)
+        (boxes,) = [e for e in s['hooks']['PreToolUse'] if 'ask_pick.py' in json.dumps(e)]
+        self.assertEqual(boxes['matcher'], 'AskUserQuestion|mcp__ccd_turn__wrap_up')
         self.assertEqual(s['model'], 'opus')
         self.assertEqual(s['env']['CLAUDE_CODE_SUBAGENT_MODEL'], 'sonnet')
         self.assertNotIn('switchModelsOnFlag', s)
@@ -1343,7 +1346,8 @@ class SettingsTemplate(unittest.TestCase):
     def test_other_hooks_keep_their_timeouts_and_cleanup_floor_is_ninety(self):
         timeouts = dict((h['command'].split('/')[-1].split()[0], h['timeout'])
                         for es in self.template['hooks'].values() for e in es for h in e['hooks'])
-        self.assertEqual(timeouts, {'guard.py': 30, 'budget.py': 10, 'capture.py': 10, 'session_start.py': 15, 'stop_steps.py': 10})
+        self.assertEqual(timeouts, {'guard.py': 30, 'budget.py': 10, 'ask_pick.py': 10, 'capture.py': 10,
+                                    'session_start.py': 15, 'stop_steps.py': 10})
         self.assertEqual(self.template['cleanupPeriodDays'], 90)
 
 
