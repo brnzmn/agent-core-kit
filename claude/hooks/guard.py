@@ -22,7 +22,8 @@ one real passing review plus passing tests on the same head when config pr_gate 
 One decision is not a deny: spawning a subagent on a model listed in config gated_models (and the advisor agent)
 returns "ask", so Claude Code prompts the user; that prompt also appears in bypass mode. So does bin/pr_review.py
 --owner-go, which merges past the review gate on the owner's order, when the words it quotes are not an order the user
-wrote in this session's transcript (a Codex session cannot ask, so there it is a deny).
+wrote in this session's transcript (a Codex session cannot ask, so there it is a deny). A plain push that puts the
+head of an open PR onto a gated branch is denied: the PR merges through gh pr merge or on the owner's order.
 Prints a decision as JSON, or nothing to let the call through.
 Its own errors deny the call and go to learning/hook-errors.log.
 """
@@ -37,6 +38,7 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common  # noqa: E402
@@ -94,7 +96,7 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'status', 'stripspace', 'submodule', 'subtree', 'switch', 'symbolic-ref', 'tag', 'update-index', 'update-ref',
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'transcript': None, 'owner_go_ask': None, 'cwd': '', 'cwd_candidates': None, 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(),
+STATE = {'transcript': None, 'pulls_down': False, 'owner_go_ask': None, 'advances': False, 'cwd': '', 'cwd_candidates': None, 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(),
          'pipe': [], 'sep': ';', 'plain': False, 'deferred_body': False, 'body_file_unstable': False,
          'raw': [], 'moved': False, 'envcfg': [], 'inherit': [], 'penv': {}, 'pinherit': {}, 'xargs': False,
          'marks': {'active': set(), 'unquoted': set(), 'braced': set()}}  # cwd None = unknown; raw = the command's tokens before $VAR expansion
@@ -137,6 +139,7 @@ WORKTREE = re.compile(r'(^|/)([^/]*-wt(/[^/]+)?|\.claude/worktrees(/[^/]+)?|[^/]
 PLAIN_WORD = (r"(?:[A-Za-z0-9._\-/~+@:,]|'[A-Za-z0-9._\-/~+@:, ]*'|\"[A-Za-z0-9._\-/~+@:, ]*\")+")
 PLAIN_TAIL = re.compile(r'^(?:\s+' + PLAIN_WORD + r')+\s*$')  # what may follow `rm -rf` when it is rewritten
 GH_TIMEOUT = 8  # seconds per gh call; the hook is killed at 10 and a killed hook lets the merge through
+PUSH_GH_TIMEOUT = 3  # seconds for the open-PR list a plain push to a gated branch checks; slower is no answer
 GH_BUDGET = 7.0  # seconds from start for all gh calls together; leaves room for startup and the kill below
 
 
@@ -403,6 +406,12 @@ MSG = {
                           'part of a sentence ' + _esc(USER) + ' wrote: "%s". A part can leave out a condition or a no. '
                           'Quote the sentence from its first word to its last (up to a comma or full stop), or the whole '
                           'message, word for word.'),
+    'deploy_push': ('This push puts the head of open PR #%s onto %s, a gated branch of %s, without the review gate. Merge '
+                    'it with gh pr merge %s once the review passes, or on ' + _esc(USER_S) + ' order with ' +
+                    _esc(PR_REVIEW) + ' %s --owner-go "<a whole sentence of theirs, word for word>".'),
+    'deploy_push_chained': ('An earlier part of this command moves branches, and this push then sends %s, a gated branch of '
+                            '%s that has open PR #%s, so the guard cannot see which commit it puts there. Run the push in '
+                            'its own call, or merge the PR with gh pr merge %s once the review passes.'),
     'lane': ('This worktree\'s .agent-lane names the other tool, which owns its commits. Leave your change '
              'uncommitted and write a handoff note (handoff skill), or work in a worktree of your own.'),
     'rm': ('Recursive delete goes to the trash. Run it as its own command: ' + TRASH + ' <paths> '
@@ -1121,16 +1130,16 @@ def gate_covers(slug, branch):
     return slug.lower() in [r.lower() for r in _listed(repos)]
 
 
-def gh_run(argv):
-    """Run gh with a hard timeout (GH_TIMEOUT, and GH_BUDGET for all calls of this hook run) and kill its whole process
-    group on expiry. The hook itself is killed at its own timeout, and a killed hook lets the merge through."""
+def gh_run(argv, cap=None):
+    """Run gh with a hard timeout (cap, at most GH_TIMEOUT, and GH_BUDGET for all calls of this hook run) and kill its whole
+    process group on expiry. The hook itself is killed at its own timeout, and a killed hook lets the merge through."""
     left = min(GH_BUDGET - (time.monotonic() - START), analysis_remaining())
     if left < 0.5:
         raise subprocess.TimeoutExpired(argv, 0)
     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             cwd=STATE['cwd'] or None, start_new_session=True)
     try:
-        out, err = proc.communicate(timeout=min(GH_TIMEOUT, left))
+        out, err = proc.communicate(timeout=min(GH_TIMEOUT if cap is None else min(cap, GH_TIMEOUT), left))
     except (subprocess.TimeoutExpired, AnalysisExpired):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -2084,6 +2093,139 @@ def raw_words(args, rest, ref):
     return [w for w, a in zip(raw[1 + len(args) - len(rest):], rest) if a == ref]
 
 
+GITHUB_REMOTE = re.compile(r'(?:https?://(?:[^/@\s]+@)?|ssh://(?:[^/@\s]+@)?|[^/@\s:]+@)github\.com[:/]'
+                           r'([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?')
+
+
+def probe_git(where, *argv):
+    """(exit code, stdout) of a git call in where, or None when it cannot run. Capped at 2 seconds and at the hook's
+    analysis budget, so a slow disk narrows what the guard checks instead of expiring the whole hook."""
+    left = time_left()
+    if left < 0.5:
+        return None
+    try:
+        out = subprocess.run(['git', '-C', where] + list(argv), capture_output=True, text=True,
+                             timeout=min(2, left - 0.3))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.returncode, out.stdout.strip()
+
+
+ADVANCING = {'merge', 'pull', 'rebase', 'cherry-pick', 'am', 'fetch', 'reset', 'update-ref'}
+
+
+def saved_refspecs(where, remote, deploy, current):
+    """The refspecs git uses for a push that names none: remote.<name>.push, else the upstream branch under
+    push.default=upstream, every branch under push.default=matching, else the current branch."""
+    if not GITHUB_REMOTE.fullmatch(remote) and re.fullmatch(r'[\w.-]+', remote):
+        got = probe_git(where, 'config', '--get-all', 'remote.%s.push' % remote)
+        if got and got[0] == 0 and got[1]:
+            return got[1].splitlines()
+    mode = probe_git(where, 'config', '--get', 'push.default')
+    mode = mode[1] if mode and mode[0] == 0 else ''
+    if mode == 'matching':
+        return ['refs/heads/' + deploy]
+    if mode in ('upstream', 'tracking') and current:
+        got = probe_git(where, 'config', '--get', 'branch.%s.merge' % current)
+        if got and got[0] == 0 and got[1]:
+            return ['HEAD:' + got[1]]
+    return ['HEAD']
+
+
+def pushed_tips(where, remote, refs, every, deploy):
+    """(whether a push of refs reaches branch deploy, the commits it would put there). Every refspec whose destination is
+    deploy counts; HEAD, @ and a missing refspec mean the current branch, and every means all local branches. Unreadable
+    refspecs (variables, globs) are left out."""
+    current = current_branch(where)
+    refs = list(refs) if refs else saved_refspecs(where, remote, deploy, current)
+    if every:
+        refs.append('refs/heads/' + deploy)
+    hit, tips = False, []
+    for ref in refs:
+        src, sep, dst = ref.lstrip('+').partition(':')
+        if re.search(r'[$`*?\[]', ref) or (sep and not src):
+            continue
+        if src in ('HEAD', '@') and not sep:
+            if STATE['moved'] == 'main' and deploy in ('main', 'master'):
+                dst = src = 'refs/heads/' + deploy  # an earlier part of this command checks out main
+            elif STATE['moved']:
+                continue  # HEAD is not what the push will see
+            else:
+                dst, src = current, 'HEAD'
+        elif not sep:
+            dst = src
+        if (dst or '').removeprefix('refs/heads/') != deploy:
+            continue
+        hit = True
+        got = probe_git(where, 'rev-parse', '--verify', '--quiet', src + '^{commit}')
+        if got and got[0] == 0 and re.fullmatch(r'[0-9a-f]{40}', got[1]):
+            tips.append(got[1])
+    return hit, tips
+
+
+def open_pulls(slug, deploy):
+    """The open PRs into deploy as a list, or None when GitHub does not answer in time or answers something else."""
+    cap = min(PUSH_GH_TIMEOUT, time_left() - 2.0)  # a slow GitHub must leave the hook time to answer
+    if cap < 0.5 or STATE['pulls_down']:
+        return None
+    try:
+        out = gh_run([os.environ.get('AGENT_CORE_GH') or 'gh', 'api',
+                      'repos/%s/pulls?state=open&base=%s&per_page=100' % (slug, quote(deploy, safe=''))], cap)
+        prs = json.loads(out.stdout) if out.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        STATE['pulls_down'] = True  # later pushes of this command do not wait for it again
+        return None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return prs if isinstance(prs, list) else None
+
+
+def deploy_push(where, positional, long_flags):
+    """(PR number, gated branch, repo, chained) when a push that passed every other rule puts the head of an open PR onto
+    a branch the PR gate covers: merging goes through gh pr merge, which asks the review gate, or through the owner's
+    order. chained is True when an earlier part of the command moves branches, so the commit the push sends is not the
+    one on disk now; the push must then run in its own call. None when the gate is off, the remote is not a repo the gate
+    covers or anything cannot be read: this narrows a push that was always allowed, so a slow GitHub or a missing remote
+    never holds it."""
+    if not gate_branches() or STATE['cwd'] is None or '--repo' in long_flags:
+        return None
+    remote = positional[0] if positional else 'origin'
+    url = remote
+    if not GITHUB_REMOTE.fullmatch(remote):
+        got = probe_git(where, 'remote', 'get-url', remote)
+        url = got[1] if got and got[0] == 0 else ''
+    found = GITHUB_REMOTE.fullmatch(url)
+    if not found:
+        return None
+    slug = '%s/%s' % found.groups()
+    for deploy in gate_branches():
+        if not gate_covers(slug, deploy):
+            continue
+        hit, tips = pushed_tips(where, remote, positional[1:], bool(long_flags & {'--all', '--branches'}), deploy)
+        chained = STATE['advances']
+        if not tips and not (hit and chained):
+            continue
+        prs = open_pulls(slug, deploy)
+        tracking = 'refs/remotes/%s/%s' % (remote, deploy)
+        for pr in prs or []:
+            head = (pr.get('head') or {}).get('sha') if isinstance(pr, dict) else None
+            if not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head) or type(pr.get('number')) is not int:
+                continue
+            local = probe_git(where, 'cat-file', '-e', head + '^{commit}')
+            if hit and chained:
+                merged = probe_git(where, 'merge-base', '--is-ancestor', head, tracking) if local and local[0] == 0 else None
+                if not (merged and merged[0] == 0):
+                    return str(pr['number']), deploy, slug, True
+            for tip in tips:
+                if head == tip:
+                    return str(pr['number']), deploy, slug, False
+                below = probe_git(where, 'merge-base', '--is-ancestor', head, tip) if local and local[0] == 0 else None
+                merged = probe_git(where, 'merge-base', '--is-ancestor', head, tracking) if below and below[0] == 0 else None
+                if below and below[0] == 0 and merged and merged[0] != 0:
+                    return str(pr['number']), deploy, slug, False
+    return None
+
+
 def git_decision(args):
     args, _ = split_redirects(args)
     STATE['raw'], _ = split_redirects(STATE['raw'])
@@ -2093,6 +2235,8 @@ def git_decision(args):
     where, sub, rest, config = head
     tree = git_tree(args[:len(args) - len(rest) - 1], where)
     note_move(sub, rest, config, where)
+    if sub in ADVANCING or (sub == 'branch' and any(a in ('-f', '-F', '--force') for a in rest)):
+        STATE['advances'] = True  # a later push in this command sends a commit the hook cannot read from the repo yet
     if sub not in GIT_KNOWN and any(c.lower().startswith('alias.') for c in config):
         return 'deny', MSG['alias']  # the alias is what runs, and it is not readable here
     if sub in LANE_SUBS:
@@ -2173,6 +2317,12 @@ def git_decision(args):
             return 'deny', MSG['delete_remote']
         if '--mirror' in l:
             return 'deny', MSG['mirror']
+        if not ('n' in s or '--dry-run' in l) and tree is None:
+            hit = deploy_push(where, p, l)
+            if hit and hit[3]:
+                return 'deny', MSG['deploy_push_chained'] % (hit[1], hit[2], hit[0], hit[0])
+            if hit:
+                return 'deny', MSG['deploy_push'] % (hit[0], hit[1], hit[2], hit[0], hit[0])
     elif sub == 'reset':
         mode_args = rest[:rest.index('--')] if '--' in rest else rest
         if any(unknown_expansion(raw) or unresolved_path(ref, raw)
@@ -3820,6 +3970,7 @@ def check_script_body(text, depth=0, mutations=None):
         return 'deny', MSG['deep']
     if depth == 0:
         STATE['moved'] = False
+        STATE['advances'] = False
         STATE['owner_go_ask'] = None
         STATE['body_file_unstable'] = False
         STATE['substitution_budget'] = MAX_SUBSTITUTIONS

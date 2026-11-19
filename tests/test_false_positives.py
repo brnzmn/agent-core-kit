@@ -31,7 +31,8 @@ ELSEWHERE = {'review_wait': 'test_merge_gate', 'review_block': 'test_merge_gate'
              'lane': 'test_lane', 'gated': 'GatedModels below',
              'branch_unknown': 'test_guard_bypass',
              'owner_go_words': 'test_owner_go', 'owner_go_unverified': 'test_owner_go',
-             'owner_go_fragment': 'test_owner_go'}
+             'owner_go_fragment': 'test_owner_go', 'deploy_push': 'test_deploy_push',
+             'deploy_push_chained': 'test_deploy_push'}
 REPO = '/work/project'  # a working folder that does not exist: relative paths are neither temp nor inside a repo
 
 

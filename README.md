@@ -128,6 +128,8 @@ Subagents without a pinned model run on Sonnet. When a model refuses or a task k
 
 `pr_review.py <pr> --owner-go "<words>"` is for the moment you order a merge the gate holds. It posts your words on the PR as "Owner merge order" and merges that head with `--match-head-commit`, without a review or tests. The guard lets it run only when the words are a whole sentence or clause of a message you typed in the session, or a button you tapped, and hold no "no" or hold. It reads the session transcript for that, so tool output, hook feedback, task notifications and the agent's own text never count. A part of a sentence is sent back to the agent to quote in full; anything else it cannot read as your order makes Claude Code ask you, and Codex is denied.
 
+A plain `git push` that would put the head of an open PR onto a gated branch is denied, because it skips the gate and leaves no record of an order. The check lists the open PRs into that branch with one `gh api` call and compares their heads with the commit being pushed; it looks at where each refspec points, at the current branch when none is named, at `--all`, and at a saved upstream. A push that follows a merge, pull or rebase in the same command has to run on its own. The repository must be covered by `pr_gate.repos`. If GitHub does not answer in time, the push goes through as before.
+
 Invoke the installed review runner from the PR checkout. Fallback tests run offline in a disposable
 Docker container. Build the worker once from a trusted checkout: `docker build -t agent-core-review-tests:1 tools/review-tests`. Keep the local Docker engine
 running when using fallback. The worker receives a shallow snapshot of the reviewed commit, without the
@@ -179,6 +181,7 @@ A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs
 | Applying learning proposals directly | Leave them for the user and say how many wait. |
 | Spawning a subagent on a model in `gated_models` | Not denied: Claude Code asks you first. |
 | `pr_review.py --owner-go` with words you did not write in the session | Not denied in Claude Code: it asks you first. Codex cannot ask, so it is denied. Words that are only part of your sentence are denied with a request to quote the whole of it. |
+| A plain `git push` that puts the head of an open PR onto a branch in `pr_gate.branches` | Merge it with `gh pr merge <pr>` once the review passes, or on your order with `pr_review.py <pr> --owner-go "<your words>"`. |
 | `gh pr merge` without required reviews or outage/test evidence, merging through `gh api` | Run `pr_review.py <pr> auto`, read its results, then `gh pr merge`. |
 | Committing in a worktree whose `.agent-lane` names the other tool | Leave the change uncommitted and write a handoff note. |
 
