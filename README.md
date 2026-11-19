@@ -38,7 +38,7 @@ claude
 Clone the repo anywhere. `~/agent-core-kit` is the suggested spot, and the examples below use it.
 
 1. `bash install.sh` checks that your settings file is valid JSON, creates `local/` (your own git repo) from the templates, backs up the files it replaces into `local/backups/<timestamp>/`, installs, and merges settings. Your existing agents, skills, commands, hooks, model and env settings stay where they are; the kit installs next to them, and a same-named agent or skill of yours is left alone with a message. `local/install-state.json` records what install changed, so uninstall can put it back. Add `--clean-slate` if you want the old ones archived first.
-2. Start a new Claude Code session so hooks and subagents load, then run `/setup`. It reads your previous global instructions, asks about you, how much autonomy agents get, your projects folder and data you want protected, writes `local/AGENTS.md` and `local/config.json`, runs `install.sh --sync` and `--check`, and ends with a numbered list of anything only you can do.
+2. Start a new Claude Code session so hooks and subagents load, then run `/setup`. It reads your previous global instructions, asks about you, how much autonomy agents get, your projects folder and data you want protected, writes `local/AGENTS.md` and `local/config.json`, runs `install.sh --sync` and `--check`, and ends with a `Needs you:` block for anything only you can do.
 3. In Codex, run `/hooks` and trust the kit's hooks. Codex runs hooks only after you review them.
 4. Run `gh auth login` if `gh` is not signed in yet.
 
@@ -178,7 +178,7 @@ A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs
 
 Write paths the guard cannot resolve as one known word are held whenever protected folders are configured. Known unquoted paths pass only when their exact value is one nonempty word without shell whitespace or globs and IFS has not changed. A `$TMPDIR` or `$(mktemp ...)` spelling alone does not prove a delete is outside protected data; use a literal verified temp path instead.
 
-Two more hooks guard the instruction files. The budget hook denies edits that add log entries to an instruction file or push it past its line budget: the rulebook 120 lines, each adapter 60, a repo's AGENTS.md 150, a CLAUDE.md that imports AGENTS.md 40, each `.claude/rules` file 80. The Stop hook pushes back once when a turn ends by handing work to you that the agent could do.
+Two more hooks guard the instruction files. The budget hook denies edits that add log entries to an instruction file or push it past its line budget: the rulebook 120 lines, each adapter 60, a repo's AGENTS.md 150, a CLAUDE.md that imports AGENTS.md 40, each `.claude/rules` file 80. The Stop hook pushes back once when a turn ends by handing work to you that the agent could do. It stays quiet about open tasks while Claude Code reports background work or a scheduled wake-up, because the turn is pausing, not ending. It also pushes back once on a closing question that marks the agent's own pick ("my pick", "(Recommended)", "I'd go with X. Is that fine?"). The question-box hook does the same for `AskUserQuestion` and the desktop app's next-step box: it denies a box that puts the agent's own pick or next step to you. A box about something only you decide passes (deleting data the agent did not create, spend over your limit, a message sent as you, a first public launch, creative direction, taking a running service down), and so does an ask that begins "Needs you:" and any box in plan mode.
 
 A guard exception prints a denial and logs to `local/learning/hook-errors.log`. A timeout or killed guard process can still let the call through because the outer hook uses `|| true`. Neither layer covers commands run inside scripts (`bash x.sh`, `python -c`), MCP tools other than SQL ones, or hosted tools. The hooks stop accidents, not a determined agent: an agent with shell access can edit `local/config.json` or `local/AGENTS.md` like any other file, so review what your agents change there.
 
@@ -217,6 +217,7 @@ Hooks capture corrections in both tools without being asked. `/learn review` min
 | `protected_supabase` | `{}` | Supabase project ref mapped to a one-line note. Schema changes are denied unless they go through `scripts/deploy`. |
 | `gated_models` | `["fable"]` | Subagent models that need your yes. Claude Code asks you before spawning one, the `advisor` agent included. |
 | `stop_hook` | `true` | The Stop hook pushes back once when a turn ends by handing work to you. |
+| `question_hook` | `true` | Deny a question box that puts the agent's own pick or next step to you. Boxes about what only you decide pass. |
 | `icloud_warning` | `true` | macOS: warn when a repo sits in iCloud-synced Desktop or Documents. |
 | `spend_limit_usd` | `5` | What an agent may spend per action without asking. Used in the messages. |
 | `permission_mode` | `""` | Claude's `defaultMode` to set: `auto`, `acceptEdits` or `bypassPermissions`. Empty leaves yours alone. |
@@ -243,6 +244,14 @@ bash install.sh --sync
 `--sync` rebuilds the generated files and copies the kit's agents, skills and hooks. It leaves your rulebook and config alone; it only updates `local/install-state.json` and, once, `local/.gitignore`. `bash install.sh --check` lists any drift between the kit and what is installed.
 
 Codex files other than its `AGENTS.md` (agents, hooks, rules, the memories pin) are written only while no Codex process is running, and the desktop app counts. If Codex is open, `--sync` says which files are waiting; quit Codex and run it again. Codex asks you to trust changed hooks again in `/hooks`.
+
+Rule lines added to the template since your install reach an existing rulebook only when you copy them into `local/AGENTS.md`. The latest additions are:
+
+- the `Needs you:` block that replaces the numbered checklist for anything only you can do (under "Act first");
+- an agent's own recommendation is taken, not asked (under "Act first");
+- live facts and "working" claims come from a read in the same turn (under "Done means verified");
+- one watcher for pending background runs, and no chat reply to a check that brings nothing new (under "How to talk to you");
+- checks you are handed only read and print, and asks name things as you see them (under "How to talk to you").
 
 ## Uninstall and restore
 
