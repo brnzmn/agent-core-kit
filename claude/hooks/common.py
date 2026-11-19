@@ -70,7 +70,8 @@ DEFAULTS = {
     'permission_mode': '',
     'auto_mode_environment': [],
     'pr_gate': {'enabled': True, 'branches': ['main', 'master', 'production'], 'repos': '*', 'reviewers': [],
-                'trust_codex_bot': False, 'allow_single_on_unavailable': False, 'test_commands': {}},
+                'trust_codex_bot': False, 'allow_single_on_unavailable': False, 'test_commands': {},
+                'required_reviews': 2},
     'routing': {'claude_week_limit_pct': 80},
     'codex': {'models': {}, 'pin_memories_off': False},
 }
@@ -143,6 +144,19 @@ def _fits_default(default, value):
 
 def user():
     return str(config().get('user_name') or '').strip() or 'the user'
+
+
+def required_reviews():
+    """1 only when pr_gate.required_reviews is the integer 1, else 2. A wrongly typed value was already dropped by
+    config(); the type check here also keeps 1.0 (and a boolean, which is an int) from selecting the looser policy."""
+    value = (config().get('pr_gate') or {}).get('required_reviews')
+    return 1 if type(value) is int and value == 1 else 2
+
+
+def required_reviewer(head_ref):
+    """The vendor that did not write the PR: a codex/ head branch is Codex's work, so Claude reviews it. Anything else,
+    including a missing branch name, gets Codex, so a Claude session never passes its own PR with a Claude review."""
+    return 'Claude' if isinstance(head_ref, str) and head_ref.startswith('codex/') else 'Codex'
 
 
 def review_test_command(slug):

@@ -4,6 +4,8 @@
   pr_review.py <pr> codex [--adversarial]   Codex's review through the vendored plugin (read-only sandbox)
   pr_review.py <pr> claude                  Claude Opus, read-only (bin/claude-review.sh)
   pr_review.py <pr> auto                    both; one unavailable needs the other PASS and passing full tests
+                                            (pr_gate.required_reviews 1: only the vendor that did not write the PR,
+                                            by head branch, codex/ = Codex's; the other runs only if it is unavailable)
 
 <pr> is anything `gh pr view` accepts: a number, a URL or a branch. Run it from a checkout of the PR head, with gh
 signed in. The comment starts "## Codex review", "## Codex adversarial review" or "## Claude review", names the head
@@ -283,7 +285,8 @@ def parse_args(argv):
 
 
 def metadata(pr):
-    out = sh([GH, 'pr', 'view', pr, '--json', 'number,baseRefName,baseRefOid,headRefOid,url'], timeout=60)
+    out = sh([GH, 'pr', 'view', pr, '--json', 'number,baseRefName,baseRefOid,headRefOid,headRefName,url'],
+             timeout=60)
     if out.returncode:
         raise ValueError('gh pr view failed: ' + out.stderr.strip())
     try:
@@ -491,6 +494,17 @@ def persisted_blockers(pr, meta):
 
 
 
+def required_first(base, head_ref):
+    """One-review policy: the vendor that did not write the PR reviews alone; the other runs only when it is unavailable."""
+    runners = {'Codex': lambda: codex_review(base, False), 'Claude': lambda: claude_review(base)}
+    required = common.required_reviewer(head_ref)
+    results = {required: runners[required]()}
+    if not results[required].verdict and results[required].unavailable:
+        other = 'Codex' if required == 'Claude' else 'Claude'
+        results[other] = runners[other]()
+    return results
+
+
 def main(argv):
     args = parse_args(argv)
     if not args:
@@ -523,7 +537,9 @@ def main(argv):
                        'base_oid': meta['baseRefOid'], 'status': 'RUNNING'}
             post_run(pr, meta, attempt)
         base = fetch_base(meta)
-        if who == 'auto':
+        if who == 'auto' and common.required_reviews() == 1:
+            results = required_first(base, meta.get('headRefName'))
+        elif who == 'auto':
             with ThreadPoolExecutor(max_workers=2) as pool:
                 futures = {'Codex': pool.submit(codex_review, base, False),
                            'Claude': pool.submit(claude_review, base)}

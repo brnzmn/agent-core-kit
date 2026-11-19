@@ -1250,9 +1250,29 @@ def latest_automatic_run(pr, head, authors):
     return latest
 
 
-def automatic_run_passes(pr, attempt, head, authors, gate, command):
+def single_run_passes(pr, attempt, head, authors, gate, command, required):
+    """The one-review policy: the required reviewer's PASS in this run, or its confirmed outage with the other vendor's
+    PASS and passing full tests. The other provider's entry does not matter otherwise (a BLOCK was denied earlier)."""
+    providers = attempt.get('providers')
+    if not isinstance(providers, dict) or not providers or not set(providers) <= {'Claude', 'Codex'}:
+        return False
+    other = 'Codex' if required == 'Claude' else 'Claude'
+    if providers.get(required) == 'PASS':
+        return review_verdict(pr, required, head, authors, run_id=attempt['run_id']) == 'PASS'
+    reasons = attempt.get('reasons')
+    return (providers.get(required) == 'UNAVAILABLE' and providers.get(other) == 'PASS'
+            and review_verdict(pr, other, head, authors, run_id=attempt['run_id']) == 'PASS'
+            and gate.get('allow_single_on_unavailable') is True
+            and isinstance(reasons, dict) and reasons.get(required) in ('quota', 'auth', 'service', 'missing_cli')
+            and passing_test_receipt(attempt.get('tests'), command))
+
+
+def automatic_run_passes(pr, attempt, head, authors, gate, command, required=None):
+    """required is the one reviewer the one-review policy wants (None: both providers, the default policy)."""
     if attempt.get('status') != 'PASS':
         return False
+    if required:
+        return single_run_passes(pr, attempt, head, authors, gate, command, required)
     providers = attempt.get('providers')
     if not isinstance(providers, dict) or set(providers) != {'Claude', 'Codex'}:
         return False
@@ -1299,6 +1319,7 @@ def outage_tests_pass(pr, provider, head, authors, command):
 
 def merge_decision(args, repo=()):
     """Both providers pass, or one real provider passes with verified outage/test evidence. A BLOCK always holds.
+    Under pr_gate.required_reviews 1 only the vendor that did not write the PR must pass.
     The gate off, other branches and repos not listed pass."""
     if not gate_branches():
         return None
@@ -1328,7 +1349,7 @@ def merge_decision(args, repo=()):
     gh = os.environ.get('AGENT_CORE_GH') or 'gh'
     try:
         out = gh_run([gh, 'pr', 'view'] + sel[:1] + repo + ['--json', 'number,url,baseRefName,baseRefOid,headRefOid,'
-                                                                      'comments,reviews'])
+                                                                      'headRefName,comments,reviews'])
         if out.returncode:
             return 'deny', MSG['review_unread'] % (out.stderr.strip()[:200] or 'gh failed')
         pr = json.loads(out.stdout)
@@ -1353,11 +1374,22 @@ def merge_decision(args, repo=()):
     if availability and (not attempt or availability[1] > attempt[1]) and (
             not availability[0] or not passing_test_receipt(availability[0].get('tests'), command)):
         return 'deny', 'The latest automatic review tests failed or are unverified for the current head, base branch and base commit. Run pr_review.py with auto again.'
+    required = common.required_reviewer(pr.get('headRefName')) if common.required_reviews() == 1 else None
     if attempt:
-        if automatic_run_passes(pr, attempt[0], head, authors, gate, command):
+        if automatic_run_passes(pr, attempt[0], head, authors, gate, command, required):
             return None
         return 'deny', 'The latest automatic review run is not a verified pass for the current head, base branch and base commit. Run pr_review.py with auto again.'
     verdicts = {who: review_verdict(pr, who, head, authors, trust, legacy_only=True) for who in ('Claude', 'Codex')}
+    if required:
+        if verdicts[required] == 'PASS':
+            return None
+        other = 'Codex' if required == 'Claude' else 'Claude'
+        # A bot comment counted by the legacy two-provider policy is not a real fallback review.
+        if (not verdicts[required] and gate.get('allow_single_on_unavailable') is True
+                and review_verdict(pr, other, head, authors, legacy_only=True) == 'PASS'
+                and outage_tests_pass(pr, required, head, authors, command)):
+            return None
+        return 'deny', MSG['review_wait'] % (pr.get('number'), branch, slug, head[:12], required, pr.get('number'))
     missing = [who for who, v in verdicts.items() if not v]
     if missing:
         if len(missing) == 1 and gate.get('allow_single_on_unavailable') is True:

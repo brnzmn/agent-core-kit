@@ -467,5 +467,186 @@ class ProviderFallback(Fixture, unittest.TestCase):
         self.assertIsNone(self.decide('gh api repos/o/r/issues/7/comments --jq \'contains("%s")\'' % marker))
 
 
+class OneReview(Fixture, unittest.TestCase):
+    """pr_gate.required_reviews 1: the vendor that did not write the PR (told from the head branch) is the one review."""
+
+    def setUp(self):
+        Fixture.setUp(self)
+        self.command = ['python3', '-m', 'unittest', 'discover', '-s', 'tests']
+        self.write_config()
+
+    def write_config(self, reviews=1, fallback=True):
+        over = dict(allow_single_on_unavailable=fallback, test_commands={REPO: self.command})
+        if reviews is not None:
+            over['required_reviews'] = reviews
+        self.config = gate(**over)
+
+    def pr(self, head_ref=None, **kwargs):
+        Fixture.pr(self, **kwargs)
+        if head_ref is not None:
+            with open(self.pr_json) as fh:
+                data = json.load(fh)
+            data['headRefName'] = head_ref
+            with open(self.pr_json, 'w') as fh:
+                json.dump(data, fh)
+
+    def decide(self, command='gh pr merge 7 --squash'):
+        return Fixture.decide(self, command, config=self.config)
+
+    def run_comment(self, providers, run_id='b' * 32, status='PASS', reasons=None, tests=True, head=HEAD):
+        data = dict(run_id=run_id, head=head, base='main', base_oid=HEAD, status=status, providers=providers,
+                    reasons=reasons or {}, tests=dict(status='PASS', count=5, command=self.command, exit_code=0)
+                    if tests else None)
+        return {'author': {'login': 'alex'}, 'body': '## Agent-core review run\nAGENT_CORE_REVIEW_RUN_V1: '
+                + json.dumps(data) + '\n'}
+
+    def run_verdict(self, who, verdict='PASS', run_id='b' * 32):
+        return {'author': {'login': 'alex'}, 'body': '## %s review\nhead: %s\nrun: %s\n\nfindings\n\nVERDICT: %s\n'
+                % (who, HEAD, run_id, verdict)}
+
+    def start(self, run_id='b' * 32):
+        data = dict(run_id=run_id, head=HEAD, base='main', base_oid=HEAD, status='RUNNING')
+        return {'author': {'login': 'alex'}, 'body': '## Agent-core review run\nAGENT_CORE_REVIEW_RUN_V1: '
+                + json.dumps(data) + '\n'}
+
+    def outage(self, provider):
+        checks = dict(status='PASS', count=5, command=self.command, exit_code=0)
+        data = dict(head=HEAD, base='main', base_oid=HEAD, provider=provider, status='UNAVAILABLE', reason='quota',
+                    tests=checks)
+        return {'author': {'login': 'alex'}, 'body': '## Agent-core review availability\n'
+                'AGENT_CORE_REVIEW_EVIDENCE_V1: ' + json.dumps(data) + '\n'}
+
+    def reason(self):
+        out = self.decide()
+        return out['permissionDecision'], out['permissionDecisionReason']
+
+    def test_a_claude_written_pr_needs_codex_and_a_claude_pass_alone_never_opens_the_gate(self):
+        self.pr(comments=[comment('Codex', 'PASS')], head_ref='claude/x')
+        self.assertIsNone(self.decide())
+        self.pr(comments=[comment('Claude', 'PASS')], head_ref='claude/x')
+        decision, text = self.reason()
+        self.assertEqual(decision, 'deny')
+        self.assertIn('Missing: Codex', text)
+        self.assertNotIn('Claude and', text)
+
+    def test_a_codex_written_pr_needs_claude_and_a_codex_pass_alone_never_opens_the_gate(self):
+        self.pr(comments=[comment('Claude', 'PASS')], head_ref='codex/x')
+        self.assertIsNone(self.decide())
+        self.pr(comments=[comment('Codex', 'PASS')], head_ref='codex/x')
+        decision, text = self.reason()
+        self.assertEqual(decision, 'deny')
+        self.assertIn('Missing: Claude', text)
+
+    def test_a_missing_or_odd_head_branch_name_counts_as_not_codex(self):
+        for head_ref in (None, '', 'feature/codex/x', 'Codex/x', 'claude/x'):
+            with self.subTest(head_ref=head_ref):
+                self.pr(comments=[comment('Claude', 'PASS')], head_ref=head_ref)
+                self.assertIn('Missing: Codex', self.reason()[1])
+                self.pr(comments=[comment('Codex', 'PASS')], head_ref=head_ref)
+                self.assertIsNone(self.decide())
+        self.pr(comments=[comment('Claude', 'PASS')], head_ref=7)
+        self.assertIn('Missing: Codex', self.reason()[1])
+
+    def test_no_review_at_all_names_only_the_required_reviewer(self):
+        self.pr(head_ref='claude/x')
+        self.assertIn('Missing: Codex.', self.reason()[1])
+        self.pr(head_ref='codex/x')
+        self.assertIn('Missing: Claude.', self.reason()[1])
+
+    def test_a_block_from_either_provider_holds_even_next_to_the_required_pass(self):
+        for head_ref, required, other in (('claude/x', 'Codex', 'Claude'), ('codex/x', 'Claude', 'Codex')):
+            for blocker in (required, other):
+                with self.subTest(head_ref=head_ref, blocker=blocker):
+                    self.pr(comments=[comment(required, 'PASS'), comment(blocker, 'BLOCK')], head_ref=head_ref)
+                    decision, text = self.reason()
+                    self.assertEqual(decision, 'deny')
+                    self.assertIn('%s review of head' % blocker, text)
+                    self.assertIn('VERDICT: BLOCK', text)
+
+    def test_a_pass_on_an_older_head_does_not_count(self):
+        self.pr(comments=[comment('Codex', 'PASS', 'b' * 40)], head_ref='claude/x')
+        self.assertIn('Missing: Codex', self.reason()[1])
+
+    def test_the_required_reviewers_automatic_run_alone_passes_when_its_verdict_carries_the_run_id(self):
+        run = self.run_comment({'Codex': 'PASS'})
+        self.pr(comments=[self.start(), self.run_verdict('Codex'), run], head_ref='claude/x')
+        self.assertIsNone(self.decide())
+        self.pr(comments=[self.start(), self.run_verdict('Codex', run_id='c' * 32), run], head_ref='claude/x')
+        self.assertEqual(self.reason()[0], 'deny')
+        self.pr(comments=[self.start(), comment('Codex', 'PASS'), run], head_ref='claude/x')
+        self.assertEqual(self.reason()[0], 'deny')
+
+    def test_an_automatic_run_of_only_the_other_vendor_does_not_pass(self):
+        run = self.run_comment({'Claude': 'PASS'})
+        self.pr(comments=[self.start(), self.run_verdict('Claude'), run], head_ref='claude/x')
+        self.assertEqual(self.reason()[0], 'deny')
+        self.pr(comments=[self.start(), self.run_verdict('Codex'), self.run_comment({'Claude': 'PASS'})],
+                head_ref='codex/x')
+        self.assertEqual(self.reason()[0], 'deny')
+
+    def test_an_automatic_run_that_is_not_a_pass_or_has_odd_providers_does_not_pass(self):
+        for providers, status in (({'Codex': 'INCOMPLETE'}, 'INCOMPLETE'), ({'Codex': 'PASS'}, 'INCOMPLETE'),
+                                  ({}, 'PASS'), ({'Codex': 'PASS', 'Gemini': 'PASS'}, 'PASS'), (['Codex'], 'PASS')):
+            with self.subTest(providers=providers, status=status):
+                self.pr(comments=[self.start(), self.run_verdict('Codex'), self.run_comment(providers, status=status)],
+                        head_ref='claude/x')
+                self.assertEqual(self.reason()[0], 'deny')
+
+    def test_an_automatic_run_with_the_required_reviewer_unavailable_needs_the_policy_and_passing_tests(self):
+        run = self.run_comment({'Codex': 'UNAVAILABLE', 'Claude': 'PASS'}, reasons={'Codex': 'quota'})
+        comments = [self.start(), self.run_verdict('Claude'), run]
+        self.pr(comments=comments, head_ref='claude/x')
+        self.assertIsNone(self.decide())
+        self.write_config(fallback=False)
+        self.assertEqual(self.reason()[0], 'deny')
+        self.write_config(fallback='true')
+        self.assertEqual(self.reason()[0], 'deny')
+        self.write_config()
+        for changed in (self.run_comment({'Codex': 'UNAVAILABLE', 'Claude': 'PASS'}, reasons={'Codex': 'quota'},
+                                         tests=False),
+                        self.run_comment({'Codex': 'UNAVAILABLE', 'Claude': 'PASS'}, reasons={'Codex': 'other'}),
+                        self.run_comment({'Codex': 'UNAVAILABLE', 'Claude': 'PASS'}, reasons={})):
+            self.pr(comments=[self.start(), self.run_verdict('Claude'), changed], head_ref='claude/x')
+            self.assertEqual(self.reason()[0], 'deny')
+        self.pr(comments=[self.start(), run], head_ref='claude/x')  # no verdict comment for the run id
+        self.assertEqual(self.reason()[0], 'deny')
+
+    def test_without_a_run_record_an_outage_of_the_required_reviewer_plus_the_others_pass_and_tests_open_it(self):
+        self.pr(comments=[comment('Claude', 'PASS'), self.outage('Codex')], head_ref='claude/x')
+        self.assertIsNone(self.decide())
+        self.write_config(fallback=False)
+        self.assertIn('Missing: Codex', self.reason()[1])
+        self.write_config()
+        self.pr(comments=[comment('Codex', 'PASS'), self.outage('Claude')], head_ref='claude/x')
+        self.assertIsNone(self.decide())  # the required Codex review passed; the Claude outage is beside the point
+        self.pr(comments=[comment('Codex', 'PASS'), self.outage('Claude')], head_ref='codex/x')
+        self.assertIsNone(self.decide())
+        self.pr(comments=[comment('Claude', 'PASS'), self.outage('Claude')], head_ref='claude/x')
+        self.assertEqual(self.reason()[0], 'deny')  # evidence must be for the required reviewer
+
+    def test_failed_outage_tests_hold_under_the_one_review_policy(self):
+        bad = self.outage('Codex')
+        bad['body'] = bad['body'].replace('"exit_code": 0', '"exit_code": 1')
+        self.pr(comments=[comment('Claude', 'PASS'), bad], head_ref='claude/x')
+        self.assertEqual(self.reason()[0], 'deny')
+
+    def test_a_mistyped_required_reviews_keeps_two_reviews(self):
+        for value in (True, False, '1', 0, 3, 1.0, [1], None):
+            with self.subTest(value=value):
+                self.write_config(reviews=value)
+                self.pr(comments=[comment('Codex', 'PASS')], head_ref='claude/x')
+                decision, text = self.reason()
+                self.assertEqual(decision, 'deny')
+                self.assertIn('Missing: Claude', text)
+                self.pr(comments=[comment('Codex', 'PASS'), comment('Claude', 'PASS')], head_ref='claude/x')
+                self.assertIsNone(self.decide())
+
+    def test_the_default_policy_wants_both_reviews_whatever_the_head_branch(self):
+        self.write_config(reviews=None)
+        for head_ref in ('claude/x', 'codex/x'):
+            self.pr(comments=[comment('Codex', 'PASS')], head_ref=head_ref)
+            self.assertIn('Missing: Claude', self.reason()[1])
+
+
 if __name__ == '__main__':
     unittest.main()

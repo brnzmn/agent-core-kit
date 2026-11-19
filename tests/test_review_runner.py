@@ -773,20 +773,25 @@ class AutomaticRun(unittest.TestCase):
                 self.assertEqual(self.posts, [])
                 self.test_call.assert_not_called()
 
-    def run_main(self, codex=None, claude=None, tests=None, policy=True, command=CMD, mode='auto'):
+    def run_main(self, codex=None, claude=None, tests=None, policy=True, command=CMD, mode='auto', reviews=None,
+                 head_ref=None):
         self.posts = []
+        gate = {'allow_single_on_unavailable': policy}
+        if reviews is not None:
+            gate['required_reviews'] = reviews
         self.codex = codex or runner.Review('PASS', 'No findings')
         self.claude = claude or runner.Review(None, "You've hit your weekly limit; resets tomorrow", 'quota')
         self.tests = tests or {'status': 'PASS', 'count': 10, 'command': CMD, 'exit_code': 0}
-        with patch.object(runner, 'metadata', return_value=META), \
+        meta = dict(META, headRefName=head_ref) if head_ref else META
+        with patch.object(runner, 'metadata', return_value=meta), \
                 patch.object(runner, 'unchanged'), \
                 patch.object(runner, 'sh', return_value=completed(0, HEAD)), \
-                patch.object(runner, 'codex_review', return_value=self.codex), \
-                patch.object(runner, 'claude_review', return_value=self.claude), \
+                patch.object(runner, 'codex_review', return_value=self.codex) as self.codex_call, \
+                patch.object(runner, 'claude_review', return_value=self.claude) as self.claude_call, \
                 patch.object(runner, 'run_tests', return_value=self.tests) as test_call, \
                 patch.object(runner, 'persisted_blockers', return_value=[]), \
                 patch.object(runner, 'publish_body', side_effect=lambda pr, meta, body: self.posts.append(body)), \
-                patch.object(runner.common, 'config', return_value={'pr_gate': {'allow_single_on_unavailable': policy}}), \
+                patch.object(runner.common, 'config', return_value={'pr_gate': gate}), \
                 patch.object(runner.common, 'review_test_command', return_value=command, create=True), \
                 contextlib.redirect_stdout(io.StringIO()):
             code = runner.main(['7', mode])
@@ -796,6 +801,14 @@ class AutomaticRun(unittest.TestCase):
     def evidence(self):
         bodies = [body for body in self.posts if body.startswith(runner.EVIDENCE_TITLE)]
         return [json.loads(body.splitlines()[1][len(runner.EVIDENCE_MARK):]) for body in bodies]
+
+    def run_record(self):
+        """The final run record: the last post that starts with the run title."""
+        bodies = [body for body in self.posts if body.startswith(runner.RUN_TITLE)]
+        return json.loads(bodies[-1].splitlines()[1][len(runner.RUN_MARK):])
+
+    def verdict_posts(self):
+        return [body for body in self.posts if body.startswith('## Codex review') or body.startswith('## Claude review')]
 
     def test_manual_provider_commands_keep_their_existing_behavior(self):
         self.assertEqual(self.run_main(mode='codex'), 0)
@@ -827,6 +840,76 @@ class AutomaticRun(unittest.TestCase):
         self.assertEqual(self.run_main(claude=runner.Review('PASS', 'No findings')), 0)
         self.test_call.assert_not_called()
         self.assertEqual(self.evidence(), [])
+
+    def test_default_policy_runs_both_reviewers(self):
+        self.assertEqual(self.run_main(claude=runner.Review('PASS', 'No findings'), head_ref='claude/x'), 0)
+        self.codex_call.assert_called_once()
+        self.claude_call.assert_called_once()
+        self.assertEqual(self.run_record()['providers'], {'Codex': 'PASS', 'Claude': 'PASS'})
+
+    def test_one_review_policy_runs_only_the_vendor_that_did_not_write_the_pr(self):
+        for head_ref, required, idle in (('claude/x', 'Codex', 'claude_call'), ('codex/x', 'Claude', 'codex_call'),
+                                         (None, 'Codex', 'claude_call')):
+            with self.subTest(head_ref=head_ref):
+                self.assertEqual(self.run_main(codex=runner.Review('PASS', 'No findings'),
+                                               claude=runner.Review('PASS', 'No findings'), reviews=1,
+                                               head_ref=head_ref), 0)
+                getattr(self, idle).assert_not_called()
+                self.assertEqual(len(self.verdict_posts()), 1)
+                self.assertTrue(self.verdict_posts()[0].startswith('## %s review' % required))
+                record = self.run_record()
+                self.assertEqual(record['providers'], {required: 'PASS'})
+                self.assertIn('run: ' + record['run_id'], self.verdict_posts()[0])
+                self.test_call.assert_not_called()
+
+    def test_one_review_policy_block_exits_1_and_incomplete_exits_3(self):
+        self.assertEqual(self.run_main(codex=runner.Review('BLOCK', '[P1] Delete bug'), reviews=1,
+                                       head_ref='claude/x'), 1)
+        self.assertEqual(self.run_record()['providers'], {'Codex': 'BLOCK'})
+        self.claude_call.assert_not_called()
+        self.assertEqual(self.run_main(codex=runner.Review(None, 'Malformed output'), reviews=1,
+                                       head_ref='claude/x'), 3)
+        self.claude_call.assert_not_called()
+        self.assertEqual(self.run_record()['providers'], {'Codex': 'INCOMPLETE'})
+
+    def test_one_review_policy_falls_back_to_the_other_vendor_when_the_required_one_is_unavailable(self):
+        outage = runner.Review(None, 'Usage cap', 'quota')
+        self.assertEqual(self.run_main(codex=outage, claude=runner.Review('PASS', 'No findings'), reviews=1,
+                                       head_ref='claude/x'), 0)
+        self.claude_call.assert_called_once()
+        self.assertEqual(self.run_record()['providers'], {'Codex': 'UNAVAILABLE', 'Claude': 'PASS'})
+        self.assertEqual(self.run_record()['reasons'], {'Codex': 'quota'})
+        self.assertEqual(self.evidence()[0]['provider'], 'Codex')
+        self.assertEqual(self.test_call.call_count, 1)
+        self.assertEqual(self.run_main(codex=runner.Review('PASS', 'No findings'), claude=outage, reviews=1,
+                                       head_ref='codex/x'), 0)
+        self.assertEqual(self.run_record()['providers'], {'Claude': 'UNAVAILABLE', 'Codex': 'PASS'})
+
+    def test_one_review_policy_fallback_holds_when_the_policy_is_off_or_tests_fail(self):
+        outage = runner.Review(None, 'Usage cap', 'quota')
+        passed = runner.Review('PASS', 'No findings')
+        self.assertEqual(self.run_main(codex=outage, claude=passed, reviews=1, policy=False, head_ref='claude/x'), 3)
+        self.test_call.assert_not_called()
+        self.assertEqual(self.evidence(), [])
+        self.assertEqual(self.run_record()['status'], 'INCOMPLETE')
+        failed = {'status': 'FAIL', 'count': 9, 'command': CMD, 'exit_code': 1}
+        self.assertEqual(self.run_main(codex=outage, claude=passed, reviews=1, tests=failed, head_ref='claude/x'), 3)
+        self.assertEqual(self.run_record()['status'], 'FAIL')
+
+    def test_one_review_policy_does_not_fall_back_when_both_are_unavailable_or_the_other_blocks(self):
+        outage = runner.Review(None, 'Usage cap', 'quota')
+        self.assertEqual(self.run_main(codex=outage, claude=outage, reviews=1, head_ref='claude/x'), 3)
+        self.test_call.assert_not_called()
+        self.assertEqual(self.run_main(codex=outage, claude=runner.Review('BLOCK', '[P1] bug'), reviews=1,
+                                       head_ref='claude/x'), 1)
+        self.test_call.assert_not_called()
+
+    def test_only_the_integer_one_selects_the_one_review_policy(self):
+        for value in (True, '1', 0, 3, 1.0, None):
+            with self.subTest(value=value):
+                self.run_main(claude=runner.Review('PASS', 'No findings'), reviews=value, head_ref='claude/x')
+                self.codex_call.assert_called_once()
+                self.claude_call.assert_called_once()
 
     def test_block_is_never_replaced_by_outage_fallback(self):
         self.assertEqual(self.run_main(codex=runner.Review('BLOCK', '[P1] Delete bug')), 1)
