@@ -1381,11 +1381,13 @@ def merge_decision(args, repo=()):
         return 'deny', 'The latest automatic review run is not a verified pass for the current head, base branch and base commit. Run pr_review.py with auto again.'
     verdicts = {who: review_verdict(pr, who, head, authors, trust, legacy_only=True) for who in ('Claude', 'Codex')}
     if required:
-        if verdicts[required] == 'PASS':
+        # The one review must be a real one: Codex's GitHub app (trust_codex_bot) never stands in for it by itself.
+        real = review_verdict(pr, required, head, authors, legacy_only=True)
+        if real == 'PASS':
             return None
         other = 'Codex' if required == 'Claude' else 'Claude'
         # A bot comment counted by the legacy two-provider policy is not a real fallback review.
-        if (not verdicts[required] and gate.get('allow_single_on_unavailable') is True
+        if (not real and gate.get('allow_single_on_unavailable') is True
                 and review_verdict(pr, other, head, authors, legacy_only=True) == 'PASS'
                 and outage_tests_pass(pr, required, head, authors, command)):
             return None

@@ -155,8 +155,9 @@ def required_reviews():
 
 
 def required_reviewer(head_ref):
-    """The vendor that did not write the PR: a codex/ head branch is Codex's work, so Claude reviews it. Anything else,
-    including a missing branch name, gets Codex, so a Claude session never passes its own PR with a Claude review."""
+    """The vendor that did not write the PR, told from the head branch name: codex/ is Codex's work, so Claude reviews
+    it; anything else, including a missing name, gets Codex. The branch name is a convention, not a proof of who wrote
+    the diff."""
     return 'Claude' if isinstance(head_ref, str) and head_ref.startswith('codex/') else 'Codex'
 
 

@@ -529,6 +529,24 @@ class OneReview(Fixture, unittest.TestCase):
         self.assertIn('Missing: Codex', text)
         self.assertNotIn('Claude and', text)
 
+    def test_the_gate_asks_github_for_the_head_branch_name(self):
+        self.pr(comments=[comment('Codex', 'PASS')], head_ref='claude/x')
+        self.assertIsNone(self.decide())
+        with open(self.calls) as fh:
+            views = [line for line in fh if line.startswith('pr view') and 'comments' in line]
+        self.assertTrue(views and all('headRefName' in line for line in views), views)
+
+    def test_codex_github_app_never_stands_in_for_the_one_review(self):
+        bot = {'author': {'login': 'chatgpt-codex-connector'}, 'commit': {'oid': HEAD}, 'state': 'COMMENTED'}
+        self.config = gate(allow_single_on_unavailable=True, test_commands={REPO: self.command}, required_reviews=1,
+                           trust_codex_bot=True)
+        self.pr(reviews=[bot], head_ref='claude/x')
+        decision, text = self.reason()
+        self.assertEqual(decision, 'deny')
+        self.assertIn('Missing: Codex', text)
+        self.pr(comments=[comment('Codex', 'PASS')], reviews=[bot], head_ref='claude/x')
+        self.assertIsNone(self.decide())
+
     def test_a_codex_written_pr_needs_claude_and_a_codex_pass_alone_never_opens_the_gate(self):
         self.pr(comments=[comment('Claude', 'PASS')], head_ref='codex/x')
         self.assertIsNone(self.decide())

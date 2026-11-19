@@ -499,7 +499,8 @@ def required_first(base, head_ref):
     runners = {'Codex': lambda: codex_review(base, False), 'Claude': lambda: claude_review(base)}
     required = common.required_reviewer(head_ref)
     results = {required: runners[required]()}
-    if not results[required].verdict and results[required].unavailable:
+    fallback = (common.config().get('pr_gate') or {}).get('allow_single_on_unavailable') is True
+    if not results[required].verdict and results[required].unavailable and fallback:  # else it could not open the gate
         other = 'Codex' if required == 'Claude' else 'Claude'
         results[other] = runners[other]()
     return results

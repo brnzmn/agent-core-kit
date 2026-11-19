@@ -889,6 +889,7 @@ class AutomaticRun(unittest.TestCase):
         outage = runner.Review(None, 'Usage cap', 'quota')
         passed = runner.Review('PASS', 'No findings')
         self.assertEqual(self.run_main(codex=outage, claude=passed, reviews=1, policy=False, head_ref='claude/x'), 3)
+        self.claude_call.assert_not_called()  # with the fallback off the second review could not open the gate
         self.test_call.assert_not_called()
         self.assertEqual(self.evidence(), [])
         self.assertEqual(self.run_record()['status'], 'INCOMPLETE')
@@ -1036,6 +1037,13 @@ class SnapshotChecks(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runner.post_comment('7', META, 'body')
         call.assert_not_called()
+
+    def test_the_automatic_run_asks_github_for_the_head_branch_name(self):
+        answer = json.dumps({'number': 7, 'baseRefName': 'main', 'baseRefOid': 'b' * 40, 'headRefOid': 'a' * 40,
+                             'url': 'https://github.com/owner/repo/pull/7', 'headRefName': 'codex/x'})
+        with patch.object(runner, 'sh', return_value=subprocess.CompletedProcess([], 0, answer, '')) as call:
+            self.assertEqual(runner.metadata('7')['headRefName'], 'codex/x')
+        self.assertIn('headRefName', call.call_args[0][0][-1])
 
     def test_malformed_remote_metadata_is_rejected(self):
         for data in ('bad JSON', '{}', json.dumps({**META, 'headRefOid': 'not a SHA'})):
