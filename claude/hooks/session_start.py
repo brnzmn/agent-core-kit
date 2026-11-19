@@ -9,7 +9,8 @@ Prints short lines, which Claude Code (and Codex) add to context:
   drifted from the kit's rulebook and adapters.
 Only when config sync_on_start is true (default false) and AGENT_CORE_CATCH_UP is not 0: a session start also launches
 bin/catch_up.py in the background when its last result is over CATCH_UP_MAX_AGE old, and says once a day when that
-run could not bring the kit checkout up to GitHub or could not sync. The hook itself makes no git or network call; it
+run could not bring the kit checkout up to GitHub, could not sync, held the sync back for uncommitted edits, or has
+been offline for over a day. The hook itself makes no git or network call; it
 reads the result of the previous run. With the switch off it reads and starts nothing.
 A repo under the configured projects folder (config projects_root) that lacks the git pre-commit hook
 (bin/git_hooks.py) gets it, silently. Nothing is created under local/ when that folder does not exist.
@@ -29,6 +30,7 @@ import repo_context  # noqa: E402
 NOTICE_STATE = os.path.join(common.LEARN, '.notice_state.json')
 CATCH_UP_STATUS = os.path.join(common.LEARN, '.catch_up.json')
 CATCH_UP_MAX_AGE = 600
+OFFLINE_NOTICE_AFTER = 86400
 CATCH_UP_BLOCKED = ('blocked-dirty', 'blocked-diverged', 'other-branch', 'error')
 
 
@@ -87,6 +89,13 @@ def catch_up_notice(script, seen, today):
             note = line + (' ' + sync if status.get('sync') == 'failed' else '')
         elif status.get('sync') == 'failed':
             note = sync
+        elif status.get('outcome') == 'offline':
+            since = status.get('offline_since')
+            if isinstance(since, (int, float)) and not isinstance(since, bool) and math.isfinite(since) \
+                    and 0 < since < time.time() - OFFLINE_NOTICE_AFTER:
+                note = ('agent-core-kit: the background check has not reached GitHub since %s, so the rules here may be '
+                        'behind. Run: git -C %s fetch origin main'
+                        % (time.strftime('%Y-%m-%d', time.localtime(since)), common.tilde(common.CORE)))
         if note:
             seen['catchup'] = today
     if age is None or age > CATCH_UP_MAX_AGE or age < 0:

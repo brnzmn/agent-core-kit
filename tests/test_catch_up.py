@@ -370,7 +370,7 @@ class FirstTime(Fixture):
         self.write(self.core, 'notes.txt', 'untracked\n')
         return old
 
-    def printed_command(self, out, which='bring them back: ', needle='git stash apply'):
+    def printed_command(self, out, which='to undo (only if you want the old edits back): ', needle='git stash apply'):
         for line in out.splitlines():
             if which in line and needle in line:
                 return line.split(which, 1)[1].split('   or: ')[0]
@@ -448,7 +448,7 @@ class FirstTime(Fixture):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.read(self.core, 'staged.txt'), b'staged\n')
         self.git(self.core, 'reset', '-q', '--hard', 'origin/main')
-        done = self.paste(self.printed_command(out, 'bring them back: ', 'git cherry-pick'))
+        done = self.paste(self.printed_command(out, 'to undo (only if you want the old commits back): ', 'git cherry-pick'))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.read(self.core, 'local2.txt'), b'two\n')
         self.assertTrue(old)
@@ -557,7 +557,7 @@ class FirstTime(Fixture):
         seen = []
         for line in proc.stdout:
             seen.append(line.rstrip('\n'))
-            if 'git cherry-pick' in line:
+            if 'Nothing above needs doing' in line:
                 break
         self.assertFalse(os.path.exists(os.path.join(self.home, 'go')))
         self.assertTrue(any('backup folder' in x for x in seen[:2]))
@@ -613,8 +613,216 @@ class FirstTime(Fixture):
         self.assertFalse(os.path.exists(os.path.join(self.core, 'backups')))
         self.assertEqual(self.git(self.core, 'branch', '--list', 'backup/*'), '')
 
+    def test_the_report_labels_its_commands_as_undo_and_says_nothing_needs_doing(self):
+        self.prepare_diverged_dirty('apart')
+        rc, out, _ = self.catch_up('--first-time', '--no-sync')
+        self.assertEqual(rc, 0, out)
+        report = self.read(self.backup_folder(), 'REPORT.txt').decode()
+        for text in (out, report):
+            self.assertIn('to undo (only if you want the old edits back): cd ', text)
+            self.assertIn('to undo (only if you want the old commits back): cd ', text)
+            self.assertIn('if that conflicts: ', text)
+            self.assertIn("  Nothing above needs doing: GitHub's version is now in place.", text)
+            self.assertNotIn('bring them back:', text)
+        lines = out.strip().splitlines()
+        self.assertEqual(lines[-1], "  Nothing above needs doing: GitHub's version is now in place.")
+
+    def test_the_nothing_to_do_line_comes_before_the_sync_result(self):
+        self.prepare_diverged_dirty('apart')
+        rc, out, _ = self.catch_up('--first-time')
+        self.assertEqual(rc, 0, out)
+        lines = out.strip().splitlines()
+        self.assertEqual(lines[-2:], ["  Nothing above needs doing: GitHub's version is now in place.",
+                                      '  install.sh --sync ran.'])
+
 
 CONDITIONAL_INSTALL = '#!/bin/bash\n[ -f "$HOME/sync-ok" ] && echo "$@" > "$HOME/sync-marker" && exit 0\nexit 1\n'
+
+
+class HeldInstall(Fixture):
+    """A background run never installs a checkout that has uncommitted edits to tracked files."""
+
+    def marker(self):
+        return os.path.join(self.home, 'sync-marker')
+
+    def held_cycle(self, stage):
+        new = self.push_update({'a.txt': 'a2\n'})
+        self.write(self.core, 'b.txt', 'b-edited\n')
+        stage()
+        rc, out, status = self.catch_up(keep=True)
+        self.assertEqual(rc, 4, out)
+        self.assertEqual(self.head(), new)
+        self.assertFalse(os.path.exists(self.marker()))
+        self.assertEqual((status['outcome'], status['sync'], status['attention']), ('updated', 'held', True))
+        self.assertIn('not installed: ~/agent-core-kit has uncommitted edits in 1 file(s) (b.txt). Commit or discard them, '
+                      'then run: bash ~/agent-core-kit/install.sh --sync', out)
+        self.assertRegex(out, r'^agent-core-kit: updated [0-9a-f]{7}\.\.[0-9a-f]{7}; not installed: ')
+        rc, out, status = self.catch_up(keep=True)
+        self.assertEqual(rc, 4, out)
+        self.assertFalse(os.path.exists(self.marker()))
+        self.assertEqual((status['outcome'], status['sync'], status['attention']), ('current', 'held', True))
+        self.assertTrue(out.startswith('agent-core-kit: ~/agent-core-kit is up to date; not installed: '), out)
+        self.assertIn('(b.txt)', out)
+        self.git(self.core, 'checkout', '-q', 'HEAD', '--', 'b.txt')
+        rc, out, status = self.catch_up()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.read(self.home, 'sync-marker'), b'--sync\n')
+        self.assertEqual(status['sync'], 'ok')
+        self.assertIn('install.sh --sync ran.', out)
+
+    def test_an_unstaged_edit_holds_the_install_until_it_is_gone(self):
+        self.held_cycle(lambda: None)
+
+    def test_a_staged_only_edit_holds_the_install_too(self):
+        self.held_cycle(lambda: self.git(self.core, 'add', 'b.txt'))
+
+    def test_an_untracked_file_alone_does_not_hold_the_install(self):
+        self.push_update({'a.txt': 'a2\n'})
+        self.write(self.core, 'notes.txt', 'untracked\n')
+        rc, out, status = self.catch_up(keep=True)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(status['sync'], 'ok')
+        self.assertEqual(self.read(self.home, 'sync-marker'), b'--sync\n')
+
+    def test_a_failed_sync_is_not_retried_over_uncommitted_edits(self):
+        self.push_update({'a.txt': 'a2\n', 'install.sh': CONDITIONAL_INSTALL})
+        rc, _, status = self.catch_up('--quiet', keep=True)
+        self.assertEqual((rc, status['sync']), (4, 'failed'))
+        self.write(self.home, 'sync-ok', '')
+        self.write(self.core, 'b.txt', 'b-edited\n')
+        rc, out, status = self.catch_up(keep=True)
+        self.assertEqual((rc, status['sync'], status['attention']), (4, 'held', True))
+        self.assertFalse(os.path.exists(self.marker()))
+        self.assertIn('not installed', out)
+
+    def test_first_time_still_archives_and_installs_with_the_same_edits(self):
+        new = self.push_update({'a.txt': 'a2\n'})
+        self.write(self.core, 'a.txt', 'a-mine\n')
+        self.write(self.core, 'b.txt', 'b-edited\n')
+        rc, out, status = self.catch_up('--first-time')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.head(), new)
+        self.assertTrue(os.path.isdir(os.path.join(self.core, 'backups')))
+        self.assertEqual(self.read(self.home, 'sync-marker'), b'--sync\n')
+        self.assertEqual(status['sync'], 'ok')
+
+    def test_first_time_that_only_fast_forwards_still_installs_with_an_edit_elsewhere(self):
+        self.push_update({'a.txt': 'a2\n'})
+        self.write(self.core, 'b.txt', 'b-edited\n')
+        rc, out, status = self.catch_up('--first-time')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.read(self.home, 'sync-marker'), b'--sync\n')
+        self.assertEqual(status['sync'], 'ok')
+
+
+class FirstTimeWhenCurrent(Fixture):
+    def marker(self):
+        return os.path.join(self.home, 'sync-marker')
+
+    def test_an_up_to_date_clean_checkout_is_installed(self):
+        rc, out, status = self.catch_up('--first-time')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.strip(), 'agent-core-kit: ~/agent-core-kit is up to date; install.sh --sync ran.')
+        self.assertEqual(self.read(self.home, 'sync-marker'), b'--sync\n')
+        self.assertEqual((status['outcome'], status['sync']), ('current', 'ok'))
+
+    def test_a_failing_install_exits_4(self):
+        self.push_update({'install.sh': '#!/bin/bash\nexit 1\n'})
+        self.git(self.core, 'pull', '-q', '--ff-only', 'origin', 'main')
+        rc, out, status = self.catch_up('--first-time')
+        self.assertEqual(rc, 4, out)
+        self.assertIn('is up to date; install.sh --sync failed, run: bash ~/agent-core-kit/install.sh --sync', out)
+        self.assertEqual((status['outcome'], status['sync']), ('current', 'failed'))
+
+    def test_an_up_to_date_checkout_with_an_edit_installs_nothing(self):
+        self.write(self.core, 'a.txt', 'a-mine\n')
+        rc, out, status = self.catch_up('--first-time')
+        self.assertEqual(rc, 4, out)
+        self.assertEqual(out.strip(), 'agent-core-kit: ~/agent-core-kit is up to date with GitHub but has uncommitted edits in '
+                         '1 file(s) (a.txt); nothing was installed. Commit or discard them, then run: bash '
+                         '~/agent-core-kit/install.sh --sync')
+        self.assertFalse(os.path.exists(self.marker()))
+        self.assertEqual((status['outcome'], status['sync'], status['attention']), ('current', 'held', True))
+        self.assertEqual(self.read(self.core, 'a.txt'), b'a-mine\n')
+
+    def test_no_sync_leaves_an_up_to_date_checkout_alone(self):
+        rc, out, _ = self.catch_up('--first-time', '--no-sync')
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(self.marker()))
+
+    def test_a_background_run_that_is_current_and_clean_runs_nothing(self):
+        rc, out, status = self.catch_up('--quiet')
+        self.assertEqual((rc, out), (0, ''))
+        self.assertFalse(os.path.exists(self.marker()))
+        self.assertNotIn('sync', status)
+
+
+class OfflineRuns(Fixture):
+    def go_offline(self):
+        self.git(self.core, 'remote', 'set-url', 'origin', os.path.join(self.tmp, 'does-not-exist.git'))
+
+    def test_first_time_offline_is_a_failure_and_the_background_run_is_not(self):
+        self.go_offline()
+        old = self.head()
+        rc, out, status = self.catch_up('--first-time')
+        self.assertEqual(rc, 3, out)
+        self.assertTrue(out.strip().endswith('; nothing was changed.'), out)
+        self.assertIn('could not reach GitHub', out)
+        self.assertEqual(status['outcome'], 'offline')
+        self.assertEqual(self.head(), old)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
+        rc, out, status = self.catch_up('--quiet')
+        self.assertEqual((rc, out), (0, ''))
+        self.assertEqual(status['outcome'], 'offline')
+
+    def test_two_offline_runs_keep_the_first_offline_since_and_a_reached_run_drops_it(self):
+        self.go_offline()
+        rc, _, first = self.catch_up('--quiet', keep=True)
+        self.assertEqual((rc, first['outcome']), (0, 'offline'))
+        self.assertAlmostEqual(first['offline_since'], time.time(), delta=30)
+        time.sleep(1.1)
+        _, _, second = self.catch_up('--quiet', keep=True)
+        self.assertEqual(second['offline_since'], first['offline_since'])
+        self.assertGreater(second['at'], first['at'])
+        self.git(self.core, 'remote', 'set-url', 'origin', self.origin)
+        _, _, third = self.catch_up('--quiet', keep=True)
+        self.assertEqual(third['outcome'], 'current')
+        self.assertNotIn('offline_since', third)
+        self.go_offline()
+        _, _, fourth = self.catch_up('--quiet')
+        self.assertGreaterEqual(fourth['offline_since'], third['at'])
+
+    def test_an_offline_record_without_a_usable_since_starts_a_new_one(self):
+        self.go_offline()
+        with open(self.status, 'w') as fh:
+            json.dump({'at': 1, 'outcome': 'offline', 'line': 'x', 'head': '', 'offline_since': 'yesterday'}, fh)
+        _, _, status = self.catch_up('--quiet')
+        self.assertAlmostEqual(status['offline_since'], time.time(), delta=30)
+
+
+class UnfinishedOperations(Fixture):
+    def test_first_time_refuses_while_a_merge_cherry_pick_or_revert_is_in_progress(self):
+        self.write(self.core, 'local1.txt', 'one\n')
+        self.commit(self.core, 'local one')
+        self.push_update({'a.txt': 'a-up\n'})
+        self.write(self.core, 'b.txt', 'b-mine\n')
+        old = self.head()
+        for name in ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'):
+            with self.subTest(name):
+                marker = os.path.join(self.core, '.git', name)
+                self.write(self.core, '.git/' + name, old + '\n')
+                self.assertEqual(self.git(self.core, 'ls-files', '-u'), '')
+                rc, out, status = self.catch_up('--first-time', '--no-sync')
+                self.assertEqual(rc, 5, out)
+                self.assertEqual(out.strip(), 'agent-core-kit: ~/agent-core-kit has a merge, cherry-pick or revert in progress; '
+                                 'finish or abort it first. Nothing was changed.')
+                self.assertEqual(status['outcome'], 'error')
+                self.assertEqual(self.git(self.core, 'rev-parse', '-q', '--verify', name), old)
+                self.assertEqual(self.head(), old)
+                self.assertEqual(self.read(self.core, 'b.txt'), b'b-mine\n')
+                self.assertFalse(os.path.exists(os.path.join(self.core, 'backups')))
+                self.assertEqual(self.git(self.core, 'branch', '--list', 'backup/*'), '')
+                os.unlink(marker)
 
 
 class Transport(Fixture):
@@ -792,6 +1000,25 @@ class NeverInstalled(Fixture):
         self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
         self.assertIn('the kit is not installed for this user', out)
         self.assertEqual(status['sync'], 'skipped')
+
+    def test_a_background_run_over_an_edit_is_not_held_because_nothing_would_be_installed(self):
+        new = self.push_update({'a.txt': 'a2\n'})
+        self.write(self.core, 'b.txt', 'b-edited\n')
+        rc, out, status = self.catch_up()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.head(), new)
+        self.assertEqual((status['sync'], status.get('attention')), ('skipped', None))
+        self.assertNotIn('not installed: ~', out)
+
+    def test_first_time_on_an_up_to_date_checkout_skips_the_sync_with_the_plain_line(self):
+        self.write(self.core, 'a.txt', 'a-mine\n')
+        rc, out, status = self.catch_up('--first-time')
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
+        self.assertIn('is up to date.', out)
+        self.assertNotIn('uncommitted', out)
+        self.assertEqual(status['outcome'], 'current')
+        self.assertNotIn('sync', status)
 
     def test_half_an_install_does_not_count(self):
         self.write(self.installed_hooks, 'guard.py', '')  # guard.py without .core-dir, as the installer tests it

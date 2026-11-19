@@ -12,7 +12,8 @@ local/learning/. --first-time archives under <checkout>/backups/ (git-ignored).
 
 Outcomes: current, offline, updated, blocked-dirty, blocked-diverged, other-branch, error.
 Exit codes: 0 current, offline or updated; 2 usage or not a checkout; 3 blocked, other branch or error;
-4 updated but install.sh --sync failed; 5 --first-time could not archive or move safely.
+4 updated but install.sh --sync failed or was held back by uncommitted edits; 5 --first-time could not archive or move
+safely. --first-time that cannot reach GitHub exits 3 (a background run that is offline exits 0).
 """
 import argparse
 import hashlib
@@ -190,6 +191,30 @@ def worktree_changes(repo):
     return [p for p in out.split('\0') if p]
 
 
+def edited_files(repo):
+    """Tracked files with a change in the index or the working tree, by git status (untracked files do not count).
+    Renames and copies list both paths."""
+    rc, out, err = repo.git('status', '--porcelain', '--untracked-files=no', '-z')
+    if rc != 0:
+        last = ((err or out).strip().splitlines() or [''])[-1]
+        raise Stop(3, 'error', 'agent-core-kit: git status failed in %s: %s' % (tilde(repo.core), last))
+    parts, files, i = out.split('\0'), [], 0
+    while i < len(parts):
+        entry = parts[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        files.append(entry[3:])
+        if (entry[0] in 'RC' or entry[1] in 'RC') and i < len(parts) and parts[i]:
+            files.append(parts[i])
+            i += 1
+    return files
+
+
+def held_text(repo, files):
+    return 'has uncommitted edits in %d file(s) (%s)' % (len(files), names(files))
+
+
 def update_names(repo):
     out = repo.out('diff', '--name-only', '-z', '--no-renames', 'HEAD', 'origin/' + BRANCH)
     return {p for p in out.split('\0') if p}
@@ -286,6 +311,11 @@ def fast_forward(repo, args, old):
         why = ': ' + not_installed_note(repo) if args.not_installed else ''
         return dict(outcome='updated', sync='skipped', head=new, line='agent-core-kit: updated %s (not synced%s).%s'
                     % (span, why, note), **extra)
+    edits = [] if args.first_time else edited_files(repo)
+    if edits:  # the sync installs the working tree as it is: a half-finished edit must not reach the running tools
+        return dict(outcome='updated', sync='held', head=new, attention=True,
+                    line='agent-core-kit: updated %s; not installed: %s %s. Commit or discard them, then run: bash %s%s'
+                    % (span, tilde(repo.core), held_text(repo, edits), sync_command(repo), note))
     if sync_install(repo):
         return dict(outcome='updated', sync='ok', head=new, line='agent-core-kit: updated %s and synced%s' % (span, note),
                     **extra)
@@ -304,6 +334,9 @@ def classify_and_update(repo, args):
     if run(['git', '-C', repo.core, 'fetch', '-q', 'origin', BRANCH], timeout=fetch_timeout(),
             env=repo.env)[0] != 0 \
             or repo.git('rev-parse', '--verify', '-q', 'origin/' + BRANCH + '^{commit}')[0] != 0:
+        if args.first_time:
+            raise Stop(3, 'offline', 'agent-core-kit: could not reach GitHub; %s not updated; nothing was changed.'
+                       % shown, head=head)
         return dict(outcome='offline', head=head, line='agent-core-kit: could not reach GitHub; %s not updated.' % shown)
     ahead, behind = (int(n) for n in repo.out('rev-list', '--left-right', '--count', 'HEAD...origin/' + BRANCH).split())
     # Commits GitHub lacks do not matter while nothing new waits on GitHub: the rules already here are the newest.
@@ -468,7 +501,7 @@ def report_lines(repo, old, new, why, stamp, folder, parts, stash, commits, kept
         lines.append('  backup branch for the edits: backup/edits-%s (at %s)' % (stamp, short(stash)))
         lines.append('  uncommitted edits archived (%d): %s' % (len(parts['files']), ', '.join(parts['files'])))
         here, fallback = way_back(repo, stamp, stash)
-        lines.append('    bring them back: ' + here)
+        lines.append('    to undo (only if you want the old edits back): ' + here)
         lines.append('    if that conflicts: ' + fallback)
         lines.append('    copies of every edited file: %s/files; patches next to it' % tilde(folder))
     if parts['added']:
@@ -480,9 +513,11 @@ def report_lines(repo, old, new, why, stamp, folder, parts, stash, commits, kept
     if commits:
         lines.append('  local commits archived (%d):' % len(commits))
         lines.extend('    %s %s' % (short(sha), subject) for sha, subject in commits)
-        lines.append('    bring them back: cd %s && git cherry-pick %s   or: cd %s && git checkout backup/local-%s'
+        lines.append('    to undo (only if you want the old commits back): cd %s && git cherry-pick %s   or: cd %s && '
+                     'git checkout backup/local-%s'
                      % (shell_path(repo.core), ' '.join(short(sha) for sha, _ in reversed(commits)),
                         shell_path(repo.core), stamp))
+    lines.append("  Nothing above needs doing: GitHub's version is now in place.")
     return lines
 
 
@@ -510,6 +545,10 @@ def first_time(repo, args, why):
     if repo.out('ls-files', '-u'):
         raise Stop(5, 'error', 'agent-core-kit: %s has an unfinished merge; finish or abort it first. Nothing was changed.'
                    % tilde(repo.core))
+    for name in ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'):
+        if repo.git('rev-parse', '-q', '--verify', name)[0] == 0:  # the put-back's reset --hard would drop that state
+            raise Stop(5, 'error', 'agent-core-kit: %s has a merge, cherry-pick or revert in progress; finish or abort it '
+                       'first. Nothing was changed.' % tilde(repo.core))
     files = tracked_changes(repo)
     in_head = [p for p in files if repo.git('cat-file', '-e', 'HEAD:' + p)[0] == 0]
     added = [p for p in files if p not in in_head]
@@ -571,15 +610,46 @@ def first_time(repo, args, why):
     return dict(outcome='updated', sync=synced, head=new, line=lines[0], printed=True)
 
 
-def retry_failed_sync(repo, args, result):
-    """A sync that failed stays failed until one succeeds. The next run finds HEAD equal to origin/main and would
-    call it current, so the previous status decides: same head and a failed sync means the installed hooks and rules
-    are still stale and the sync runs again."""
+def first_time_current(repo, args, result):
+    """--first-time on a checkout that is already at origin/main: the checkout may have been pulled by hand, so its
+    installed hooks may be old. Install it unless it has uncommitted edits. A kit that was never installed
+    (args.no_sync is set for it) keeps the plain up-to-date line: a catch-up never performs the first install."""
+    if not (args.first_time and not args.no_sync and result['outcome'] == 'current'):
+        return result
+    shown = tilde(repo.core)
+    edits = edited_files(repo)
+    if edits:
+        result.update(sync='held', attention=True,
+                      line='agent-core-kit: %s is up to date with GitHub but %s; nothing was installed. Commit or '
+                      'discard them, then run: bash %s' % (shown, held_text(repo, edits), sync_command(repo)))
+    elif sync_install(repo):
+        result.update(sync='ok', line='agent-core-kit: %s is up to date; install.sh --sync ran.' % shown)
+    else:
+        result.update(sync='failed', line='agent-core-kit: %s is up to date; install.sh --sync failed, run: bash %s'
+                      % (shown, sync_command(repo)))
+    return result
+
+
+def retry_pending_sync(repo, args, result):
+    """A sync that failed, or was held back for uncommitted edits, stays pending until one succeeds. The next run finds
+    HEAD equal to origin/main and would call it current, so the previous status decides: same head and a pending sync
+    means the installed hooks and rules are still stale and the sync runs again, unless the checkout is still dirty."""
     prev = read_status(args.status_file) if args.status_file else {}
-    if prev.get('sync') != 'failed' or prev.get('head') != result.get('head') or 'sync' in result:
+    if prev.get('sync') not in ('failed', 'held') or prev.get('head') != result.get('head') or 'sync' in result:
         return result
     if args.no_sync:
-        result['sync'] = 'failed'
+        result['sync'] = prev['sync']
+        return result
+    edits = [] if args.first_time else edited_files(repo)
+    if edits:
+        held = 'not installed: %s %s. Commit or discard them, then run: bash %s' % (tilde(repo.core),
+                                                                                   held_text(repo, edits),
+                                                                                   sync_command(repo))
+        if result['outcome'] == 'current':
+            result['line'] = 'agent-core-kit: %s is up to date; %s' % (tilde(repo.core), held)
+        else:
+            result['line'] += ' ' + held[0].upper() + held[1:]
+        result.update(sync='held', attention=True)
     elif sync_install(repo):
         result['sync'] = 'ok'
         result['line'] += ' install.sh --sync ran.'
@@ -620,8 +690,9 @@ def execute(args, core):
                 raise
             why = 'local commits' if stop.outcome == 'blocked-diverged' else 'uncommitted edits'
             result = first_time(repo, args, why)
-        result = retry_failed_sync(repo, args, result)
-        code = 4 if result.get('sync') == 'failed' else 0
+        result = first_time_current(repo, args, result)
+        result = retry_pending_sync(repo, args, result)
+        code = 4 if result.get('sync') in ('failed', 'held') else 0
         return code, result
     finally:
         try:
@@ -686,8 +757,8 @@ def main(argv=None):
     except Stop as stop:
         code, result = stop.code, dict(outcome=stop.outcome, line=stop.line, **stop.extra)
         prev = read_status(args.status_file)
-        if prev.get('sync') == 'failed' and prev.get('head') and prev.get('head') == result.get('head'):
-            result['sync'] = 'failed'  # a blocked run must not forget it
+        if prev.get('sync') in ('failed', 'held') and prev.get('head') and prev.get('head') == result.get('head'):
+            result['sync'] = prev['sync']  # a blocked run must not forget it
     except KeyboardInterrupt:
         return 130
     if result is None:
@@ -703,6 +774,12 @@ def main(argv=None):
         for key in ('sync', 'attention'):
             if key in result:
                 record[key] = result[key]
+        if result['outcome'] == 'offline':
+            before = read_status(args.status_file)
+            since = before.get('offline_since')
+            usable = before.get('outcome') == 'offline' and isinstance(since, (int, float)) \
+                and not isinstance(since, bool) and 0 < since <= record['at']
+            record['offline_since'] = int(since) if usable else record['at']
         try:
             write_json(args.status_file, record)
         except OSError:
