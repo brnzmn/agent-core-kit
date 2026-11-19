@@ -97,7 +97,7 @@ Some skills load on their own when the task matches: `explain-codebase`, `verify
 | `usage.py` | Claude and Codex plan usage in under 10 seconds, plus the routing call. A number it cannot read is reported as unknown, never guessed. |
 | `pr_review.py`, `claude-review.sh` | The two PR reviews, the read-only Claude review, the merge on your order (`--owner-go`), and the close after two blocked rounds (`--close`). |
 | `lane.sh` | Marks a worktree as one tool's lane. |
-| `catch_up.py` | Brings the kit checkout up to GitHub's `main` by fast-forward and runs `install.sh --sync`; session start runs it when `sync_on_start` is on, and `--first-time` reconciles a checkout that cannot fast-forward. |
+| `catch_up.py` | Brings the kit checkout up to GitHub's `main` by fast-forward and runs `install.sh --sync`; session start runs it when `sync_on_start` is on, and `--first-time` reconciles a checkout that cannot fast-forward. A background run never installs uncommitted edits. |
 | `codex_scratch.py` | A throwaway Codex home for tests. Scratch runs count against your Codex plan. |
 | `build.py`, `git_hooks.py`, `precommit.py` | What `install.sh` drives: builds, installs, checks, and the instruction-file pre-commit hook. |
 
@@ -256,7 +256,7 @@ bash install.sh --sync
 
 `--sync` rebuilds the generated files and copies the kit's agents, skills and hooks. It leaves your rulebook and config alone; it only updates `local/install-state.json` and, once, `local/.gitignore`. `bash install.sh --check` lists any drift between the kit and what is installed.
 
-To have this done for you, set `"sync_on_start": true` in `local/config.json`. A session start then brings the kit checkout up to GitHub in the background (fast-forward only) and runs `--sync`. When it cannot, the next session says one line with the reason. `python3 bin/catch_up.py --first-time` reconciles a checkout that has local edits or commits: it archives them under `backups/` and on a `backup/local-<time>` branch, moves the checkout to `main`, and prints the commands that bring them back (also saved in the backup's `REPORT.txt`). Your rulebook and config in `local/` are not touched; the catch-up writes only its own status file there. On a clone that was never installed it updates the files and leaves the first install to you.
+To have this done for you, set `"sync_on_start": true` in `local/config.json`. A session start then brings the kit checkout up to GitHub in the background (fast-forward only) and runs `--sync`, but never while tracked files in the checkout have uncommitted edits: it holds the install back and says so once a day. When it cannot update, the next session says one line with the reason, and one more when GitHub has been out of reach for over a day. `python3 bin/catch_up.py --first-time` reconciles a checkout that has local edits or commits: it archives them under `backups/` and on a `backup/local-<time>` branch, moves the checkout to `main`, and prints undo commands, needed only if you want the old edits back (also saved in the backup's `REPORT.txt`). Your rulebook and config in `local/` are not touched; the catch-up writes only its own status file there. On a clone that was never installed it updates the files and leaves the first install to you.
 
 Codex files other than its `AGENTS.md` (agents, hooks, rules, the memories pin) are written only while no Codex process is running, and the desktop app counts. If Codex is open, `--sync` says which files are waiting; quit Codex and run it again. Codex asks you to trust changed hooks again in `/hooks`.
 

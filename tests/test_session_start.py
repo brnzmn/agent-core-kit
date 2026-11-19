@@ -382,6 +382,29 @@ class CatchUp(unittest.TestCase):
         self.set_status('current', 'agent-core-kit: ~/agent-core-kit is up to date.', sync='failed')
         self.assertIn('bash %s --sync' % os.path.join(self.core, 'install.sh'), self.start())
 
+    def test_a_held_install_is_shown_once_a_day_without_the_sync_failed_sentence(self):
+        line = ('agent-core-kit: updated a..b; not installed: ~/agent-core-kit has uncommitted edits in 1 file(s) (b.txt). '
+                'Commit or discard them, then run: bash ~/agent-core-kit/install.sh --sync')
+        self.set_status('updated', line, sync='held', attention=True)
+        out = self.start()
+        self.assertIn(line, out)
+        self.assertNotIn('sync failed', out)
+        self.assertNotIn(line, self.start())
+
+    def test_an_offline_catch_up_is_shown_once_after_a_day_and_not_before(self):
+        since = time.time() - 2 * 86400
+        self.set_status('offline', 'agent-core-kit: could not reach GitHub; ~/agent-core-kit not updated.',
+                        offline_since=since)
+        notice = ('agent-core-kit: the background check has not reached GitHub since %s, so the rules here may be '
+                  'behind. Run: git -C %s fetch origin main' % (time.strftime('%Y-%m-%d', time.localtime(since)), self.core))
+        self.assertIn(notice, self.start())
+        self.assertNotIn(notice, self.start(), 'once a day')
+        self.forget_notices()
+        self.set_status('offline', 'x', offline_since=time.time() - 3600)
+        self.assertNotIn('has not reached GitHub', self.start())
+        self.set_status('offline', 'x')
+        self.assertNotIn('has not reached GitHub', self.start())
+
     def test_a_long_status_line_is_cut_and_an_ignored_copy_notice_is_shown(self):
         self.set_status('updated', 'agent-core-kit: updated a..b. ' + 'x' * 500, attention=True)
         out = self.start()
