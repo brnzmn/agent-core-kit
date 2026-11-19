@@ -250,8 +250,8 @@ Rule lines added to the template since your install reach an existing rulebook o
 - the `Needs you:` block that replaces the numbered checklist for anything only you can do (under "Act first");
 - an agent's own recommendation is taken, not asked (under "Act first");
 - live facts and "working" claims come from a read in the same turn (under "Done means verified");
-- one watcher for pending background runs, and no chat reply to a check that brings nothing new (under "How to talk to you");
-- checks you are handed only read and print, and asks name things as you see them (under "How to talk to you").
+- one watcher for pending background runs, and no chat reply to a check that brings nothing new (under the "How to talk to" section);
+- checks you are handed only read and print, and asks name things as you see them (under the "How to talk to" section).
 
 ## Uninstall and restore
 

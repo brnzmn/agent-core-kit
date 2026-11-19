@@ -189,7 +189,7 @@ class OwnPick(unittest.TestCase):
                      'Fixed. My recommendation is a retry. Can you see the email?'):
             self.assertIsNone(stop(text), text)
 
-    def test_his_own_decisions_stay_questions(self):
+    def test_the_users_own_decisions_stay_questions(self):
         for text in ('A residential proxy fixes it for about $40 a month. I recommend it. Pay for it?',
                      'I recommend removing the old rows. Delete the 2019 archive table?',
                      'The update needs the bot down for five minutes. I recommend tonight. Take it down now or at 02:00?',

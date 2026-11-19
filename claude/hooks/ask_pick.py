@@ -8,7 +8,7 @@ a label the agent wrote, sometimes hours later. Two boxes do it:
 - The desktop app's next-step box (wrap_up with an ask), where the ask is usually the agent's own next step with a
   question mark ("Fix it and run round four?" / "Yes, fix it"). Denied when the ask proposes a step, asks leave for
   one ("Can I merge now?", "Want me to deploy?") or marks a pick. An ask for something only the user knows ("Is the
-  token stored?", "When is the TV free?") passes.
+  token stored?", "When is the test device free?") passes.
 Either box passes when the choice is the user's to make (stop_steps.owner_choice: deleting data the agent did not
 create, spend over the limit, a message sent as them, a first public launch, creative direction, a step that takes a
 running service down), when the question begins "Needs you:", which is how the agent says the answer is the user's

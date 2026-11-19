@@ -41,7 +41,7 @@ class AskPick(unittest.TestCase):
         self.assertIsNone(ask(box(q('Which column is the order date?', ('created_at', 'Set on insert'),
                                     ('placed_at', 'Set at checkout')))))
 
-    def test_his_own_decisions_pass_with_a_pick(self):
+    def test_the_users_own_decisions_pass_with_a_pick(self):
         for question in (q('Pay for the residential proxy?', ('Yes, $40 a month (Recommended)', 'Fixes the 429s'), ('No', 'Keep failing')),
                          q('Remove the 2019 archive?', ('Delete it (Recommended)', '12 GB'), ('Keep it', 'No change')),
                          q('When does the bot go down for the update?', ('Now (Recommended)', 'Five minutes of downtime'), ('02:00', 'Tonight')),
@@ -121,7 +121,7 @@ class NextStepBox(unittest.TestCase):
             self.assertIsNotNone(ask_box(step(ask, 'Yes', 'No')), ask)
         self.assertIsNone(ask_box(step('Needs you: may I use the test device now? It takes a few seconds.', 'Yes, now', 'After I finish')))
 
-    def test_his_own_decisions_pass(self):
+    def test_the_users_own_decisions_pass(self):
         for ask, labels in (('Swap the key on the server and restart the bot?', ('Yes, swap it', 'No, leave it')),
                             ('Upgrade Docker now (restarts the other containers too)?', ('Yes, upgrade it', 'Not now')),
                             ('Stop the staging worker to make room?', ('Stop it', 'Leave it')),
