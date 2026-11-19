@@ -129,7 +129,7 @@ class NextStepBox(unittest.TestCase):
                             ('Delete the 2019 archive table?', ('Delete it', 'Keep it'))):
             self.assertIsNone(ask_box(step(ask, *labels)), ask)
 
-    def test_a_named_need_passes_and_a_request_for_his_action_needs_the_name(self):
+    def test_a_named_need_passes_and_a_request_for_the_users_action_needs_the_name(self):
         self.assertIsNotNone(ask_box(step('Post the question in the team channel now?', 'Posted it', 'Later')))
         self.assertIsNone(ask_box(step('Needs you: post the question in the team channel, so I can read the reply.', 'Posted it')))
         self.assertIsNone(ask_box(step('**Needs you:** pick the plan.', 'Pro', 'Team')))
