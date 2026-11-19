@@ -199,6 +199,19 @@ def sync_command(repo):
     return shell_path(os.path.join(repo.core, 'install.sh')) + ' --sync'
 
 
+def installed():
+    """True when install.sh has installed the kit for this user (the installer's own test: guard.py and .core-dir in
+    the hooks folder). A catch-up updates an installed kit. It never performs the first install: install.sh --sync
+    would do one, and that changes how every session on the machine behaves."""
+    hooks = os.path.join(os.path.expanduser('~'), '.claude', 'hooks', 'agent-core')
+    return os.path.isfile(os.path.join(hooks, 'guard.py')) and os.path.isfile(os.path.join(hooks, '.core-dir'))
+
+
+def not_installed_note(repo):
+    return ('the kit is not installed for this user, so nothing was synced; to install it run: bash %s'
+            % shell_path(os.path.join(repo.core, 'install.sh')))
+
+
 def sync_install(repo):
     """True when install.sh --sync exited 0."""
     script = os.path.join(repo.core, 'install.sh')
@@ -270,8 +283,9 @@ def fast_forward(repo, args, old):
     note = (' %d local ignored file(s) GitHub now tracks were copied to %s/ignored-overwritten first.'
             % (kept, tilde(kept_folder))) if kept else ''
     if args.no_sync:
-        return dict(outcome='updated', sync='skipped', head=new, line='agent-core-kit: updated %s (not synced).%s'
-                    % (span, note), **extra)
+        why = ': ' + not_installed_note(repo) if args.not_installed else ''
+        return dict(outcome='updated', sync='skipped', head=new, line='agent-core-kit: updated %s (not synced%s).%s'
+                    % (span, why, note), **extra)
     if sync_install(repo):
         return dict(outcome='updated', sync='ok', head=new, line='agent-core-kit: updated %s and synced%s' % (span, note),
                     **extra)
@@ -552,6 +566,8 @@ def first_time(repo, args, why):
         print('  install.sh --sync failed; run: bash %s' % sync_command(repo), flush=True)
     elif synced == 'ok':
         print('  install.sh --sync ran.', flush=True)
+    elif args.not_installed:
+        print('  ' + not_installed_note(repo) + '.', flush=True)
     return dict(outcome='updated', sync=synced, head=new, line=lines[0], printed=True)
 
 
@@ -663,6 +679,8 @@ def main(argv=None):
     explicit_status = bool(args.status_file)
     own_folder = not explicit_status and os.path.isdir(local_dir(core))
     args.status_file = args.status_file or default_status_file(core)
+    args.not_installed = not args.no_sync and not installed()
+    args.no_sync = args.no_sync or args.not_installed
     try:
         code, result = execute(args, core)
     except Stop as stop:

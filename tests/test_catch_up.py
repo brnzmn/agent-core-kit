@@ -35,6 +35,9 @@ class Fixture(unittest.TestCase):
         self.tmp = os.path.realpath(self._tmp.name)
         self.home = os.path.join(self.tmp, 'home')
         os.makedirs(self.home)
+        self.installed_hooks = os.path.join(self.home, '.claude', 'hooks', 'agent-core')
+        for name in ('guard.py', '.core-dir'):  # what install.sh leaves behind: the kit is installed for this user
+            self.write(self.installed_hooks, name, '')
         self.env = clean_env(self.home)
         self.origin = os.path.join(self.tmp, 'origin.git')
         self.core = os.path.join(self.home, 'agent-core-kit')
@@ -760,6 +763,42 @@ class KitLayout(Fixture):
         rc, out, _ = self.catch_up('--quiet')
         self.assertEqual(rc, 3)
         self.assertRegex(out, r'^agent-core-kit: ~?/.*agent-core-kit is on feature, not main; not updated\.\n$')
+
+
+class NeverInstalled(Fixture):
+    """A clone the installer never ran for: the catch-up updates the files and leaves the first install to the user."""
+
+    def setUp(self):
+        super().setUp()
+        shutil.rmtree(os.path.join(self.home, '.claude'))
+
+    def test_an_update_does_not_run_the_installer_and_says_how_to_install(self):
+        new = self.push_update({'a.txt': 'a2\n'})
+        rc, out, status = self.catch_up()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.head(), new)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
+        self.assertIn('not synced: the kit is not installed for this user', out)
+        self.assertIn('install.sh', out)
+        self.assertNotIn('--sync', out)
+        self.assertEqual((status['outcome'], status['sync']), ('updated', 'skipped'))
+
+    def test_first_time_does_not_run_the_installer_either(self):
+        self.write(self.core, 'a.txt', 'mine\n')
+        new = self.push_update({'a.txt': 'a2\n'})
+        rc, out, status = self.catch_up('--first-time')
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.head(), new)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
+        self.assertIn('the kit is not installed for this user', out)
+        self.assertEqual(status['sync'], 'skipped')
+
+    def test_half_an_install_does_not_count(self):
+        self.write(self.installed_hooks, 'guard.py', '')  # guard.py without .core-dir, as the installer tests it
+        self.push_update({'a.txt': 'a2\n'})
+        rc, out, _ = self.catch_up()
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
 
 
 if __name__ == '__main__':
