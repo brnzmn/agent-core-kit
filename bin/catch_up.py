@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import filecmp
 import shlex
 import shutil
@@ -539,16 +540,22 @@ class Shield:
             signal.signal(sig, handler)
 
 
+def refuse_unfinished(repo):
+    """Stop a --first-time run while a merge, cherry-pick or revert is in progress, before anything is archived or moved:
+    the put-back's reset --hard would drop that state, and a fast-forward does not check for a revert."""
+    for name in ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'):
+        if repo.git('rev-parse', '-q', '--verify', name)[0] == 0:
+            raise Stop(5, 'error', 'agent-core-kit: %s has a merge, cherry-pick or revert in progress; finish or abort it '
+                       'first. Nothing was changed.' % tilde(repo.core), head=repo.git('rev-parse', 'HEAD')[1].strip())
+
+
 def first_time(repo, args, why):
     """Move a checkout that cannot fast-forward onto origin/main, archiving what it holds first."""
     old = repo.out('rev-parse', 'HEAD')
     if repo.out('ls-files', '-u'):
         raise Stop(5, 'error', 'agent-core-kit: %s has an unfinished merge; finish or abort it first. Nothing was changed.'
                    % tilde(repo.core))
-    for name in ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'):
-        if repo.git('rev-parse', '-q', '--verify', name)[0] == 0:  # the put-back's reset --hard would drop that state
-            raise Stop(5, 'error', 'agent-core-kit: %s has a merge, cherry-pick or revert in progress; finish or abort it '
-                       'first. Nothing was changed.' % tilde(repo.core))
+    refuse_unfinished(repo)
     files = tracked_changes(repo)
     in_head = [p for p in files if repo.git('cat-file', '-e', 'HEAD:' + p)[0] == 0]
     added = [p for p in files if p not in in_head]
@@ -630,12 +637,21 @@ def first_time_current(repo, args, result):
     return result
 
 
+def same_line(repo, earlier, head):
+    """True when head is the commit a pending sync was recorded for, or a commit made on top of it: the owner who
+    commits a held edit instead of discarding it must not lose the install."""
+    if not isinstance(earlier, str) or not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', earlier):
+        return False
+    return earlier == head or repo.git('merge-base', '--is-ancestor', earlier, head)[0] == 0
+
+
 def retry_pending_sync(repo, args, result):
     """A sync that failed, or was held back for uncommitted edits, stays pending until one succeeds. The next run finds
     HEAD equal to origin/main and would call it current, so the previous status decides: same head and a pending sync
     means the installed hooks and rules are still stale and the sync runs again, unless the checkout is still dirty."""
     prev = read_status(args.status_file) if args.status_file else {}
-    if prev.get('sync') not in ('failed', 'held') or prev.get('head') != result.get('head') or 'sync' in result:
+    if prev.get('sync') not in ('failed', 'held') or 'sync' in result \
+            or not same_line(repo, prev.get('head'), result.get('head')):
         return result
     if args.no_sync:
         result['sync'] = prev['sync']
@@ -684,6 +700,8 @@ def execute(args, core):
             saved[getattr(signal, name)] = signal.signal(getattr(signal, name), stop_on_signal)
     try:
         try:
+            if args.first_time:
+                refuse_unfinished(repo)
             result = classify_and_update(repo, args)
         except Stop as stop:
             if not (args.first_time and stop.outcome in ('blocked-dirty', 'blocked-diverged')):

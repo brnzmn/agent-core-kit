@@ -825,6 +825,49 @@ class UnfinishedOperations(Fixture):
                 os.unlink(marker)
 
 
+class UnfinishedOnTheFastForwardPath(Fixture):
+    def test_first_time_refuses_a_revert_in_progress_even_when_it_could_fast_forward(self):
+        self.push_update({'a.txt': 'a-up\n'})
+        old = self.head()
+        self.write(self.core, '.git/REVERT_HEAD', old + '\n')
+        rc, out, status = self.catch_up('--first-time')
+        self.assertEqual(rc, 5, out)
+        self.assertIn('has a merge, cherry-pick or revert in progress', out)
+        self.assertEqual((status['outcome'], status['head']), ('error', old))
+        self.assertEqual(self.head(), old)
+        self.assertEqual(self.git(self.core, 'rev-parse', '-q', '--verify', 'REVERT_HEAD'), old)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
+        os.unlink(os.path.join(self.core, '.git', 'REVERT_HEAD'))
+        rc, out, _ = self.catch_up()  # a background run is not held up by this check
+        self.assertEqual(rc, 0, out)
+
+
+class HeldThenCommitted(Fixture):
+    def test_a_held_install_runs_once_the_edit_is_committed_instead_of_discarded(self):
+        new = self.push_update({'a.txt': 'a2\n'})
+        self.write(self.core, 'b.txt', 'b-edited\n')
+        rc, out, status = self.catch_up(keep=True)
+        self.assertEqual((rc, status['sync'], self.head()), (4, 'held', new), out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
+        self.commit(self.core, 'keep my edit')
+        rc, out, status = self.catch_up(keep=True)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.read(self.home, 'sync-marker'), b'--sync\n')
+        self.assertEqual((status['outcome'], status['sync']), ('current', 'ok'))
+        os.unlink(os.path.join(self.home, 'sync-marker'))
+        rc, out, status = self.catch_up()  # done: nothing pending any more
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
+
+    def test_a_status_file_with_a_made_up_head_starts_no_install(self):
+        with open(self.status, 'w') as fh:
+            json.dump({'at': 1, 'outcome': 'updated', 'line': 'x', 'head': '--upload-pack=touch /tmp/x', 'sync': 'held'}, fh)
+        rc, out, status = self.catch_up(keep=True)
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, 'sync-marker')))
+        self.assertNotIn('sync', status)
+
+
 class Transport(Fixture):
     def test_the_owners_core_ssh_command_is_used_for_the_fetch(self):
         record = os.path.join(self.tmp, 'ssh-used')
