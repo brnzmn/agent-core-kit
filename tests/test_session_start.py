@@ -1,15 +1,18 @@
 """SessionStart: repo context (deploy targets, accounts, decisions) and the once-a-day notices."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import BIN, CORE, HOOKS, TEST_CONFIG, env_for, make_local  # noqa: E402
 
 sys.path.insert(0, HOOKS)
+import common  # noqa: E402
 import repo_context  # noqa: E402
 
 # Runs session_start in a process that believes it is on macOS (the iCloud check only fires there) and, when
@@ -273,6 +276,193 @@ class Notices(unittest.TestCase):
         write(home, '.claude/CLAUDE.md', built)
         with tempfile.TemporaryDirectory() as cwd:
             self.assertEqual(session_start(cwd, local, home=home), '')
+
+
+FAKE_CATCH_UP = (
+    'import os, sys, time\n'
+    'root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n'
+    'with open(os.path.join(root, "spawned"), "w") as fh:\n'
+    '    fh.write(" ".join(sys.argv[1:]))\n'
+    'time.sleep(3)\n')
+
+
+# session_start with every open() and Popen() recorded, to show what the hook does and does not touch
+TRACE_WRAPPER = '''
+import builtins, json, os, subprocess, sys
+sys.path.insert(0, %(hooks)r)
+opened, started = [], []
+real_open, real_popen = builtins.open, subprocess.Popen
+def traced_open(file, *a, **k):
+    opened.append(str(file))
+    return real_open(file, *a, **k)
+class TracedPopen(real_popen):
+    def __init__(self, args, *a, **k):
+        started.append([str(x) for x in args])
+        super().__init__(args, *a, **k)
+builtins.open, subprocess.Popen = traced_open, TracedPopen
+import session_start
+session_start.main()
+with real_open(os.environ['TRACE_LOG'], 'w') as fh:
+    json.dump([opened, started], fh)
+''' % {'hooks': HOOKS}
+
+
+class CatchUp(unittest.TestCase):
+    """The hook against a throwaway kit checkout (with a stand-in bin/catch_up.py), a throwaway local/ and HOME."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        self.core = os.path.join(self.tmp, 'kit')
+        self.home = os.path.join(self.tmp, 'home')
+        self.work = os.path.join(self.tmp, 'work')
+        for d in (self.home, self.work):
+            os.makedirs(d)
+        git_repo(self.core)
+        write(self.core, 'bin/catch_up.py', FAKE_CATCH_UP)
+        self.local = local_with_rulebook(dict(TEST_CONFIG, sync_on_start=True))
+        self.status = os.path.join(self.local, 'learning', '.catch_up.json')
+        self.spawned = os.path.join(self.core, 'spawned')
+
+    def start(self, **env):
+        full = dict(env_for(self.local, HOME=self.home), AGENT_CORE_DIR=self.core)
+        full.pop('AGENT_CORE_CATCH_UP', None)
+        full.update(env)
+        cmd = [sys.executable, '-c', TRACE_WRAPPER] if 'TRACE_LOG' in env else \
+            [sys.executable, os.path.join(HOOKS, 'session_start.py')]
+        began = time.time()
+        out = subprocess.run(cmd, input=json.dumps({'cwd': self.work}), capture_output=True, text=True, env=full,
+                             timeout=20)
+        self.elapsed = time.time() - began
+        assert out.returncode == 0 and not out.stderr, out.stderr
+        return out.stdout
+
+    def set_status(self, outcome, line='', age=0, **extra):
+        write(self.local, 'learning/.catch_up.json', json.dumps(dict(extra, at=time.time() - age, outcome=outcome,
+                                                                      line=line, head='abc')))
+
+    def forget_notices(self):
+        write(self.local, 'learning/.notice_state.json', '{}')
+
+    def set_config(self, **config):
+        write(self.local, 'config.json', json.dumps(dict(TEST_CONFIG, **config)))
+
+    def wait_for_spawn(self, seconds=5):
+        end = time.time() + seconds
+        while time.time() < end:
+            if os.path.exists(self.spawned):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_a_blocked_catch_up_is_reported_once_a_day(self):
+        line = 'agent-core-kit: ~/agent-core-kit is 2 commit(s) behind GitHub and has uncommitted edits in a.txt; not updated.'
+        self.set_status('blocked-dirty', line)
+        self.assertIn(line, self.start())
+        self.assertNotIn(line, self.start())
+        self.assertFalse(os.path.exists(self.spawned), 'a fresh result needs no new catch-up')
+
+    def test_other_branch_and_diverged_are_reported_and_a_current_one_is_not(self):
+        for outcome in ('other-branch', 'blocked-diverged', 'error'):
+            self.forget_notices()
+            self.set_status(outcome, 'agent-core-kit: %s line' % outcome)
+            self.assertIn('agent-core-kit: %s line' % outcome, self.start())
+        self.forget_notices()
+        self.set_status('current', 'agent-core-kit: ~/agent-core-kit is up to date.')
+        self.assertNotIn('up to date', self.start())
+
+    def test_a_failed_sync_after_an_update_asks_for_the_sync(self):
+        self.set_status('updated', 'agent-core-kit: updated a..b, sync failed', sync='failed')
+        out = self.start()
+        self.assertIn('install.sh --sync failed on %s' % self.core, out)
+        self.assertIn('bash %s --sync' % os.path.join(self.core, 'install.sh'), out)
+
+    def test_a_failed_sync_is_reported_whatever_the_outcome(self):
+        self.set_status('current', 'agent-core-kit: ~/agent-core-kit is up to date.', sync='failed')
+        self.assertIn('bash %s --sync' % os.path.join(self.core, 'install.sh'), self.start())
+
+    def test_a_long_status_line_is_cut_and_an_ignored_copy_notice_is_shown(self):
+        self.set_status('updated', 'agent-core-kit: updated a..b. ' + 'x' * 500, attention=True)
+        out = self.start()
+        self.assertIn('agent-core-kit: updated a..b. ', out)
+        self.assertNotIn('x' * 300, out)
+
+    def test_a_status_whose_time_is_not_a_finite_number_counts_as_missing(self):
+        write(self.local, 'learning/.catch_up.json', '{"at": NaN, "outcome": "current", "line": "", "head": "abc"}')
+        self.start()
+        self.assertTrue(self.wait_for_spawn(), 'a new catch-up should start')
+
+    def test_a_missing_status_file_starts_the_catch_up_without_waiting_for_it(self):
+        out = self.start()
+        self.assertTrue(self.wait_for_spawn(), 'catch_up.py was not started')
+        self.assertLess(self.elapsed, 2.5, 'the hook waited for the catch-up (it sleeps 3 s)')
+        with open(self.spawned) as fh:
+            args = fh.read()
+        self.assertIn('--quiet', args)
+        self.assertIn('--core ' + self.core, args)
+        self.assertIn('--status-file ' + self.status, args)
+        self.assertNotIn('agent-core notices', out)
+
+    def test_a_status_file_older_than_ten_minutes_starts_another(self):
+        self.set_status('current', age=11 * 60)
+        self.start()
+        self.assertTrue(self.wait_for_spawn())
+
+    def test_the_environment_switch_stops_the_catch_up(self):
+        self.set_status('blocked-dirty', 'agent-core-kit: blocked', age=11 * 60)
+        out = self.start(AGENT_CORE_CATCH_UP='0')
+        self.assertNotIn('blocked', out)
+        self.assertFalse(self.wait_for_spawn(1.5), 'a catch-up started although it is switched off')
+
+    def test_no_git_checkout_or_no_script_means_no_catch_up(self):
+        os.unlink(os.path.join(self.core, 'bin', 'catch_up.py'))
+        self.start()
+        self.assertFalse(self.wait_for_spawn(1))
+        write(self.core, 'bin/catch_up.py', FAKE_CATCH_UP)
+        shutil.rmtree(os.path.join(self.core, '.git'))
+        self.start()
+        self.assertFalse(self.wait_for_spawn(1))
+
+    def test_a_kit_without_a_local_folder_starts_nothing(self):
+        out = self.start(AGENT_CORE_LOCAL=os.path.join(self.tmp, 'no-local-yet'))
+        self.assertIn('not set up', out)
+        self.assertFalse(self.wait_for_spawn(1))
+
+    def traced_start(self):
+        """Run the hook with open() and Popen recorded: (paths opened, commands started)."""
+        log = os.path.join(self.tmp, 'trace.json')
+        out = self.start(TRACE_LOG=log, TRACE_WORK=self.work)
+        with open(log) as fh:
+            opened, started = json.load(fh)
+        return out, opened, started
+
+    def test_it_is_off_by_default_so_a_session_start_starts_no_catch_up_and_reads_no_status_file(self):
+        self.assertIs(common.DEFAULTS['sync_on_start'], False)
+        with open(os.path.join(CORE, 'config.example.json'), encoding='utf-8') as fh:
+            self.assertIs(json.load(fh)['sync_on_start'], False)
+        for config in (dict(TEST_CONFIG), dict(TEST_CONFIG, sync_on_start=False), dict(TEST_CONFIG, sync_on_start='true')):
+            write(self.local, 'config.json', json.dumps(config))
+            self.forget_notices()
+            self.set_status('blocked-dirty', 'agent-core-kit: blocked line', age=11 * 60, sync='failed')
+            out, opened, started = self.traced_start()
+            self.assertNotIn('blocked line', out)
+            self.assertNotIn('install.sh --sync failed', out)
+            self.assertEqual([p for p in opened if p.endswith('.catch_up.json')], [], config)
+            self.assertEqual(started, [], config)
+            self.assertFalse(os.path.exists(self.spawned), config)
+
+    def test_switched_on_the_same_trace_shows_the_status_read_and_the_start(self):
+        self.set_config(sync_on_start=True)
+        out, opened, started = self.traced_start()
+        self.assertEqual(len([p for p in opened if p.endswith('.catch_up.json')]), 1)
+        self.assertEqual(len(started), 1)
+        self.assertIn('catch_up.py', started[0][1])
+
+    def test_switching_it_on_in_config_starts_it(self):
+        self.set_config(sync_on_start=True)
+        self.start()
+        self.assertTrue(self.wait_for_spawn())
 
 
 class GitHook(unittest.TestCase):

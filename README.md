@@ -97,6 +97,7 @@ Some skills load on their own when the task matches: `explain-codebase`, `verify
 | `usage.py` | Claude and Codex plan usage in under 10 seconds, plus the routing call. A number it cannot read is reported as unknown, never guessed. |
 | `pr_review.py`, `claude-review.sh` | The two PR reviews and the read-only Claude review. |
 | `lane.sh` | Marks a worktree as one tool's lane. |
+| `catch_up.py` | Brings the kit checkout up to GitHub's `main` by fast-forward and runs `install.sh --sync`; session start runs it when `sync_on_start` is on, and `--first-time` reconciles a checkout that cannot fast-forward. |
 | `codex_scratch.py` | A throwaway Codex home for tests. Scratch runs count against your Codex plan. |
 | `build.py`, `git_hooks.py`, `precommit.py` | What `install.sh` drives: builds, installs, checks, and the instruction-file pre-commit hook. |
 
@@ -217,6 +218,7 @@ Hooks capture corrections in both tools without being asked. `/learn review` min
 | `protected_supabase` | `{}` | Supabase project ref mapped to a one-line note. Schema changes are denied unless they go through `scripts/deploy`. |
 | `gated_models` | `["fable"]` | Subagent models that need your yes. Claude Code asks you before spawning one, the `advisor` agent included. |
 | `stop_hook` | `true` | The Stop hook pushes back once when a turn ends by handing work to you. |
+| `sync_on_start` | `false` | Off by default. When `true`, a session start brings the kit checkout up to GitHub in the background and runs `install.sh --sync` (see Updating). |
 | `icloud_warning` | `true` | macOS: warn when a repo sits in iCloud-synced Desktop or Documents. |
 | `spend_limit_usd` | `5` | What an agent may spend per action without asking. Used in the messages. |
 | `permission_mode` | `""` | Claude's `defaultMode` to set: `auto`, `acceptEdits` or `bypassPermissions`. Empty leaves yours alone. |
@@ -242,6 +244,8 @@ bash install.sh --sync
 ```
 
 `--sync` rebuilds the generated files and copies the kit's agents, skills and hooks. It leaves your rulebook and config alone; it only updates `local/install-state.json` and, once, `local/.gitignore`. `bash install.sh --check` lists any drift between the kit and what is installed.
+
+To have this done for you, set `"sync_on_start": true` in `local/config.json`. A session start then brings the kit checkout up to GitHub in the background (fast-forward only) and runs `--sync`. When it cannot, the next session says one line with the reason. `python3 bin/catch_up.py --first-time` reconciles a checkout that has local edits or commits: it archives them under `backups/` and on a `backup/local-<time>` branch, moves the checkout to `main`, and prints the commands that bring them back (also saved in the backup's `REPORT.txt`). Your rulebook and config in `local/` are not touched; the catch-up writes only its own status file there. On a clone that was never installed it updates the files and leaves the first install to you.
 
 Codex files other than its `AGENTS.md` (agents, hooks, rules, the memories pin) are written only while no Codex process is running, and the desktop app counts. If Codex is open, `--sync` says which files are waiting; quit Codex and run it again. Codex asks you to trust changed hooks again in `/hooks`.
 
