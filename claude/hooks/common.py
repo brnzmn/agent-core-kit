@@ -65,6 +65,7 @@ DEFAULTS = {
     'protected_supabase': {},
     'gated_models': ['fable'],
     'stop_hook': True,
+    'sync_on_start': False,
     'icloud_warning': True,
     'spend_limit_usd': 5,
     'permission_mode': '',
