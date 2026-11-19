@@ -3337,8 +3337,9 @@ QUOTE_CHARS = ' \t\r\n"\'`\u201c\u201d\u2018\u2019'
 
 def owner_go_calls(toks, stripped):
     """[(words or None, readable)] for every --owner-go that follows a pr_review.py word in a simple command, whatever the
-    interpreter or its path; [] when the command is not one. readable is False for words the shell builds at run time."""
-    start = next((i for i, t in enumerate(toks) if os.path.basename(t) == 'pr_review.py'), None)
+    interpreter or its path, or the module name after python -m; [] when the command is not one. readable is False for
+    words the shell builds at run time."""
+    start = next((i for i, t in enumerate(toks) if os.path.basename(t) in ('pr_review.py', 'pr_review')), None)
     calls, i = [], (start + 1) if start is not None else len(toks)
     while i < len(toks):
         if toks[i] == '--owner-go':
@@ -3368,6 +3369,9 @@ def typed_text(content):
     if not isinstance(content, list) or any(isinstance(b, dict) and b.get('type') == 'tool_result' for b in content):
         return None
     return '\n'.join(str(b.get('text') or '') for b in content if isinstance(b, dict) and b.get('type') == 'text')
+
+
+TOOL_ECHO = re.compile(r'\s*<(?:bash-|local-command-|command-)')
 
 
 def human_origin(origin):
@@ -3412,8 +3416,8 @@ def claude_event_texts(ev, asked):
     text = typed_text(content)
     if text is None:
         return []
-    if 'origin' in ev:
-        return [text] if human_origin(ev['origin']) else []
+    if 'origin' in ev:  # the output of the user's own ! and / commands can be written under their name: not what they said
+        return [text] if human_origin(ev['origin']) and not TOOL_ECHO.match(text) else []
     # older Claude Code writes no origin: what is left of its non-typed entries starts like a tag, a bracket or feedback
     return [] if text.lstrip().startswith(('<', 'Stop hook feedback', '[')) else [text]
 
@@ -3470,12 +3474,25 @@ def codex_typed_texts(path):
 
 
 PUNCT = QUOTE_CHARS + '.!?;,:'
-OPENS_CLAUSE = re.compile(r'(?:^|[.!?;,:]\s)[\s"\'`]*$')
+CLAUSE_MARKS = '.!?;,:'
+SPACE_AND_QUOTES = ' "\'`'
 CLOSES_CLAUSE = re.compile(r'["\'`]*(?:$|[.!?;,:]+["\'`]*(?:\s|$))')
 # The user's own no or hold: words that hold one are never taken as an order without a tap. English only; add the words of
 # other languages the user writes in to this list.
 REFUSAL = re.compile(r"(?<!\w)(?:no|not|cannot|never|nor|stop|wait|hold|cancel|dont|doesnt|didnt|cant|wont|shouldnt|"
                      r"wouldnt|couldnt|isnt|arent|mustnt)(?!\w)|n't(?!\w)")
+WORD = re.compile(r'[^\W\d_]{4,}|\d+')
+COMMON_WORDS = frozenset(('that this with then have will just from your what when they them does done please also here '
+                          'there into some more were been than only about would could should after before still again').split())
+
+
+def opens_clause(line, start):
+    """True when the words that begin at start open a clause: between them and the start of the line, or a clause mark
+    followed by a space, lie only spaces and quotes. Reads backwards from start, so a long line costs nothing extra."""
+    i = start
+    while i and line[i - 1] in SPACE_AND_QUOTES:
+        i -= 1
+    return not i or (i < start and line[i - 1] in CLAUSE_MARKS and line[i] == ' ')
 
 
 def order_match(phrase, text):
@@ -3489,17 +3506,38 @@ def order_match(phrase, text):
     for line in text.splitlines():
         line = plain_text(line)
         for hit in found.finditer(line):
-            if OPENS_CLAUSE.search(line[:hit.start()]) and CLOSES_CLAUSE.match(line[hit.end():]):
+            if opens_clause(line, hit.start()) and CLOSES_CLAUSE.match(line, hit.end()):
                 return 'order'
             seen = 'fragment'
     return seen
 
 
+def said_words(text):
+    """The words of a text that can tie it to another: four letters or more and not among the commonest, and numbers."""
+    return set(WORD.findall(text)) - COMMON_WORDS
+
+
+def withdrawn(phrase, later):
+    """True when a message the user wrote after the order holds a no or a hold and shares a word or a number with the
+    quoted words: "wait, don't merge it yet" after "Yes, merge it.", "hold off on 7" after "merge PR 7". A withdrawal in
+    other words cannot be told from talk about something else, so it is not caught."""
+    words = said_words(phrase)
+    for n, text in enumerate(later):
+        if n % 50 == 0 and time_left() < 1.0:
+            raise TimeoutError('too much text to read in the time left')
+        plain = plain_text(text)
+        if REFUSAL.search(plain) and words & said_words(plain):
+            return True
+    return False
+
+
 def owner_order(words):
     """'order' when words are an order the user wrote or chose in this session, 'fragment' when they are only part of a
     sentence of theirs, None when they cannot be read as the user's order. The latest message that holds the words
-    decides, so a later "don't merge it yet" outranks an earlier "merge it". Short words ("yes", "go", "ok") answer some
-    question and carry no order of their own, and words that hold a no or a hold are never an order."""
+    decides, and a later message of the user's with a no about the same thing outranks an earlier order whatever the agent
+    quotes. A part of a sentence that holds a no is not sent back for a longer quote: it goes to the user. Short words
+    ("yes", "go", "ok") answer some question and carry no order of their own, and words that hold a no or a hold are
+    never an order."""
     phrase = plain_text(words.strip(QUOTE_CHARS)).strip(PUNCT)
     path = STATE['transcript']
     if len(phrase) < 5 and ' ' not in phrase or REFUSAL.search(phrase) or not isinstance(path, str) or not path:
@@ -3508,10 +3546,17 @@ def owner_order(words):
     if not os.path.isfile(path):  # a device or a pipe would be read until the time ran out
         return None
     texts = codex_typed_texts(path) if os.environ.get('AGENT_CORE_TOOL') == 'codex' else claude_typed_texts(path)
-    for text in reversed(texts):
-        match = order_match(phrase, text)
+    key = max(re.findall(r'\w+', phrase), key=len, default='')
+    for at in range(len(texts) - 1, -1, -1):
+        if at % 50 == 0 and time_left() < 1.0:
+            raise TimeoutError('too much text to read in the time left')
+        if key not in texts[at].casefold():
+            continue  # cheap: the longest word of the quote is not in this message at all
+        match = order_match(phrase, texts[at])
+        if match == 'order':
+            return None if withdrawn(phrase, texts[at + 1:]) else 'order'
         if match:
-            return match
+            return None if REFUSAL.search(plain_text(texts[at])) else 'fragment'
     return None
 
 
