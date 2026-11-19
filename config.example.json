@@ -7,6 +7,7 @@
   "gated_models": ["fable"],
   "stop_hook": true,
   "question_hook": true,
+  "sync_on_start": false,
   "icloud_warning": true,
   "spend_limit_usd": 5,
   "permission_mode": "",

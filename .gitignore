@@ -4,3 +4,5 @@
 __pycache__/
 *.pyc
 .DS_Store
+# archives made by bin/catch_up.py --first-time
+/backups/
