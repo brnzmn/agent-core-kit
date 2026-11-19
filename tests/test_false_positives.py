@@ -29,7 +29,10 @@ NOTE = TEST_CONFIG['protected_supabase'][REF]
 # keys that cannot be triggered by a bare command: they have tests of their own
 ELSEWHERE = {'review_wait': 'test_merge_gate', 'review_block': 'test_merge_gate', 'review_unread': 'test_merge_gate',
              'lane': 'test_lane', 'gated': 'GatedModels below',
-             'branch_unknown': 'test_guard_bypass'}
+             'branch_unknown': 'test_guard_bypass',
+             'owner_go_words': 'test_owner_go', 'owner_go_unverified': 'test_owner_go',
+             'owner_go_fragment': 'test_owner_go', 'deploy_push': 'test_deploy_push',
+             'deploy_push_chained': 'test_deploy_push'}
 REPO = '/work/project'  # a working folder that does not exist: relative paths are neither temp nor inside a repo
 
 

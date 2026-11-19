@@ -52,8 +52,10 @@
 |---|---|
 | Planning, orchestration, judgment calls, work {{USER}} steers | Claude |
 | New implementation lane | Claude; Codex when `python3 {{KIT}}/bin/usage.py` says Claude's week is past the routing threshold. A lane gets its own worktree, marked with `{{KIT}}/bin/lane.sh` |
-| PR into a deploy branch | `python3 {{KIT}}/bin/pr_review.py <pr> auto`; both review when available, or the configured outage fallback with one pass and passing tests; any blocking finding holds the merge |
+| PR into a deploy branch | `python3 {{KIT}}/bin/pr_review.py <pr> auto`; both vendors review when available, or only the one that did not write the PR when `pr_gate.required_reviews` is 1, or the configured outage fallback with one pass and passing tests; any blocking finding holds the merge |
 | Codex's own diff before it merges | Claude through `claude-review`, or the gate's configured outage fallback; unavailable is never a passing review |
+| A PR that still blocks after two review rounds | Only blocking findings are fixed during the rounds. Then fix what blocks and run `python3 {{KIT}}/bin/pr_review.py <pr> --close`: it runs the full tests, files the rest as one issue and merges. A third round runs only when {{USER}} asks for it |
+| {{USER}} orders a merge the gate holds | `python3 {{KIT}}/bin/pr_review.py <pr> --owner-go "<a whole sentence of theirs, word for word>"`, which records the order on the PR. A PR head is never pushed onto the deploy branch by hand |
 
 ## How to talk to {{USER}}
 - Lead with the outcome and the one next move, in plain language. Technical depth only where it changes a decision, or when the first move fails.

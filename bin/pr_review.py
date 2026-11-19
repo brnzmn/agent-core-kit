@@ -4,6 +4,10 @@
   pr_review.py <pr> codex [--adversarial]   Codex's review through the vendored plugin (read-only sandbox)
   pr_review.py <pr> claude                  Claude Opus, read-only (bin/claude-review.sh)
   pr_review.py <pr> auto                    both; one unavailable needs the other PASS and passing full tests
+                                            (pr_gate.required_reviews 1: only the vendor that did not write the PR,
+                                            by head branch, codex/ = Codex's; the other runs only if it is unavailable)
+  pr_review.py <pr> --owner-go "<words>"    the owner's merge order: records their words on the PR, merges that head
+  pr_review.py <pr> --close [--followups F] after round two still blocks: tests pass, follow-ups filed, merged
 
 <pr> is anything `gh pr view` accepts: a number, a URL or a branch. Run it from a checkout of the PR head, with gh
 signed in. The comment starts "## Codex review", "## Codex adversarial review" or "## Claude review", names the head
@@ -12,6 +16,11 @@ finding (the adversarial review blocks on a needs-attention verdict). Claude blo
 Anything in the review text that looks like a secret (tokens, keys, private key blocks, a value after token/secret/
 password/key =) is replaced by [REDACTED] before it is posted or printed, and the count is printed.
 Exit 0 pass, 1 block, 3 incomplete. Auto records the configured full test result; only passing tests can satisfy fallback.
+--owner-go and --close take --merge (default), --squash or --rebase, and exit 0 only once gh merged the PR. --owner-go
+runs no review and no tests: the guard hook checks that the words are a whole sentence or clause the owner wrote in the
+session.
+--close needs reviews of two heads, the latest a BLOCK on an older head, a clean checkout at the head, and passing
+full tests (pr_gate.test_commands); it files the leftovers as an issue, posts "## Agent-core review close", merges.
 """
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -283,7 +292,8 @@ def parse_args(argv):
 
 
 def metadata(pr):
-    out = sh([GH, 'pr', 'view', pr, '--json', 'number,baseRefName,baseRefOid,headRefOid,url'], timeout=60)
+    out = sh([GH, 'pr', 'view', pr, '--json', 'number,baseRefName,baseRefOid,headRefOid,headRefName,url'],
+             timeout=60)
     if out.returncode:
         raise ValueError('gh pr view failed: ' + out.stderr.strip())
     try:
@@ -310,17 +320,22 @@ def unchanged(pr, expected):
         raise ValueError('the PR head, base or repository changed during the run')
 
 
-def publish_body(pr, expected, body):
-    """Publish already prepared prose or an explicitly serialized record. Model text never chooses its path."""
-    unchanged(pr, expected)
+def comment_on(url, body):
+    """Post body as a comment on the PR at url; ValueError when gh refuses."""
     with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False) as fh:
         fh.write(body)
     try:
-        posted = sh([GH, 'pr', 'comment', expected['url'], '--body-file', fh.name], timeout=60)
+        posted = sh([GH, 'pr', 'comment', url, '--body-file', fh.name], timeout=60)
     finally:
         os.unlink(fh.name)
     if posted.returncode:
         raise ValueError('posting the comment failed: ' + posted.stderr.strip())
+
+
+def publish_body(pr, expected, body):
+    """Publish already prepared prose or an explicitly serialized record. Model text never chooses its path."""
+    unchanged(pr, expected)
+    comment_on(expected['url'], body)
     print(body)
 
 
@@ -341,6 +356,14 @@ def post_comment(pr, expected, body):
     body, count = redact_comment(body)
     print('pr_review: redacted %d secret-like string(s) before posting' % count)
     publish_body(pr, expected, body)
+
+
+def publish(url, body):
+    """Post body on the PR at url, redacted. The owner's order posts without publish_body's unchanged() check: it does
+    not depend on the checkout."""
+    body, count = redact_comment(body)
+    print('pr_review: redacted %d secret-like string(s) before posting' % count)
+    comment_on(url, body)
 
 
 def public_test_command(command):
@@ -491,7 +514,222 @@ def persisted_blockers(pr, meta):
 
 
 
+def required_first(base, head_ref):
+    """One-review policy: the vendor that did not write the PR reviews alone; the other runs only when it is unavailable."""
+    runners = {'Codex': lambda: codex_review(base, False), 'Claude': lambda: claude_review(base)}
+    required = common.required_reviewer(head_ref)
+    results = {required: runners[required]()}
+    fallback = (common.config().get('pr_gate') or {}).get('allow_single_on_unavailable') is True
+    if not results[required].verdict and results[required].unavailable and fallback:  # else it could not open the gate
+        other = 'Codex' if required == 'Claude' else 'Claude'
+        results[other] = runners[other]()
+    return results
+
+
+ENDING_METHODS = ('--merge', '--squash', '--rebase')
+MAX_WORDS = 500
+
+
+class Ending(NamedTuple):
+    kind: str  # 'owner-go' or 'close'
+    pr: str
+    words: Optional[str] = None
+    followups: Optional[str] = None
+    method: str = 'merge'
+
+
+def wants_ending(argv):
+    return any(a == '--close' or a == '--owner-go' or a.startswith('--owner-go=') for a in argv)
+
+
+def parse_ending(argv):
+    """The Ending the arguments ask for, or None when they are not valid. `--owner-go` takes the next argument whole,
+    whatever it starts with, and only that exact spelling counts: guard.py reads the same words before the command runs."""
+    pos, words, followups, methods, close, k = [], None, None, [], False, 0
+    while k < len(argv):
+        a = argv[k]
+        flag, joined, value = a.partition('=')
+        if flag in ('--owner-go', '--followups'):
+            if not joined:  # the value is the next argument, whatever it starts with
+                if k + 1 >= len(argv):
+                    return None
+                value, k = argv[k + 1], k + 1
+            if (words if flag == '--owner-go' else followups) is not None:
+                return None
+            words, followups = (value, followups) if flag == '--owner-go' else (words, value)
+        elif a == '--close':
+            close = True
+        elif a in ENDING_METHODS:
+            methods.append(a[2:])
+        elif a.startswith('-'):
+            return None
+        else:
+            pos.append(a)
+        k += 1
+    if len(pos) != 1 or len(methods) > 1 or close == (words is not None) or (followups is not None and not close):
+        return None
+    return Ending('close' if close else 'owner-go', pos[0], words, followups, methods[0] if methods else 'merge')
+
+
+def merge_pr(url, method, head):
+    """gh pr merge pinned to head, so a push after the checks cannot slip into the merge."""
+    out = sh([GH, 'pr', 'merge', url, '--' + method, '--match-head-commit', head], timeout=120)
+    if out.returncode:
+        raise ValueError('gh pr merge failed: ' + (out.stderr.strip() or out.stdout.strip() or 'no output'))
+
+
+def owner_go(pr, words, method):
+    """The owner's merge order: put their words on the PR, then merge that exact head. Whether the words are really the
+    owner's is checked by guard.py before this runs; nothing here looks at reviews, tests or check runs."""
+    words = words.strip()
+    if not words or len(words) > MAX_WORDS:
+        print("pr_review: --owner-go needs the owner's words, 1 to %d characters" % MAX_WORDS)
+        return 3
+    quoted, _ = redact(' '.join(words.split()))
+    try:
+        meta = metadata(pr)
+        head = meta['headRefOid']
+        record = {'head': head, 'base': meta['baseRefName'], 'base_oid': meta['baseRefOid']}
+        publish(meta['url'], '## Owner merge order\nhead: %s\n\n%s ordered this merge in the agent session:\n> %s\n\n'
+                'AGENT_CORE_OWNER_GO_V1: %s\n' % (head, common.user(), quoted, json.dumps(record, separators=(',', ':'))))
+        merge_pr(meta['url'], method, head)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print('pr_review: ' + diagnostic(str(exc)))
+        return 3
+    print("pr_review: merged PR #%d at %s on %s's order" % (meta['number'], head[:12], common.user()))
+    return 0
+
+
+def trusted_authors():
+    """Logins whose verdict comments count: pr_gate.reviewers, else the signed-in gh user (as persisted_blockers)."""
+    from guard import _listed
+    authors = {name.lstrip('@').lower() for name in _listed((common.config().get('pr_gate') or {}).get('reviewers'))}
+    if not authors:
+        login = sh([GH, 'api', 'user', '--jq', '.login'], timeout=60)
+        if login.returncode or not login.stdout.strip():
+            raise ValueError('could not verify the signed-in review author')
+        authors = {login.stdout.strip().lower()}
+    return authors
+
+
+def review_history(meta):
+    """[(reviewer, head, verdict, comment url)] for every trusted verdict comment on the PR, oldest first. The verdict is
+    read by guard.review_verdict, the same reader the merge gate uses; a comment of an automatic run is read under its own
+    run id, because this is the history of what was reviewed and not the question whether a run still counts."""
+    out = sh([GH, 'pr', 'view', meta['url'], '--json', 'comments,headRefOid,baseRefName,baseRefOid,number,url'], timeout=60)
+    if out.returncode:
+        raise ValueError('could not read the review history: ' + diagnostic(out.stderr.strip()))
+    try:
+        data = json.loads(out.stdout)
+        if (not isinstance(data, dict) or not isinstance(data.get('comments'), list)
+                or any(data.get(key) != meta[key] for key in ('headRefOid', 'baseRefName', 'baseRefOid'))):
+            raise ValueError()
+    except (TypeError, AttributeError, ValueError):
+        raise ValueError('the review history does not describe the current PR') from None
+    authors = trusted_authors()
+    from guard import review_verdict
+    found = []
+    for comment in data['comments']:
+        lines = str((comment or {}).get('body') or '').lstrip().splitlines()
+        title = re.fullmatch(r'## (Codex|Claude)(?: adversarial)? review', lines[0]) if lines else None
+        shaped = re.fullmatch(r'head: ([0-9a-f]{40})', lines[1]) if len(lines) > 1 else None
+        if not title or not shaped:
+            continue
+        run = re.fullmatch(r'run: ([0-9a-f-]+)', lines[2]) if len(lines) > 2 else None
+        verdict = review_verdict({'comments': [comment]}, title[1], shaped[1], authors, run_id=run[1] if run else None)
+        if verdict:
+            found.append((title[1], shaped[1], verdict, str(comment.get('url') or '')))
+    return found
+
+
+def follow_up_body(path, number, blocked, head, count, links):
+    """The issue text for the leftovers: the file's content, or a sentence on what happened and the review links."""
+    if path is not None:
+        try:
+            with open(os.path.expanduser(path), encoding='utf-8', errors='replace') as fh:
+                text = fh.read().strip()
+        except OSError as exc:
+            raise ValueError('cannot read the follow-ups file: %s' % exc.strerror) from None
+        if not text:
+            raise ValueError('the follow-ups file is empty')
+        text, _ = redact(text)
+        return text[:MAX_TEXT] + '\n'
+    lines = ['Round two of the review of PR #%d still blocked at %s. The blockers were fixed in %s and merged with %d '
+             'passing tests.' % (number, blocked[:12], head[:12], count), '']
+    lines += ['- ' + link for link in links] + ([''] if links else [])
+    lines.append('Anything in those reviews that was not fixed is tracked in this issue.')
+    return '\n'.join(lines) + '\n'
+
+
+def file_issue(slug, number, body):
+    """Open the follow-up issue and return its URL."""
+    with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False) as fh:
+        fh.write(body)
+    try:
+        out = sh([GH, 'issue', 'create', '-R', slug, '--title', 'Follow-ups from the review of PR #%d' % number,
+                  '--body-file', fh.name], timeout=60)
+    finally:
+        os.unlink(fh.name)
+    url = re.findall(r'https?://\S+/issues/[0-9]+', out.stdout)
+    if out.returncode or not url:
+        raise ValueError('filing the follow-up issue failed: ' + diagnostic(out.stderr.strip() or out.stdout.strip()))
+    return url[-1]
+
+
+def close_review(pr, followups, method):
+    """Merge after review round two still blocks, once what blocked is fixed and the full tests pass. Every check comes
+    before the first post, so a refusal leaves nothing on GitHub."""
+    try:
+        meta = metadata(pr)
+        unchanged(pr, meta)
+        head, url = meta['headRefOid'], meta['url']
+        slug = '/'.join(url.split('/')[3:5])
+        history = review_history(meta)
+        rounds = list(dict.fromkeys(entry[1] for entry in history))
+        if len(rounds) < 2:
+            raise ValueError('only %d head(s) carry a review verdict; --close is for after round two' % len(rounds))
+        if history[-1][2] != 'BLOCK' or history[-1][1] == head:
+            raise ValueError('the latest review verdict must be a BLOCK on an older head, with the fix pushed after it')
+        if any(verdict == 'BLOCK' for _, reviewed, verdict, _ in history if reviewed == head):
+            raise ValueError('the current head carries a BLOCK verdict')
+        blocked = history[-1][1]
+        command = common.review_test_command(slug)
+        if command is None:
+            raise ValueError('pr_gate.test_commands has no entry for ' + slug)
+        public_test_command(command)
+        links = [link for _, _, _, link in history if link]
+        follow_up_body(followups, meta['number'], blocked, head, 0, links)  # an unreadable file stops before the tests
+        tests = run_tests(command, slug, head)
+        if tests['status'] != 'PASS' or tests['count'] <= 0:
+            raise ValueError('the full tests did not pass (exit %s, %d counted)' % (tests['exit_code'], tests['count']))
+        unchanged(pr, meta)
+        issue = file_issue(slug, meta['number'], follow_up_body(followups, meta['number'], blocked, head,
+                                                                tests['count'], links))
+        record = {'head': head, 'base': meta['baseRefName'], 'base_oid': meta['baseRefOid'], 'blocked_head': blocked,
+                  'rounds': len(rounds), 'tests': tests, 'issue': issue}
+        encoded = json.dumps(record, separators=(',', ':'))
+        if redact(encoded)[1]:
+            raise ValueError('the close record contains credential-like data; remove it before publishing')
+        publish(url, '## Agent-core review close\nhead: %s\n\nRound two still blocked at %s. The blockers were fixed in '
+                'this head, the full tests pass (%d), and the rest is in %s.\n\nAGENT_CORE_REVIEW_CLOSE_V1: %s\n'
+                % (head, blocked[:12], tests['count'], issue, encoded))
+        merge_pr(url, method, head)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print('pr_review: ' + diagnostic(str(exc)))
+        return 3
+    print('pr_review: merged PR #%d at %s; follow-ups in %s' % (meta['number'], head[:12], issue))
+    return 0
+
+
 def main(argv):
+    if wants_ending(argv):
+        ending = parse_ending(argv)
+        if not ending:
+            print(__doc__)
+            return 3
+        if ending.kind == 'owner-go':
+            return owner_go(ending.pr, ending.words, ending.method)
+        return close_review(ending.pr, ending.followups, ending.method)
     args = parse_args(argv)
     if not args:
         print(__doc__)
@@ -523,7 +761,9 @@ def main(argv):
                        'base_oid': meta['baseRefOid'], 'status': 'RUNNING'}
             post_run(pr, meta, attempt)
         base = fetch_base(meta)
-        if who == 'auto':
+        if who == 'auto' and common.required_reviews() == 1:
+            results = required_first(base, meta.get('headRefName'))
+        elif who == 'auto':
             with ThreadPoolExecutor(max_workers=2) as pool:
                 futures = {'Codex': pool.submit(codex_review, base, False),
                            'Claude': pool.submit(claude_review, base)}

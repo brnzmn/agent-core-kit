@@ -79,7 +79,7 @@ The pre-commit hook is skipped, with a message, in repos whose hooks come from t
 | Split work across subagents | `/fanout` |
 | Create, list or retire a worktree safely | `/worktree` |
 | Get a read-only Claude review of a Codex diff | the `claude-review` skill, in Codex |
-| Review a PR, including provider outages | `python3 ~/agent-core-kit/bin/pr_review.py <pr> auto` (`claude`, `codex`, and `codex --adversarial` remain available) |
+| Review a PR, including provider outages | `python3 ~/agent-core-kit/bin/pr_review.py <pr> auto` (`claude`, `codex`, and `codex --adversarial` remain available). To merge on your order when the gate holds the PR: `... <pr> --owner-go "<your words>"`. To merge after review round two still blocks and the blockers are fixed: `... <pr> --close` |
 | See plan usage and where new lanes should go | `python3 ~/agent-core-kit/bin/usage.py` |
 | Redo the first-run interview | `/setup` |
 | Compare what is installed with the kit | `bash ~/agent-core-kit/install.sh --check` |
@@ -95,7 +95,7 @@ Some skills load on their own when the task matches: `explain-codebase`, `verify
 | `lint.py` | Checks instruction files against their line budgets and flags log sections, stale paths and shouting. |
 | `learn.py`, `apply.py` | The learning loop: capture, mine, bundle, and apply approved proposals. |
 | `usage.py` | Claude and Codex plan usage in under 10 seconds, plus the routing call. A number it cannot read is reported as unknown, never guessed. |
-| `pr_review.py`, `claude-review.sh` | The two PR reviews and the read-only Claude review. |
+| `pr_review.py`, `claude-review.sh` | The two PR reviews, the read-only Claude review, the merge on your order (`--owner-go`), and the close after two blocked rounds (`--close`). |
 | `lane.sh` | Marks a worktree as one tool's lane. |
 | `catch_up.py` | Brings the kit checkout up to GitHub's `main` by fast-forward and runs `install.sh --sync`; session start runs it when `sync_on_start` is on, and `--first-time` reconciles a checkout that cannot fast-forward. |
 | `codex_scratch.py` | A throwaway Codex home for tests. Scratch runs count against your Codex plan. |
@@ -123,6 +123,14 @@ Subagents without a pinned model run on Sonnet. When a model refuses or a task k
 - **Claude orchestrates.** Planning, delegation, judgment calls and work you steer stay in Claude Code.
 - **Codex is the second opinion and the overflow lane.** New implementation lanes go to Claude until `bin/usage.py` reports Claude's weekly usage past `routing.claude_week_limit_pct` (80 by default). Past that, new lanes go to Codex. If both are past it, running lanes finish and no new ones start.
 - **The review gate covers deploy branches.** `pr_review.py <pr> auto` attempts both providers on the exact PR head. Both must pass when available. If `pr_gate.allow_single_on_unavailable` is enabled, a confirmed quota, authentication, service or missing-CLI outage may use one real PASS plus a passing configured full test suite. Claude runs with `--output-format json`: typed API status fields classify quota, authentication and service outages. A bad model or request, a budget or turn limit, and a completed result hold the gate. For older Claude CLIs and CLI-built errors without an API status, only a short diagnostic (at most 500 characters) may establish an outage; a long partial review cannot. Codex requires typed provider error codes. A missing CLI is checked independently. A BLOCK always holds the merge. Both unavailable, malformed results, timeouts, failed tests or stale evidence hold it too. Only your signed-in gh user or `pr_gate.reviewers` may publish counted evidence; only `pr_review.py` posts it. A new commit needs fresh reviews and tests. Codex bot reviews cannot supply the outage fallback. Once an automatic run starts, its latest completed result controls the gate. Failed or interrupted automatic runs require a fresh successful `auto` run; manual verdict comments cannot reuse an older automatic success.
+
+`pr_gate.required_reviews: 1` selects one review per PR, by the vendor that did not write it. A head branch that starts with `codex/` is Codex's, so Claude reviews it; any other head branch gets Codex. The merge gate then wants a PASS from that reviewer only, and a PASS from the other vendor never opens it. `auto` runs only the required reviewer. It runs the other one only when the required one is unavailable and `pr_gate.allow_single_on_unavailable` is on, and then the usual fallback applies: a real PASS plus passing full tests. Codex's GitHub app does not count as the one review. Any other value of the key, or none, keeps both reviews.
+
+`pr_review.py <pr> --owner-go "<words>"` is for the moment you order a merge the gate holds. It posts your words on the PR as "Owner merge order" and merges that head with `--match-head-commit`, without a review or tests. The guard lets it run only when the words are a whole sentence or clause of a message you typed in the session, or a button you tapped, and hold no "no" or hold. It reads the session transcript for that, so tool output, hook feedback, task notifications and the agent's own text never count. A later message of yours with a no or a hold about the same thing outranks the order. A part of a sentence is sent back to the agent to quote in full; anything else it cannot read as your order makes Claude Code ask you, and Codex is denied.
+
+`pr_review.py <pr> --close` is for after review round two still blocks and the blockers are fixed, when a third paid round is not worth it. It needs reviews of two different heads, the latest a BLOCK on an older head; a clean checkout at the current head with no BLOCK on it; and a passing full test run from `pr_gate.test_commands`. Then it files the leftovers as one issue (the text of `--followups FILE`, or a generated list of the review links), posts "Agent-core review close" and merges that head. A missing condition stops it before anything is posted.
+
+A plain `git push` that would put the head of an open PR onto a gated branch is denied, because it skips the gate and leaves no record of an order. The check lists the open PRs into that branch with one `gh api` call and compares their heads with the commit being pushed; it looks at where each refspec points, at the current branch when none is named, at `--all`, and at a saved upstream. A push that follows a merge, pull or rebase in the same command has to run on its own. The repository must be covered by `pr_gate.repos`. If GitHub does not answer in time, the push goes through as before.
 
 Invoke the installed review runner from the PR checkout. Fallback tests run offline in a disposable
 Docker container. Build the worker once from a trusted checkout: `docker build -t agent-core-review-tests:1 tools/review-tests`. Keep the local Docker engine
@@ -156,7 +164,7 @@ PR head -> Claude + Codex reviews -> both PASS -> merge
 
 ## The guard hook
 
-A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs, `sudo` and `env` wrappers) and denies the dangerous ones, including commands hidden in `eval`, `$( )`, backticks, pipes into `sh` and heredocs fed to a shell. Each denial names the alternative. It asks only for gated models; everything else is a plain deny, so bypass mode does not stall on it. The same policy runs in Codex through its hooks, with a rules file as a second layer for unconditional Git denials. The hook checks complete staging paths and permits named staging such as `git add -A src/file.py`.
+A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs, `sudo` and `env` wrappers) and denies the dangerous ones, including commands hidden in `eval`, `$( )`, backticks, pipes into `sh` and heredocs fed to a shell. Each denial names the alternative. It asks for gated models and for a merge order it cannot tie to your words (below); everything else is a plain deny, so bypass mode does not stall on it. The same policy runs in Codex through its hooks, with a rules file as a second layer for unconditional Git denials. The hook checks complete staging paths and permits named staging such as `git add -A src/file.py`.
 
 | Blocked | Use instead |
 |---|---|
@@ -174,6 +182,8 @@ A PreToolUse hook parses every shell command (quotes, pipes, `bash -c`, heredocs
 | Schema changes to a `protected_supabase` project outside `scripts/deploy` | Use the repo's deploy script. |
 | Applying learning proposals directly | Leave them for the user and say how many wait. |
 | Spawning a subagent on a model in `gated_models` | Not denied: Claude Code asks you first. |
+| `pr_review.py --owner-go` with words you did not write in the session | Not denied in Claude Code: it asks you first. Codex cannot ask, so it is denied. Words that are only part of your sentence are denied with a request to quote the whole of it. |
+| A plain `git push` that puts the head of an open PR onto a branch in `pr_gate.branches` | Merge it with `gh pr merge <pr>` once the review passes, or on your order with `pr_review.py <pr> --owner-go "<your words>"`. |
 | `gh pr merge` without required reviews or outage/test evidence, merging through `gh api` | Run `pr_review.py <pr> auto`, read its results, then `gh pr merge`. |
 | Committing in a worktree whose `.agent-lane` names the other tool | Leave the change uncommitted and write a handoff note. |
 
@@ -230,6 +240,7 @@ Hooks capture corrections in both tools without being asked. `/learn review` min
 | `pr_gate.reviewers` | `[]` | GitHub logins whose verdict comments count. Empty means your signed-in gh user. |
 | `pr_gate.trust_codex_bot` | `false` | Count a review by Codex's GitHub app on the head commit as the Codex verdict. |
 | `pr_gate.allow_single_on_unavailable` | `false` | Allow one real PASS plus passing full tests when the other provider is confirmed unavailable. A BLOCK still holds. |
+| `pr_gate.required_reviews` | `2` | `2` wants a PASS from both Claude and Codex. `1` wants one, from the vendor that did not write the PR: a head branch that starts with `codex/` is reviewed by Claude, any other by Codex. Any other value keeps `2`. |
 | `pr_gate.test_commands` | `{}` | GitHub repo name to full test command argument array, for example `{"acme/shop": ["python3", "-m", "unittest", "discover", "-s", "tests"]}`. Required for the outage fallback. |
 | `routing.claude_week_limit_pct` | `80` | Past this share of Claude's weekly limit, new lanes go to Codex. |
 | `codex.models` | `{}` | Role (`explorer`, `worker`, `verifier`, `reviewer`, or the Claude names `Explore`, `worker`, `verifier`, `reviewer`) to Codex model name. Empty means no model line, so Codex uses its default. |

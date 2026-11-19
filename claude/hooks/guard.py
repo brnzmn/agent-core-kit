@@ -19,8 +19,11 @@ Supabase projects listed in config protected_supabase outside the repo's scripts
 proposals directly, a shell that runs a script it cannot be shown (a pipe from anything but echo/printf/cat), and
 merging a PR into a gated branch before its review gate passes. A documented provider outage can use
 one real passing review plus passing tests on the same head when config pr_gate enables that fallback.
-The one decision that is not a deny: spawning a subagent on a model listed in config gated_models (and the advisor
-agent) returns "ask", so Claude Code prompts the user; that prompt also appears in bypass mode.
+Two decisions are not a deny. Spawning a subagent on a model listed in config gated_models (and the advisor agent)
+returns "ask", so Claude Code prompts the user; that prompt also appears in bypass mode. So does bin/pr_review.py
+--owner-go, which merges past the review gate on the owner's order, when the words it quotes are not an order the user
+wrote in this session's transcript (a Codex session cannot ask, so there it is a deny). A plain push that puts the
+head of an open PR onto a gated branch is denied: the PR merges through gh pr merge or on the owner's order.
 Prints a decision as JSON, or nothing to let the call through.
 Its own errors deny the call and go to learning/hook-errors.log.
 """
@@ -35,6 +38,7 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common  # noqa: E402
@@ -92,7 +96,7 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'status', 'stripspace', 'submodule', 'subtree', 'switch', 'symbolic-ref', 'tag', 'update-index', 'update-ref',
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'cwd_candidates': None, 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(),
+STATE = {'transcript': None, 'pulls_down': False, 'owner_go_ask': None, 'advances': False, 'cwd': '', 'cwd_candidates': None, 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(),
          'pipe': [], 'sep': ';', 'plain': False, 'deferred_body': False, 'body_file_unstable': False,
          'raw': [], 'moved': False, 'envcfg': [], 'inherit': [], 'penv': {}, 'pinherit': {}, 'xargs': False,
          'marks': {'active': set(), 'unquoted': set(), 'braced': set()}}  # cwd None = unknown; raw = the command's tokens before $VAR expansion
@@ -135,6 +139,7 @@ WORKTREE = re.compile(r'(^|/)([^/]*-wt(/[^/]+)?|\.claude/worktrees(/[^/]+)?|[^/]
 PLAIN_WORD = (r"(?:[A-Za-z0-9._\-/~+@:,]|'[A-Za-z0-9._\-/~+@:, ]*'|\"[A-Za-z0-9._\-/~+@:, ]*\")+")
 PLAIN_TAIL = re.compile(r'^(?:\s+' + PLAIN_WORD + r')+\s*$')  # what may follow `rm -rf` when it is rewritten
 GH_TIMEOUT = 8  # seconds per gh call; the hook is killed at 10 and a killed hook lets the merge through
+PUSH_GH_TIMEOUT = 3  # seconds for the open-PR list a plain push to a gated branch checks; slower is no answer
 GH_BUDGET = 7.0  # seconds from start for all gh calls together; leaves room for startup and the kill below
 
 
@@ -148,6 +153,14 @@ def analysis_remaining():
     if left <= 0:
         raise AnalysisExpired()
     return left
+
+
+def time_left():
+    """Seconds of the hook's analysis budget left, 0 once it is spent (callers here step aside instead of expiring)."""
+    try:
+        return analysis_remaining()
+    except AnalysisExpired:
+        return 0
 
 
 def analysis_alarm(signum, frame):
@@ -382,6 +395,23 @@ MSG = {
     'review_unread': 'gh pr merge is held: reviews of the PR\'s current head and base commit could not be read (%s). Retry once gh works; a base change requires fresh automatic reviews.',
     'api_merge': ('gh api cannot merge a PR around the review gate (pr_gate in config). Merge with gh pr merge <number>, '
                   'which checks the review and provider-outage evidence.'),
+    'owner_go_words': ('pr_review.py --owner-go merges past the review gate on ' + USER_S + ' order, so it needs the words '
+                       'of ' + USER_S + ' message as one literal quoted argument, not a variable or a substitution. Quote '
+                       'the message exactly as written.'),
+    'owner_go_unverified': ('pr_review.py --owner-go merges past the review gate on ' + _esc(USER_S) + ' order, and these '
+                            'words could not be read as ' + _esc(USER_S) + ' order from this session: "%s". They are not in '
+                            'a message ' + _esc(USER) + ' wrote here, or they hold a no or a hold, or they are a one-word '
+                            'answer. Allowing this is ' + _esc(USER_S) + ' call: it merges the PR without the review.'),
+    'owner_go_fragment': ('pr_review.py --owner-go records ' + _esc(USER_S) + ' order on the PR, and these words are only '
+                          'part of a sentence ' + _esc(USER) + ' wrote: "%s". A part can leave out a condition or a no. '
+                          'Quote the sentence from its first word to its last (up to a comma or full stop), or the whole '
+                          'message, word for word.'),
+    'deploy_push': ('This push puts the head of open PR #%s onto %s, a gated branch of %s, without the review gate. Merge '
+                    'it with gh pr merge %s once the review passes, or on ' + _esc(USER_S) + ' order with ' +
+                    _esc(PR_REVIEW) + ' %s --owner-go "<a whole sentence of theirs, word for word>".'),
+    'deploy_push_chained': ('An earlier part of this command moves branches, and this push then sends %s, a gated branch of '
+                            '%s that has open PR #%s, so the guard cannot see which commit it puts there. Run the push in '
+                            'its own call, or merge the PR with gh pr merge %s once the review passes.'),
     'lane': ('This worktree\'s .agent-lane names the other tool, which owns its commits. Leave your change '
              'uncommitted and write a handoff note (handoff skill), or work in a worktree of your own.'),
     'rm': ('Recursive delete goes to the trash. Run it as its own command: ' + TRASH + ' <paths> '
@@ -1100,16 +1130,16 @@ def gate_covers(slug, branch):
     return slug.lower() in [r.lower() for r in _listed(repos)]
 
 
-def gh_run(argv):
-    """Run gh with a hard timeout (GH_TIMEOUT, and GH_BUDGET for all calls of this hook run) and kill its whole process
-    group on expiry. The hook itself is killed at its own timeout, and a killed hook lets the merge through."""
+def gh_run(argv, cap=None):
+    """Run gh with a hard timeout (cap, at most GH_TIMEOUT, and GH_BUDGET for all calls of this hook run) and kill its whole
+    process group on expiry. The hook itself is killed at its own timeout, and a killed hook lets the merge through."""
     left = min(GH_BUDGET - (time.monotonic() - START), analysis_remaining())
     if left < 0.5:
         raise subprocess.TimeoutExpired(argv, 0)
     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             cwd=STATE['cwd'] or None, start_new_session=True)
     try:
-        out, err = proc.communicate(timeout=min(GH_TIMEOUT, left))
+        out, err = proc.communicate(timeout=min(GH_TIMEOUT if cap is None else min(cap, GH_TIMEOUT), left))
     except (subprocess.TimeoutExpired, AnalysisExpired):
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -1250,9 +1280,29 @@ def latest_automatic_run(pr, head, authors):
     return latest
 
 
-def automatic_run_passes(pr, attempt, head, authors, gate, command):
+def single_run_passes(pr, attempt, head, authors, gate, command, required):
+    """The one-review policy: the required reviewer's PASS in this run, or its confirmed outage with the other vendor's
+    PASS and passing full tests. The other provider's entry does not matter otherwise (a BLOCK was denied earlier)."""
+    providers = attempt.get('providers')
+    if not isinstance(providers, dict) or not providers or not set(providers) <= {'Claude', 'Codex'}:
+        return False
+    other = 'Codex' if required == 'Claude' else 'Claude'
+    if providers.get(required) == 'PASS':
+        return review_verdict(pr, required, head, authors, run_id=attempt['run_id']) == 'PASS'
+    reasons = attempt.get('reasons')
+    return (providers.get(required) == 'UNAVAILABLE' and providers.get(other) == 'PASS'
+            and review_verdict(pr, other, head, authors, run_id=attempt['run_id']) == 'PASS'
+            and gate.get('allow_single_on_unavailable') is True
+            and isinstance(reasons, dict) and reasons.get(required) in ('quota', 'auth', 'service', 'missing_cli')
+            and passing_test_receipt(attempt.get('tests'), command))
+
+
+def automatic_run_passes(pr, attempt, head, authors, gate, command, required=None):
+    """required is the one reviewer the one-review policy wants (None: both providers, the default policy)."""
     if attempt.get('status') != 'PASS':
         return False
+    if required:
+        return single_run_passes(pr, attempt, head, authors, gate, command, required)
     providers = attempt.get('providers')
     if not isinstance(providers, dict) or set(providers) != {'Claude', 'Codex'}:
         return False
@@ -1299,6 +1349,7 @@ def outage_tests_pass(pr, provider, head, authors, command):
 
 def merge_decision(args, repo=()):
     """Both providers pass, or one real provider passes with verified outage/test evidence. A BLOCK always holds.
+    Under pr_gate.required_reviews 1 only the vendor that did not write the PR must pass.
     The gate off, other branches and repos not listed pass."""
     if not gate_branches():
         return None
@@ -1328,7 +1379,7 @@ def merge_decision(args, repo=()):
     gh = os.environ.get('AGENT_CORE_GH') or 'gh'
     try:
         out = gh_run([gh, 'pr', 'view'] + sel[:1] + repo + ['--json', 'number,url,baseRefName,baseRefOid,headRefOid,'
-                                                                      'comments,reviews'])
+                                                                      'headRefName,comments,reviews'])
         if out.returncode:
             return 'deny', MSG['review_unread'] % (out.stderr.strip()[:200] or 'gh failed')
         pr = json.loads(out.stdout)
@@ -1353,11 +1404,24 @@ def merge_decision(args, repo=()):
     if availability and (not attempt or availability[1] > attempt[1]) and (
             not availability[0] or not passing_test_receipt(availability[0].get('tests'), command)):
         return 'deny', 'The latest automatic review tests failed or are unverified for the current head, base branch and base commit. Run pr_review.py with auto again.'
+    required = common.required_reviewer(pr.get('headRefName')) if common.required_reviews() == 1 else None
     if attempt:
-        if automatic_run_passes(pr, attempt[0], head, authors, gate, command):
+        if automatic_run_passes(pr, attempt[0], head, authors, gate, command, required):
             return None
         return 'deny', 'The latest automatic review run is not a verified pass for the current head, base branch and base commit. Run pr_review.py with auto again.'
     verdicts = {who: review_verdict(pr, who, head, authors, trust, legacy_only=True) for who in ('Claude', 'Codex')}
+    if required:
+        # The one review must be a real one: Codex's GitHub app (trust_codex_bot) never stands in for it by itself.
+        real = review_verdict(pr, required, head, authors, legacy_only=True)
+        if real == 'PASS':
+            return None
+        other = 'Codex' if required == 'Claude' else 'Claude'
+        # A bot comment counted by the legacy two-provider policy is not a real fallback review.
+        if (not real and gate.get('allow_single_on_unavailable') is True
+                and review_verdict(pr, other, head, authors, legacy_only=True) == 'PASS'
+                and outage_tests_pass(pr, required, head, authors, command)):
+            return None
+        return 'deny', MSG['review_wait'] % (pr.get('number'), branch, slug, head[:12], required, pr.get('number'))
     missing = [who for who, v in verdicts.items() if not v]
     if missing:
         if len(missing) == 1 and gate.get('allow_single_on_unavailable') is True:
@@ -2029,6 +2093,140 @@ def raw_words(args, rest, ref):
     return [w for w, a in zip(raw[1 + len(args) - len(rest):], rest) if a == ref]
 
 
+GITHUB_REMOTE = re.compile(r'(?:https?://(?:[^/@\s]+@)?|ssh://(?:[^/@\s]+@)?|[^/@\s:]+@)github\.com[:/]'
+                           r'([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?')
+
+
+def probe_git(where, *argv):
+    """(exit code, stdout) of a git call in where, or None when it cannot run. Capped at 2 seconds and at the hook's
+    analysis budget, so a slow disk narrows what the guard checks instead of expiring the whole hook."""
+    left = time_left()
+    if left < 0.5:
+        return None
+    try:
+        out = subprocess.run(['git', '-C', where] + list(argv), capture_output=True, text=True,
+                             timeout=min(2, left - 0.3))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.returncode, out.stdout.strip()
+
+
+ADVANCING = {'merge', 'pull', 'rebase', 'cherry-pick', 'am', 'fetch', 'reset', 'update-ref'}
+
+
+def saved_refspecs(where, remote, deploy, current):
+    """The refspecs git uses for a push that names none: remote.<name>.push, else the upstream branch under
+    push.default=upstream, every branch under push.default=matching, else the current branch."""
+    if not GITHUB_REMOTE.fullmatch(remote) and re.fullmatch(r'[\w.-]+', remote):
+        got = probe_git(where, 'config', '--get-all', 'remote.%s.push' % remote)
+        if got and got[0] == 0 and got[1]:
+            return got[1].splitlines()
+    mode = probe_git(where, 'config', '--get', 'push.default')
+    mode = mode[1] if mode and mode[0] == 0 else ''
+    if mode == 'matching':
+        return ['refs/heads/' + deploy]
+    if mode in ('upstream', 'tracking') and current:
+        got = probe_git(where, 'config', '--get', 'branch.%s.merge' % current)
+        if got and got[0] == 0 and got[1]:
+            return ['HEAD:' + got[1]]
+    return ['HEAD']
+
+
+def pushed_tips(where, remote, refs, every, deploy):
+    """(whether a push of refs reaches branch deploy, the commits it would put there). Every refspec whose destination is
+    deploy counts; HEAD, @ and a missing refspec mean the current branch, and every means all local branches. Unreadable
+    refspecs (variables, globs) are left out."""
+    current = current_branch(where)
+    refs = list(refs) if refs else saved_refspecs(where, remote, deploy, current)
+    if every:
+        refs.append('refs/heads/' + deploy)
+    hit, tips = False, []
+    for ref in refs:
+        src, sep, dst = ref.lstrip('+').partition(':')
+        if re.search(r'[$`*?\[]', ref) or (sep and not src):
+            continue
+        if src in ('HEAD', '@') and not sep:
+            if STATE['moved'] == 'main' and deploy in ('main', 'master'):
+                dst = src = 'refs/heads/' + deploy  # an earlier part of this command checks out main
+            elif STATE['moved']:
+                continue  # HEAD is not what the push will see
+            else:
+                dst, src = current, 'HEAD'
+        elif not sep:
+            dst = src
+        if (dst or '').removeprefix('refs/heads/') != deploy:
+            continue
+        hit = True
+        got = probe_git(where, 'rev-parse', '--verify', '--quiet', src + '^{commit}')
+        if got and got[0] == 0 and re.fullmatch(r'[0-9a-f]{40}', got[1]):
+            tips.append(got[1])
+    return hit, tips
+
+
+def open_pulls(slug, deploy):
+    """The open PRs into deploy as a list, or None when GitHub does not answer in time or answers something else."""
+    cap = min(PUSH_GH_TIMEOUT, time_left() - 2.0)  # a slow GitHub must leave the hook time to answer
+    if cap < 0.5 or STATE['pulls_down']:
+        return None
+    try:
+        out = gh_run([os.environ.get('AGENT_CORE_GH') or 'gh', 'api',
+                      'repos/%s/pulls?state=open&base=%s&per_page=100' % (slug, quote(deploy, safe=''))], cap)
+        prs = json.loads(out.stdout) if out.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        STATE['pulls_down'] = True  # later pushes of this command do not wait for it again
+        return None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return prs if isinstance(prs, list) else None
+
+
+def deploy_push(where, positional, long_flags):
+    """(PR number, gated branch, repo, chained) when a push that passed every other rule puts the head of an open PR onto
+    a branch the PR gate covers: merging goes through gh pr merge, which asks the review gate, or through the owner's
+    order. chained is True when an earlier part of the command moves branches, so the commit the push sends is not the
+    one on disk now; the push must then run in its own call. None when the gate is off, the remote is not a repo the gate
+    covers or anything cannot be read: this narrows a push that was always allowed, so a slow GitHub or a missing remote
+    never holds it."""
+    if not gate_branches() or STATE['cwd'] is None or '--repo' in long_flags:
+        return None
+    remote = positional[0] if positional else 'origin'
+    url = remote
+    if not GITHUB_REMOTE.fullmatch(remote):
+        got = probe_git(where, 'remote', 'get-url', remote)
+        url = got[1] if got and got[0] == 0 else ''
+    found = GITHUB_REMOTE.fullmatch(url)
+    if not found:
+        return None
+    slug = '%s/%s' % found.groups()
+    for deploy in gate_branches():
+        if not gate_covers(slug, deploy):
+            continue
+        hit, tips = pushed_tips(where, remote, positional[1:], bool(long_flags & {'--all', '--branches'}), deploy)
+        chained = STATE['advances']
+        if not tips and not (hit and chained):
+            continue
+        prs = open_pulls(slug, deploy)
+        tracking = 'refs/remotes/%s/%s' % (remote, deploy)
+        for pr in prs or []:
+            head = pr.get('head') if isinstance(pr, dict) else None
+            head = head.get('sha') if isinstance(head, dict) else None  # an entry GitHub shaped oddly holds nothing
+            if not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head) or type(pr.get('number')) is not int:
+                continue
+            local = probe_git(where, 'cat-file', '-e', head + '^{commit}')
+            if hit and chained:
+                merged = probe_git(where, 'merge-base', '--is-ancestor', head, tracking) if local and local[0] == 0 else None
+                if not (merged and merged[0] == 0):
+                    return str(pr['number']), deploy, slug, True
+            for tip in tips:
+                if head == tip:
+                    return str(pr['number']), deploy, slug, False
+                below = probe_git(where, 'merge-base', '--is-ancestor', head, tip) if local and local[0] == 0 else None
+                merged = probe_git(where, 'merge-base', '--is-ancestor', head, tracking) if below and below[0] == 0 else None
+                if below and below[0] == 0 and merged and merged[0] != 0:
+                    return str(pr['number']), deploy, slug, False
+    return None
+
+
 def git_decision(args):
     args, _ = split_redirects(args)
     STATE['raw'], _ = split_redirects(STATE['raw'])
@@ -2038,6 +2236,8 @@ def git_decision(args):
     where, sub, rest, config = head
     tree = git_tree(args[:len(args) - len(rest) - 1], where)
     note_move(sub, rest, config, where)
+    if sub in ADVANCING or (sub == 'branch' and any(a in ('-f', '-F', '--force') for a in rest)):
+        STATE['advances'] = True  # a later push in this command sends a commit the hook cannot read from the repo yet
     if sub not in GIT_KNOWN and any(c.lower().startswith('alias.') for c in config):
         return 'deny', MSG['alias']  # the alias is what runs, and it is not readable here
     if sub in LANE_SUBS:
@@ -2118,6 +2318,12 @@ def git_decision(args):
             return 'deny', MSG['delete_remote']
         if '--mirror' in l:
             return 'deny', MSG['mirror']
+        if not ('n' in s or '--dry-run' in l) and tree is None:
+            hit = deploy_push(where, p, l)
+            if hit and hit[3]:
+                return 'deny', MSG['deploy_push_chained'] % (hit[1], hit[2], hit[0], hit[0])
+            if hit:
+                return 'deny', MSG['deploy_push'] % (hit[0], hit[1], hit[2], hit[0], hit[0])
     elif sub == 'reset':
         mode_args = rest[:rest.index('--')] if '--' in rest else rest
         if any(unknown_expansion(raw) or unresolved_path(ref, raw)
@@ -3127,6 +3333,255 @@ def analyze(toks, depth, raw=None, mutations=None):
         STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = saved
 
 
+QUOTE_CHARS = ' \t\r\n"\'`\u201c\u201d\u2018\u2019'
+
+
+def owner_go_calls(toks, stripped):
+    """[(words or None, readable)] for every --owner-go that follows a pr_review.py word in a simple command, whatever the
+    interpreter or its path, or the module name after python -m; [] when the command is not one. readable is False for
+    words the shell builds at run time."""
+    start = next((i for i, t in enumerate(toks) if os.path.basename(t) in ('pr_review.py', 'pr_review')), None)
+    calls, i = [], (start + 1) if start is not None else len(toks)
+    while i < len(toks):
+        if toks[i] == '--owner-go':
+            more = i + 1 < len(toks)
+            calls.append((toks[i + 1], not unknown_expansion(stripped[i + 1])) if more else (None, False))
+            i += 2
+            continue
+        if toks[i].startswith('--owner-go='):
+            calls.append((toks[i].partition('=')[2], not unknown_expansion(stripped[i])))
+        i += 1
+    return calls
+
+
+STRAIGHT = {0x2018: "'", 0x2019: "'", 0x201c: '"', 0x201d: '"'}
+
+
+def plain_text(text):
+    """Case-folded text with straight quotes and every whitespace run as one space, to compare the owner's words with
+    what the user typed."""
+    return re.sub(r'\s+', ' ', text.translate(STRAIGHT).casefold()).strip()
+
+
+def typed_text(content):
+    """The text of a user message whose content is a string or text blocks; None when a tool_result is among them."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list) or any(isinstance(b, dict) and b.get('type') == 'tool_result' for b in content):
+        return None
+    return '\n'.join(str(b.get('text') or '') for b in content if isinstance(b, dict) and b.get('type') == 'text')
+
+
+TOOL_ECHO = re.compile(r'\s*<(?:bash-|local-command-|command-)')
+
+
+def human_origin(origin):
+    return isinstance(origin, dict) and origin.get('kind') == 'human'
+
+
+def picked_answers(ev, content, asked):
+    """The answer values the user chose in an AskUserQuestion: the result must answer a call of that tool seen earlier.
+    The question text is the agent's own and never counts."""
+    answers = ev['toolUseResult'].get('answers') if isinstance(ev['toolUseResult'], dict) else None
+    ids = {b.get('tool_use_id') for b in content if isinstance(b, dict) and b.get('type') == 'tool_result'} \
+        if isinstance(content, list) else set()
+    if not isinstance(answers, dict) or not ids or not ids <= asked:
+        return []
+    out = []
+    for value in answers.values():
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, str) and not item.startswith('[User did not answer'):
+                out.append(item)
+    return out
+
+
+def claude_event_texts(ev, asked):
+    """What the user themselves wrote in one Claude Code transcript entry. Tool results, hook feedback, task
+    notifications, compaction summaries and assistant text can all carry words an agent wrote, so they give nothing."""
+    kind = ev.get('type')
+    message = ev.get('message') if isinstance(ev.get('message'), dict) else {}
+    content = message.get('content')
+    if kind == 'assistant':
+        asked.update(b.get('id') for b in content or [] if isinstance(b, dict) and b.get('type') == 'tool_use'
+                     and b.get('name') == 'AskUserQuestion')
+        return []
+    if kind == 'attachment':
+        queued = ev.get('attachment')  # text the user typed while the agent was working
+        ok = (isinstance(queued, dict) and queued.get('type') == 'queued_command' and human_origin(queued.get('origin'))
+              and isinstance(queued.get('prompt'), str))
+        return [queued['prompt']] if ok else []
+    if kind != 'user' or ev.get('isSidechain') or ev.get('isMeta') or ev.get('isCompactSummary'):
+        return []
+    if 'toolUseResult' in ev:
+        return picked_answers(ev, content, asked)
+    text = typed_text(content)
+    if text is None:
+        return []
+    if 'origin' in ev:  # the output of the user's own ! and / commands can be written under their name: not what they said
+        return [text] if human_origin(ev['origin']) and not TOOL_ECHO.match(text) else []
+    # older Claude Code writes no origin: what is left of its non-typed entries starts like a tag, a bracket or feedback
+    return [] if text.lstrip().startswith(('<', 'Stop hook feedback', '[')) else [text]
+
+
+def claude_typed_texts(path):
+    """Every text the user wrote in this session, from the Claude Code transcript at path."""
+    texts, asked = [], set()
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for n, line in enumerate(fh):
+            if n % 500 == 0 and time_left() < 1.0:
+                raise TimeoutError('the transcript is too large to read in the time left')
+            if '"user"' not in line and '"attachment"' not in line and 'AskUserQuestion' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict):
+                texts.extend(claude_event_texts(ev, asked))
+    return texts
+
+
+def codex_typed_texts(path):
+    """Every text the user typed in a Codex rollout (the two shapes bin/learn.py reads); nothing for a session the user
+    did not drive and for a compressed rollout."""
+    meta = None if path.endswith('.zst') else common.codex_meta(path)
+    if not meta or not common.codex_typed(meta):
+        return []
+    texts = []
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for n, line in enumerate(fh):
+            if n % 500 == 0 and time_left() < 1.0:
+                raise TimeoutError('the transcript is too large to read in the time left')
+            if 'user_message' not in line and 'UserMessage' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict) or ev.get('type') != 'event_msg' or not isinstance(ev.get('payload'), dict):
+                continue
+            payload = ev['payload']
+            item = payload.get('item')
+            if payload.get('type') == 'user_message':
+                text = payload.get('message')
+            elif payload.get('type') == 'item_completed' and isinstance(item, dict) and item.get('type') == 'UserMessage':
+                text = typed_text(item.get('content'))
+            else:
+                continue
+            text = common.codex_user_text(text) if isinstance(text, str) else ''
+            if text:
+                texts.append(text)
+    return texts
+
+
+PUNCT = QUOTE_CHARS + '.!?;,:'
+CLAUSE_MARKS = '.!?;,:'
+SPACE_AND_QUOTES = ' "\'`'
+CLOSES_CLAUSE = re.compile(r'["\'`]*(?:$|[.!?;,:]+["\'`]*(?:\s|$))')
+# The user's own no or hold: words that hold one are never taken as an order without a tap. English only; add the words of
+# other languages the user writes in to this list.
+REFUSAL = re.compile(r"(?<!\w)(?:no|not|cannot|never|nor|stop|wait|hold|cancel|dont|doesnt|didnt|cant|wont|shouldnt|"
+                     r"wouldnt|couldnt|isnt|arent|mustnt)(?!\w)|n't(?!\w)")
+WORD = re.compile(r'[^\W\d_]{4,}|\d+')
+COMMON_WORDS = frozenset(('that this with then have will just from your what when they them does done please also here '
+                          'there into some more were been than only about would could should after before still again').split())
+
+
+def opens_clause(line, start):
+    """True when the words that begin at start open a clause: between them and the start of the line, or a clause mark
+    followed by a space, lie only spaces and quotes. Reads backwards from start, so a long line costs nothing extra."""
+    i = start
+    while i and line[i - 1] in SPACE_AND_QUOTES:
+        i -= 1
+    return not i or (i < start and line[i - 1] in CLAUSE_MARKS and line[i] == ' ')
+
+
+def order_match(phrase, text):
+    """'order' when phrase is one or more whole clauses of text, 'fragment' when it only occurs inside one, None when it
+    is not there. A clause runs from the start of the message, a line break or one of . ! ? ; , : followed by a space, to
+    the next of those; the whole message is one unit, so a quote of all of it matches. A fragment can leave out the
+    condition or the no around it ("merge it" out of "don't merge it yet"), and the words are what the PR records."""
+    if phrase == plain_text(text).strip(PUNCT):
+        return 'order'
+    found, seen = re.compile(r'(?<!\w)' + re.escape(phrase) + r'(?!\w)'), None
+    for line in text.splitlines():
+        line = plain_text(line)
+        for hit in found.finditer(line):
+            if opens_clause(line, hit.start()) and CLOSES_CLAUSE.match(line, hit.end()):
+                return 'order'
+            seen = 'fragment'
+    return seen
+
+
+def said_words(text):
+    """The words of a text that can tie it to another: four letters or more and not among the commonest, and numbers."""
+    return set(WORD.findall(text)) - COMMON_WORDS
+
+
+def withdrawn(phrase, later):
+    """True when a message the user wrote after the order holds a no or a hold and shares a word or a number with the
+    quoted words: "wait, don't merge it yet" after "Yes, merge it.", "hold off on 7" after "merge PR 7". A withdrawal in
+    other words cannot be told from talk about something else, so it is not caught."""
+    words = said_words(phrase)
+    for n, text in enumerate(later):
+        if n % 50 == 0 and time_left() < 1.0:
+            raise TimeoutError('too much text to read in the time left')
+        plain = plain_text(text)
+        if REFUSAL.search(plain) and words & said_words(plain):
+            return True
+    return False
+
+
+def owner_order(words):
+    """'order' when words are an order the user wrote or chose in this session, 'fragment' when they are only part of a
+    sentence of theirs, None when they cannot be read as the user's order. The latest message that holds the words
+    decides, and a later message of the user's with a no about the same thing outranks an earlier order whatever the agent
+    quotes. A part of a sentence that holds a no is not sent back for a longer quote: it goes to the user. Short words
+    ("yes", "go", "ok") answer some question and carry no order of their own, and words that hold a no or a hold are
+    never an order."""
+    phrase = plain_text(words.strip(QUOTE_CHARS)).strip(PUNCT)
+    path = STATE['transcript']
+    if len(phrase) < 5 and ' ' not in phrase or REFUSAL.search(phrase) or not isinstance(path, str) or not path:
+        return None
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):  # a device or a pipe would be read until the time ran out
+        return None
+    texts = codex_typed_texts(path) if os.environ.get('AGENT_CORE_TOOL') == 'codex' else claude_typed_texts(path)
+    key = max(re.findall(r'\w+', phrase), key=len, default='')
+    for at in range(len(texts) - 1, -1, -1):
+        if at % 50 == 0 and time_left() < 1.0:
+            raise TimeoutError('too much text to read in the time left')
+        if key not in texts[at].casefold():
+            continue  # cheap: the longest word of the quote is not in this message at all
+        match = order_match(phrase, texts[at])
+        if match == 'order':
+            return None if withdrawn(phrase, texts[at + 1:]) else 'order'
+        if match:
+            return None if REFUSAL.search(plain_text(texts[at])) else 'fragment'
+    return None
+
+
+def owner_go_decision(calls):
+    """pr_review.py --owner-go is allowed only on an order the user wrote in this session. A part of one of their sentences
+    is denied with how to quote it, so the agent corrects the quote itself. Anything else that is not verified is an ask,
+    which the user answers themselves; Codex cannot ask, so there it is a deny. Nothing in the check may reach the
+    generic fail-closed deny."""
+    if any(words is None or not readable or not words.strip(QUOTE_CHARS) for words, readable in calls):
+        return 'deny', MSG['owner_go_words']
+    unverified = None
+    for words, _ in calls:
+        try:
+            match = owner_order(words)
+        except Exception:
+            match = None
+        if match == 'fragment':
+            return 'deny', MSG['owner_go_fragment'] % words.strip()[:120]
+        if match != 'order' and not unverified:
+            kind = 'deny' if os.environ.get('AGENT_CORE_TOOL') == 'codex' else 'ask'
+            unverified = kind, MSG['owner_go_unverified'] % words.strip()[:120]
+    return unverified
+
+
 def analyze_command(toks, depth, raw=None, mutations=None):
     toks = strip_reserved_time(toks)
     plain, redirs = split_redirects(toks)
@@ -3188,6 +3643,13 @@ def analyze_command(toks, depth, raw=None, mutations=None):
         set_cwd(None)
         return None
     prog, args = os.path.basename(toks[0]), toks[1:]
+    calls = [] if prog in ('echo', 'printf') else owner_go_calls(toks, stripped)  # printing the usage runs nothing
+    if calls:
+        decision = owner_go_decision(calls)
+        if decision and decision[0] == 'ask':
+            STATE['owner_go_ask'] = STATE['owner_go_ask'] or decision  # a later deny in the same line must still win
+        elif decision:
+            return decision
     if prog in SHELLS:
         return nested(shell_decision, args, depth)
     if prog == 'eval':
@@ -3554,6 +4016,8 @@ def check_script_body(text, depth=0, mutations=None):
         return 'deny', MSG['deep']
     if depth == 0:
         STATE['moved'] = False
+        STATE['advances'] = False
+        STATE['owner_go_ask'] = None
         STATE['body_file_unstable'] = False
         STATE['substitution_budget'] = MAX_SUBSTITUTIONS
     try:
@@ -3565,6 +4029,8 @@ def check_script_body(text, depth=0, mutations=None):
         decision = check_tokens(tokens, depth, mutations=mutations)
         if decision:
             return decision
+        if depth == 0:
+            return STATE['owner_go_ask']  # asked only after the whole line passed: one tap must not release the rest of it
     except (TooDeep, RecursionError):
         return 'deny', MSG['deep']
     return None
@@ -3606,7 +4072,7 @@ ADVISOR_MODEL = 'fable'  # claude/agents/advisor.md
 
 def check_agent(tool_input):
     """Ask the user before a subagent runs on a gated model (config gated_models), including the advisor agent while its
-    model is gated. Removing fable from gated_models lets the advisor run without the prompt. The only "ask" in the guard."""
+    model is gated. Removing fable from gated_models lets the advisor run without the prompt."""
     kind = str(tool_input.get('subagent_type') or '').lower()
     model = str(tool_input.get('model') or '').lower()
     gated = [g.lower() for g in _listed(common.config().get('gated_models'))]
@@ -4215,6 +4681,7 @@ def main_body():
         result = None
         if tool == 'Bash':
             STATE['cwd'] = str(data.get('cwd') or os.getcwd())
+            STATE['transcript'] = data.get('transcript_path')
             command = str(tool_input.get('command') or '')
             result = check_script(command)
             if result and result[1] == MSG['rm']:
