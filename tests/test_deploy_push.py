@@ -121,6 +121,10 @@ class DeployPush(unittest.TestCase):
         with open(self.pulls, 'w') as fh:
             fh.write('not json')
         self.assertIsNone(self.push())
+        for odd in ('[{"head": 5}]', '[{"number": 40, "head": "abc"}]', '[5, null, {"head": null}]'):
+            with open(self.pulls, 'w') as fh:
+                fh.write(odd)
+            self.assertIsNone(self.push(), odd)  # an entry shaped oddly is no reason to hold the push
         self.set_pulls(self.pr_head)
         open(os.path.join(self.dir, 'slow'), 'w').close()
         self.assertIsNone(self.push())  # gh outlives the hook's gh budget

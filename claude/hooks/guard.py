@@ -19,7 +19,7 @@ Supabase projects listed in config protected_supabase outside the repo's scripts
 proposals directly, a shell that runs a script it cannot be shown (a pipe from anything but echo/printf/cat), and
 merging a PR into a gated branch before its review gate passes. A documented provider outage can use
 one real passing review plus passing tests on the same head when config pr_gate enables that fallback.
-One decision is not a deny: spawning a subagent on a model listed in config gated_models (and the advisor agent)
+Two decisions are not a deny. Spawning a subagent on a model listed in config gated_models (and the advisor agent)
 returns "ask", so Claude Code prompts the user; that prompt also appears in bypass mode. So does bin/pr_review.py
 --owner-go, which merges past the review gate on the owner's order, when the words it quotes are not an order the user
 wrote in this session's transcript (a Codex session cannot ask, so there it is a deny). A plain push that puts the
@@ -2208,7 +2208,8 @@ def deploy_push(where, positional, long_flags):
         prs = open_pulls(slug, deploy)
         tracking = 'refs/remotes/%s/%s' % (remote, deploy)
         for pr in prs or []:
-            head = (pr.get('head') or {}).get('sha') if isinstance(pr, dict) else None
+            head = pr.get('head') if isinstance(pr, dict) else None
+            head = head.get('sha') if isinstance(head, dict) else None  # an entry GitHub shaped oddly holds nothing
             if not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head) or type(pr.get('number')) is not int:
                 continue
             local = probe_git(where, 'cat-file', '-e', head + '^{commit}')
