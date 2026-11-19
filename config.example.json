@@ -6,6 +6,7 @@
   "protected_supabase": {},
   "gated_models": ["fable"],
   "stop_hook": true,
+  "question_hook": true,
   "icloud_warning": true,
   "spend_limit_usd": 5,
   "permission_mode": "",

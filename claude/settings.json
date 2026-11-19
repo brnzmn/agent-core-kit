@@ -69,6 +69,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "AskUserQuestion|mcp__ccd_turn__wrap_up",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/agent-core/ask_pick.py || true",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [

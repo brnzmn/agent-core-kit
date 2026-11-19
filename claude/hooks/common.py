@@ -65,6 +65,7 @@ DEFAULTS = {
     'protected_supabase': {},
     'gated_models': ['fable'],
     'stop_hook': True,
+    'question_hook': True,
     'icloud_warning': True,
     'spend_limit_usd': 5,
     'permission_mode': '',
