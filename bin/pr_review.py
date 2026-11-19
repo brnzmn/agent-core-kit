@@ -6,6 +6,7 @@
   pr_review.py <pr> auto                    both; one unavailable needs the other PASS and passing full tests
                                             (pr_gate.required_reviews 1: only the vendor that did not write the PR,
                                             by head branch, codex/ = Codex's; the other runs only if it is unavailable)
+  pr_review.py <pr> --owner-go "<words>"    the owner's merge order: records their words on the PR, merges that head
 
 <pr> is anything `gh pr view` accepts: a number, a URL or a branch. Run it from a checkout of the PR head, with gh
 signed in. The comment starts "## Codex review", "## Codex adversarial review" or "## Claude review", names the head
@@ -14,6 +15,8 @@ finding (the adversarial review blocks on a needs-attention verdict). Claude blo
 Anything in the review text that looks like a secret (tokens, keys, private key blocks, a value after token/secret/
 password/key =) is replaced by [REDACTED] before it is posted or printed, and the count is printed.
 Exit 0 pass, 1 block, 3 incomplete. Auto records the configured full test result; only passing tests can satisfy fallback.
+--owner-go takes --merge (default), --squash or --rebase, and exits 0 only once gh merged the PR. It runs no review and
+no tests: the guard hook checks that the words are a whole sentence or clause the owner wrote in the session.
 """
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -313,17 +316,22 @@ def unchanged(pr, expected):
         raise ValueError('the PR head, base or repository changed during the run')
 
 
-def publish_body(pr, expected, body):
-    """Publish already prepared prose or an explicitly serialized record. Model text never chooses its path."""
-    unchanged(pr, expected)
+def comment_on(url, body):
+    """Post body as a comment on the PR at url; ValueError when gh refuses."""
     with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False) as fh:
         fh.write(body)
     try:
-        posted = sh([GH, 'pr', 'comment', expected['url'], '--body-file', fh.name], timeout=60)
+        posted = sh([GH, 'pr', 'comment', url, '--body-file', fh.name], timeout=60)
     finally:
         os.unlink(fh.name)
     if posted.returncode:
         raise ValueError('posting the comment failed: ' + posted.stderr.strip())
+
+
+def publish_body(pr, expected, body):
+    """Publish already prepared prose or an explicitly serialized record. Model text never chooses its path."""
+    unchanged(pr, expected)
+    comment_on(expected['url'], body)
     print(body)
 
 
@@ -344,6 +352,14 @@ def post_comment(pr, expected, body):
     body, count = redact_comment(body)
     print('pr_review: redacted %d secret-like string(s) before posting' % count)
     publish_body(pr, expected, body)
+
+
+def publish(url, body):
+    """Post body on the PR at url, redacted. The owner's order posts without publish_body's unchanged() check: it does
+    not depend on the checkout."""
+    body, count = redact_comment(body)
+    print('pr_review: redacted %d secret-like string(s) before posting' % count)
+    comment_on(url, body)
 
 
 def public_test_command(command):
@@ -506,7 +522,84 @@ def required_first(base, head_ref):
     return results
 
 
+ENDING_METHODS = ('--merge', '--squash', '--rebase')
+MAX_WORDS = 500
+
+
+class Ending(NamedTuple):
+    kind: str  # 'owner-go'
+    pr: str
+    words: Optional[str] = None
+    method: str = 'merge'
+
+
+def wants_ending(argv):
+    return any(a == '--owner-go' or a.startswith('--owner-go=') for a in argv)
+
+
+def parse_ending(argv):
+    """The Ending the arguments ask for, or None when they are not valid. `--owner-go` takes the next argument whole,
+    whatever it starts with, and only that exact spelling counts: guard.py reads the same words before the command runs."""
+    pos, words, methods, k = [], None, [], 0
+    while k < len(argv):
+        a = argv[k]
+        flag, joined, value = a.partition('=')
+        if flag == '--owner-go':
+            if not joined:  # the value is the next argument, whatever it starts with
+                if k + 1 >= len(argv):
+                    return None
+                value, k = argv[k + 1], k + 1
+            if words is not None:
+                return None
+            words = value
+        elif a in ENDING_METHODS:
+            methods.append(a[2:])
+        elif a.startswith('-'):
+            return None
+        else:
+            pos.append(a)
+        k += 1
+    if len(pos) != 1 or len(methods) > 1 or words is None:
+        return None
+    return Ending('owner-go', pos[0], words, methods[0] if methods else 'merge')
+
+
+def merge_pr(url, method, head):
+    """gh pr merge pinned to head, so a push after the checks cannot slip into the merge."""
+    out = sh([GH, 'pr', 'merge', url, '--' + method, '--match-head-commit', head], timeout=120)
+    if out.returncode:
+        raise ValueError('gh pr merge failed: ' + (out.stderr.strip() or out.stdout.strip() or 'no output'))
+
+
+def owner_go(pr, words, method):
+    """The owner's merge order: put their words on the PR, then merge that exact head. Whether the words are really the
+    owner's is checked by guard.py before this runs; nothing here looks at reviews, tests or check runs."""
+    words = words.strip()
+    if not words or len(words) > MAX_WORDS:
+        print("pr_review: --owner-go needs the owner's words, 1 to %d characters" % MAX_WORDS)
+        return 3
+    quoted, _ = redact(' '.join(words.split()))
+    try:
+        meta = metadata(pr)
+        head = meta['headRefOid']
+        record = {'head': head, 'base': meta['baseRefName'], 'base_oid': meta['baseRefOid']}
+        publish(meta['url'], '## Owner merge order\nhead: %s\n\n%s ordered this merge in the agent session:\n> %s\n\n'
+                'AGENT_CORE_OWNER_GO_V1: %s\n' % (head, common.user(), quoted, json.dumps(record, separators=(',', ':'))))
+        merge_pr(meta['url'], method, head)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print('pr_review: ' + diagnostic(str(exc)))
+        return 3
+    print("pr_review: merged PR #%d at %s on %s's order" % (meta['number'], head[:12], common.user()))
+    return 0
+
+
 def main(argv):
+    if wants_ending(argv):
+        ending = parse_ending(argv)
+        if not ending:
+            print(__doc__)
+            return 3
+        return owner_go(ending.pr, ending.words, ending.method)
     args = parse_args(argv)
     if not args:
         print(__doc__)

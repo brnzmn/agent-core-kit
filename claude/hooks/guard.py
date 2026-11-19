@@ -19,8 +19,10 @@ Supabase projects listed in config protected_supabase outside the repo's scripts
 proposals directly, a shell that runs a script it cannot be shown (a pipe from anything but echo/printf/cat), and
 merging a PR into a gated branch before its review gate passes. A documented provider outage can use
 one real passing review plus passing tests on the same head when config pr_gate enables that fallback.
-The one decision that is not a deny: spawning a subagent on a model listed in config gated_models (and the advisor
-agent) returns "ask", so Claude Code prompts the user; that prompt also appears in bypass mode.
+One decision is not a deny: spawning a subagent on a model listed in config gated_models (and the advisor agent)
+returns "ask", so Claude Code prompts the user; that prompt also appears in bypass mode. So does bin/pr_review.py
+--owner-go, which merges past the review gate on the owner's order, when the words it quotes are not an order the user
+wrote in this session's transcript (a Codex session cannot ask, so there it is a deny).
 Prints a decision as JSON, or nothing to let the call through.
 Its own errors deny the call and go to learning/hook-errors.log.
 """
@@ -92,7 +94,7 @@ GIT_KNOWN = {'add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bund
              'status', 'stripspace', 'submodule', 'subtree', 'switch', 'symbolic-ref', 'tag', 'update-index', 'update-ref',
              'var', 'verify-commit', 'verify-tag', 'version', 'whatchanged', 'worktree', 'write-tree'}
 SUPABASE_SCHEMA = {('db', 'push'), ('db', 'reset'), ('migration', 'up')}
-STATE = {'cwd': '', 'cwd_candidates': None, 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(),
+STATE = {'transcript': None, 'owner_go_ask': None, 'cwd': '', 'cwd_candidates': None, 'heredocs': [], 'expands': [], 'vars': {}, 'restricted': set(), 'unknown': set(),
          'pipe': [], 'sep': ';', 'plain': False, 'deferred_body': False, 'body_file_unstable': False,
          'raw': [], 'moved': False, 'envcfg': [], 'inherit': [], 'penv': {}, 'pinherit': {}, 'xargs': False,
          'marks': {'active': set(), 'unquoted': set(), 'braced': set()}}  # cwd None = unknown; raw = the command's tokens before $VAR expansion
@@ -148,6 +150,14 @@ def analysis_remaining():
     if left <= 0:
         raise AnalysisExpired()
     return left
+
+
+def time_left():
+    """Seconds of the hook's analysis budget left, 0 once it is spent (callers here step aside instead of expiring)."""
+    try:
+        return analysis_remaining()
+    except AnalysisExpired:
+        return 0
 
 
 def analysis_alarm(signum, frame):
@@ -382,6 +392,17 @@ MSG = {
     'review_unread': 'gh pr merge is held: reviews of the PR\'s current head and base commit could not be read (%s). Retry once gh works; a base change requires fresh automatic reviews.',
     'api_merge': ('gh api cannot merge a PR around the review gate (pr_gate in config). Merge with gh pr merge <number>, '
                   'which checks the review and provider-outage evidence.'),
+    'owner_go_words': ('pr_review.py --owner-go merges past the review gate on ' + USER_S + ' order, so it needs the words '
+                       'of ' + USER_S + ' message as one literal quoted argument, not a variable or a substitution. Quote '
+                       'the message exactly as written.'),
+    'owner_go_unverified': ('pr_review.py --owner-go merges past the review gate on ' + _esc(USER_S) + ' order, and these '
+                            'words could not be read as ' + _esc(USER_S) + ' order from this session: "%s". They are not in '
+                            'a message ' + _esc(USER) + ' wrote here, or they hold a no or a hold, or they are a one-word '
+                            'answer. Allowing this is ' + _esc(USER_S) + ' call: it merges the PR without the review.'),
+    'owner_go_fragment': ('pr_review.py --owner-go records ' + _esc(USER_S) + ' order on the PR, and these words are only '
+                          'part of a sentence ' + _esc(USER) + ' wrote: "%s". A part can leave out a condition or a no. '
+                          'Quote the sentence from its first word to its last (up to a comma or full stop), or the whole '
+                          'message, word for word.'),
     'lane': ('This worktree\'s .agent-lane names the other tool, which owns its commits. Leave your change '
              'uncommitted and write a handoff note (handoff skill), or work in a worktree of your own.'),
     'rm': ('Recursive delete goes to the trash. Run it as its own command: ' + TRASH + ' <paths> '
@@ -3161,6 +3182,210 @@ def analyze(toks, depth, raw=None, mutations=None):
         STATE['cwd'], STATE['vars'], STATE['restricted'], STATE['unknown'], STATE['cwd_candidates'] = saved
 
 
+QUOTE_CHARS = ' \t\r\n"\'`\u201c\u201d\u2018\u2019'
+
+
+def owner_go_calls(toks, stripped):
+    """[(words or None, readable)] for every --owner-go that follows a pr_review.py word in a simple command, whatever the
+    interpreter or its path; [] when the command is not one. readable is False for words the shell builds at run time."""
+    start = next((i for i, t in enumerate(toks) if os.path.basename(t) == 'pr_review.py'), None)
+    calls, i = [], (start + 1) if start is not None else len(toks)
+    while i < len(toks):
+        if toks[i] == '--owner-go':
+            more = i + 1 < len(toks)
+            calls.append((toks[i + 1], not unknown_expansion(stripped[i + 1])) if more else (None, False))
+            i += 2
+            continue
+        if toks[i].startswith('--owner-go='):
+            calls.append((toks[i].partition('=')[2], not unknown_expansion(stripped[i])))
+        i += 1
+    return calls
+
+
+STRAIGHT = {0x2018: "'", 0x2019: "'", 0x201c: '"', 0x201d: '"'}
+
+
+def plain_text(text):
+    """Case-folded text with straight quotes and every whitespace run as one space, to compare the owner's words with
+    what the user typed."""
+    return re.sub(r'\s+', ' ', text.translate(STRAIGHT).casefold()).strip()
+
+
+def typed_text(content):
+    """The text of a user message whose content is a string or text blocks; None when a tool_result is among them."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list) or any(isinstance(b, dict) and b.get('type') == 'tool_result' for b in content):
+        return None
+    return '\n'.join(str(b.get('text') or '') for b in content if isinstance(b, dict) and b.get('type') == 'text')
+
+
+def human_origin(origin):
+    return isinstance(origin, dict) and origin.get('kind') == 'human'
+
+
+def picked_answers(ev, content, asked):
+    """The answer values the user chose in an AskUserQuestion: the result must answer a call of that tool seen earlier.
+    The question text is the agent's own and never counts."""
+    answers = ev['toolUseResult'].get('answers') if isinstance(ev['toolUseResult'], dict) else None
+    ids = {b.get('tool_use_id') for b in content if isinstance(b, dict) and b.get('type') == 'tool_result'} \
+        if isinstance(content, list) else set()
+    if not isinstance(answers, dict) or not ids or not ids <= asked:
+        return []
+    out = []
+    for value in answers.values():
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, str) and not item.startswith('[User did not answer'):
+                out.append(item)
+    return out
+
+
+def claude_event_texts(ev, asked):
+    """What the user themselves wrote in one Claude Code transcript entry. Tool results, hook feedback, task
+    notifications, compaction summaries and assistant text can all carry words an agent wrote, so they give nothing."""
+    kind = ev.get('type')
+    message = ev.get('message') if isinstance(ev.get('message'), dict) else {}
+    content = message.get('content')
+    if kind == 'assistant':
+        asked.update(b.get('id') for b in content or [] if isinstance(b, dict) and b.get('type') == 'tool_use'
+                     and b.get('name') == 'AskUserQuestion')
+        return []
+    if kind == 'attachment':
+        queued = ev.get('attachment')  # text the user typed while the agent was working
+        ok = (isinstance(queued, dict) and queued.get('type') == 'queued_command' and human_origin(queued.get('origin'))
+              and isinstance(queued.get('prompt'), str))
+        return [queued['prompt']] if ok else []
+    if kind != 'user' or ev.get('isSidechain') or ev.get('isMeta') or ev.get('isCompactSummary'):
+        return []
+    if 'toolUseResult' in ev:
+        return picked_answers(ev, content, asked)
+    text = typed_text(content)
+    if text is None:
+        return []
+    if 'origin' in ev:
+        return [text] if human_origin(ev['origin']) else []
+    # older Claude Code writes no origin: what is left of its non-typed entries starts like a tag, a bracket or feedback
+    return [] if text.lstrip().startswith(('<', 'Stop hook feedback', '[')) else [text]
+
+
+def claude_typed_texts(path):
+    """Every text the user wrote in this session, from the Claude Code transcript at path."""
+    texts, asked = [], set()
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for n, line in enumerate(fh):
+            if n % 500 == 0 and time_left() < 1.0:
+                raise TimeoutError('the transcript is too large to read in the time left')
+            if '"user"' not in line and '"attachment"' not in line and 'AskUserQuestion' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict):
+                texts.extend(claude_event_texts(ev, asked))
+    return texts
+
+
+def codex_typed_texts(path):
+    """Every text the user typed in a Codex rollout (the two shapes bin/learn.py reads); nothing for a session the user
+    did not drive and for a compressed rollout."""
+    meta = None if path.endswith('.zst') else common.codex_meta(path)
+    if not meta or not common.codex_typed(meta):
+        return []
+    texts = []
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        for n, line in enumerate(fh):
+            if n % 500 == 0 and time_left() < 1.0:
+                raise TimeoutError('the transcript is too large to read in the time left')
+            if 'user_message' not in line and 'UserMessage' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict) or ev.get('type') != 'event_msg' or not isinstance(ev.get('payload'), dict):
+                continue
+            payload = ev['payload']
+            item = payload.get('item')
+            if payload.get('type') == 'user_message':
+                text = payload.get('message')
+            elif payload.get('type') == 'item_completed' and isinstance(item, dict) and item.get('type') == 'UserMessage':
+                text = typed_text(item.get('content'))
+            else:
+                continue
+            text = common.codex_user_text(text) if isinstance(text, str) else ''
+            if text:
+                texts.append(text)
+    return texts
+
+
+PUNCT = QUOTE_CHARS + '.!?;,:'
+OPENS_CLAUSE = re.compile(r'(?:^|[.!?;,:]\s)[\s"\'`]*$')
+CLOSES_CLAUSE = re.compile(r'["\'`]*(?:$|[.!?;,:]+["\'`]*(?:\s|$))')
+# The user's own no or hold: words that hold one are never taken as an order without a tap. English only; add the words of
+# other languages the user writes in to this list.
+REFUSAL = re.compile(r"(?<!\w)(?:no|not|cannot|never|nor|stop|wait|hold|cancel|dont|doesnt|didnt|cant|wont|shouldnt|"
+                     r"wouldnt|couldnt|isnt|arent|mustnt)(?!\w)|n't(?!\w)")
+
+
+def order_match(phrase, text):
+    """'order' when phrase is one or more whole clauses of text, 'fragment' when it only occurs inside one, None when it
+    is not there. A clause runs from the start of the message, a line break or one of . ! ? ; , : followed by a space, to
+    the next of those; the whole message is one unit, so a quote of all of it matches. A fragment can leave out the
+    condition or the no around it ("merge it" out of "don't merge it yet"), and the words are what the PR records."""
+    if phrase == plain_text(text).strip(PUNCT):
+        return 'order'
+    found, seen = re.compile(r'(?<!\w)' + re.escape(phrase) + r'(?!\w)'), None
+    for line in text.splitlines():
+        line = plain_text(line)
+        for hit in found.finditer(line):
+            if OPENS_CLAUSE.search(line[:hit.start()]) and CLOSES_CLAUSE.match(line[hit.end():]):
+                return 'order'
+            seen = 'fragment'
+    return seen
+
+
+def owner_order(words):
+    """'order' when words are an order the user wrote or chose in this session, 'fragment' when they are only part of a
+    sentence of theirs, None when they cannot be read as the user's order. The latest message that holds the words
+    decides, so a later "don't merge it yet" outranks an earlier "merge it". Short words ("yes", "go", "ok") answer some
+    question and carry no order of their own, and words that hold a no or a hold are never an order."""
+    phrase = plain_text(words.strip(QUOTE_CHARS)).strip(PUNCT)
+    path = STATE['transcript']
+    if len(phrase) < 5 and ' ' not in phrase or REFUSAL.search(phrase) or not isinstance(path, str) or not path:
+        return None
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):  # a device or a pipe would be read until the time ran out
+        return None
+    texts = codex_typed_texts(path) if os.environ.get('AGENT_CORE_TOOL') == 'codex' else claude_typed_texts(path)
+    for text in reversed(texts):
+        match = order_match(phrase, text)
+        if match:
+            return match
+    return None
+
+
+def owner_go_decision(calls):
+    """pr_review.py --owner-go is allowed only on an order the user wrote in this session. A part of one of their sentences
+    is denied with how to quote it, so the agent corrects the quote itself. Anything else that is not verified is an ask,
+    which the user answers themselves; Codex cannot ask, so there it is a deny. Nothing in the check may reach the
+    generic fail-closed deny."""
+    if any(words is None or not readable or not words.strip(QUOTE_CHARS) for words, readable in calls):
+        return 'deny', MSG['owner_go_words']
+    unverified = None
+    for words, _ in calls:
+        try:
+            match = owner_order(words)
+        except Exception:
+            match = None
+        if match == 'fragment':
+            return 'deny', MSG['owner_go_fragment'] % words.strip()[:120]
+        if match != 'order' and not unverified:
+            kind = 'deny' if os.environ.get('AGENT_CORE_TOOL') == 'codex' else 'ask'
+            unverified = kind, MSG['owner_go_unverified'] % words.strip()[:120]
+    return unverified
+
+
 def analyze_command(toks, depth, raw=None, mutations=None):
     toks = strip_reserved_time(toks)
     plain, redirs = split_redirects(toks)
@@ -3222,6 +3447,13 @@ def analyze_command(toks, depth, raw=None, mutations=None):
         set_cwd(None)
         return None
     prog, args = os.path.basename(toks[0]), toks[1:]
+    calls = [] if prog in ('echo', 'printf') else owner_go_calls(toks, stripped)  # printing the usage runs nothing
+    if calls:
+        decision = owner_go_decision(calls)
+        if decision and decision[0] == 'ask':
+            STATE['owner_go_ask'] = STATE['owner_go_ask'] or decision  # a later deny in the same line must still win
+        elif decision:
+            return decision
     if prog in SHELLS:
         return nested(shell_decision, args, depth)
     if prog == 'eval':
@@ -3588,6 +3820,7 @@ def check_script_body(text, depth=0, mutations=None):
         return 'deny', MSG['deep']
     if depth == 0:
         STATE['moved'] = False
+        STATE['owner_go_ask'] = None
         STATE['body_file_unstable'] = False
         STATE['substitution_budget'] = MAX_SUBSTITUTIONS
     try:
@@ -3599,6 +3832,8 @@ def check_script_body(text, depth=0, mutations=None):
         decision = check_tokens(tokens, depth, mutations=mutations)
         if decision:
             return decision
+        if depth == 0:
+            return STATE['owner_go_ask']  # asked only after the whole line passed: one tap must not release the rest of it
     except (TooDeep, RecursionError):
         return 'deny', MSG['deep']
     return None
@@ -3640,7 +3875,7 @@ ADVISOR_MODEL = 'fable'  # claude/agents/advisor.md
 
 def check_agent(tool_input):
     """Ask the user before a subagent runs on a gated model (config gated_models), including the advisor agent while its
-    model is gated. Removing fable from gated_models lets the advisor run without the prompt. The only "ask" in the guard."""
+    model is gated. Removing fable from gated_models lets the advisor run without the prompt."""
     kind = str(tool_input.get('subagent_type') or '').lower()
     model = str(tool_input.get('model') or '').lower()
     gated = [g.lower() for g in _listed(common.config().get('gated_models'))]
@@ -4249,6 +4484,7 @@ def main_body():
         result = None
         if tool == 'Bash':
             STATE['cwd'] = str(data.get('cwd') or os.getcwd())
+            STATE['transcript'] = data.get('transcript_path')
             command = str(tool_input.get('command') or '')
             result = check_script(command)
             if result and result[1] == MSG['rm']:
